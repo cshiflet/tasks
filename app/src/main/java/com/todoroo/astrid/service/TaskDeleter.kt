@@ -107,5 +107,5 @@ class TaskDeleter @Inject constructor(
         }
     }
 
-    fun isDeleted(task: Long): Boolean = deletionDao.isDeleted(task)
+    suspend fun isDeleted(task: Long): Boolean = deletionDao.isDeleted(task)
 }
