@@ -23,9 +23,14 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             implementation(libs.androidx.room)
-            implementation(libs.kotlinx.datetime)
+            // Use api to expose kotlinx.datetime to consumers
+            api(libs.kotlinx.datetime)
             implementation(libs.kotlinx.serialization)
             implementation(libs.kermit)
+        }
+        jvmMain.dependencies {
+            // Explicitly include JVM artifact for runtime
+            api(libs.kotlinx.datetime)
         }
     }
     task("testClasses")

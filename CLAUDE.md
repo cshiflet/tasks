@@ -31,6 +31,9 @@ Tasks is an open-source Android to-do list application based on the discontinued
 
 # Build release bundle (requires signing keys)
 ./gradlew app:bundleGoogleplayRelease wear:bundleRelease
+
+# Run desktop app (requires JDK 21)
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew :desktop:runApp --no-configuration-cache
 ```
 
 ## Development Setup
@@ -49,6 +52,7 @@ Tasks is an open-source Android to-do list application based on the discontinued
 - **app**: Main Android application with UI and business logic
 - **data**: Kotlin Multiplatform module containing Room database entities, DAOs, and data models (shared between Android and JVM)
 - **kmp**: Kotlin Multiplatform module with shared Compose UI components
+- **desktop**: Compose for Desktop application (Linux, macOS, Windows)
 - **wear**: Wear OS companion app
 - **wear-datalayer**: Data layer for Wear OS communication
 - **icons**: Icon resources module

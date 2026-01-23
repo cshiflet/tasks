@@ -25,6 +25,10 @@ kotlin {
         androidMain.dependencies {
             implementation(libs.androidx.ui.tooling.preview.android)
         }
+        jvmMain.dependencies {
+            // Ensure kotlinx-datetime is available at runtime for JVM
+            implementation(libs.kotlinx.datetime)
+        }
         commonMain.dependencies {
             implementation(projects.data)
             implementation(compose.components.resources)
@@ -35,7 +39,8 @@ kotlin {
             implementation(libs.androidx.datastore)
             implementation(libs.androidx.lifecycle.viewmodel.compose)
             implementation(libs.kermit)
-            implementation(libs.kotlinx.datetime)
+            // Use api to expose to dependent modules like desktop
+            api(libs.kotlinx.datetime)
             implementation(libs.kotlinx.immutable)
             implementation(libs.kotlinx.serialization)
         }

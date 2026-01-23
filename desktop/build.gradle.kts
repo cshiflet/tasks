@@ -7,17 +7,30 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+configurations.all {
+    // Force version 0.6.2 which has Instant as a class, not a type alias
+    resolutionStrategy {
+        force("org.jetbrains.kotlinx:kotlinx-datetime:0.6.2")
+        force("org.jetbrains.kotlinx:kotlinx-datetime-jvm:0.6.2")
+    }
+}
+
 dependencies {
-    implementation(projects.kmp)
-    implementation(projects.data)
+    // Use api to ensure transitive dependencies are included
+    api(projects.kmp)
+    api(projects.data)
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)
     implementation(compose.materialIconsExtended)
     implementation(compose.components.resources)
     implementation(libs.kotlinx.serialization)
+    // Explicitly include kotlinx.datetime with JVM artifact for runtime
     implementation(libs.kotlinx.datetime)
+    implementation("org.jetbrains.kotlinx:kotlinx-datetime-jvm:0.7.1")
     implementation(libs.kotlinx.immutable)
     implementation(libs.kermit)
+    // Swing dispatcher for Dispatchers.Main on desktop
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
     implementation(libs.androidx.datastore)
     implementation(libs.androidx.room)
     implementation(libs.androidx.sqlite)
@@ -58,4 +71,11 @@ compose.desktop {
 
 kotlin {
     jvmToolchain(21)
+}
+
+// Custom task to run with full classpath (workaround for Compose Desktop classpath issues)
+tasks.register<JavaExec>("runApp") {
+    dependsOn("classes")
+    mainClass.set("org.tasks.desktop.MainKt")
+    classpath = sourceSets["main"].runtimeClasspath
 }
