@@ -33,6 +33,14 @@ class DesktopApplication(
     private val _drawerQuery = MutableStateFlow("")
     val drawerQuery: StateFlow<String> = _drawerQuery.asStateFlow()
 
+    // Trigger to refresh task list when tasks are modified
+    private val _taskRefreshTrigger = MutableStateFlow(0)
+    val taskRefreshTrigger: StateFlow<Int> = _taskRefreshTrigger.asStateFlow()
+
+    fun refreshTasks() {
+        _taskRefreshTrigger.value++
+    }
+
     val navigator get() = container.navigator
     val taskDao get() = container.taskDao
     val caldavDao get() = container.caldavDao

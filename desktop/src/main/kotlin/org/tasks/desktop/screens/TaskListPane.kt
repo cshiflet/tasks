@@ -30,6 +30,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -86,9 +87,10 @@ fun TaskListPane(
     val scope = rememberCoroutineScope()
     var tasks by remember { mutableStateOf<SectionedDataSource>(SectionedDataSource()) }
     val currentFilter = application.currentFilter
+    val refreshTrigger by application.taskRefreshTrigger.collectAsState()
     val preferences = remember { DesktopQueryPreferences() }
 
-    LaunchedEffect(currentFilter) {
+    LaunchedEffect(currentFilter, refreshTrigger) {
         withContext(Dispatchers.IO) {
             val query = TaskListQuery.getQuery(
                 preferences = preferences,

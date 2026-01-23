@@ -61,6 +61,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.tasks.data.entity.CaldavCalendar
+import org.tasks.data.entity.CaldavTask
 import org.tasks.data.entity.TagData
 import org.tasks.data.entity.Task
 import org.tasks.desktop.DesktopApplication
@@ -153,6 +154,28 @@ fun TaskEditPane(
                 updatedTask.id
             }
 
+            // Update list assignment (CaldavTask)
+            val existingCaldavTask = application.caldavDao.getTask(savedTaskId)
+            when {
+                selectedListId != null && existingCaldavTask == null -> {
+                    // Create new CaldavTask
+                    application.caldavDao.insert(
+                        CaldavTask(
+                            task = savedTaskId,
+                            calendar = selectedListId,
+                        )
+                    )
+                }
+                selectedListId != null && existingCaldavTask != null && existingCaldavTask.calendar != selectedListId -> {
+                    // Update existing CaldavTask
+                    application.caldavDao.update(existingCaldavTask.copy(calendar = selectedListId))
+                }
+                selectedListId == null && existingCaldavTask != null -> {
+                    // Delete CaldavTask (remove from list)
+                    application.caldavDao.delete(existingCaldavTask)
+                }
+            }
+
             // Update tags using the proper DAO method
             val existingTags = application.tagDao.getTagsForTask(savedTaskId)
             val toRemove = existingTags.filter { existing ->
@@ -174,6 +197,7 @@ fun TaskEditPane(
             }
 
             withContext(Dispatchers.Main) {
+                application.refreshTasks()
                 onClose()
             }
         }
@@ -188,6 +212,7 @@ fun TaskEditPane(
                 )
             }
             withContext(Dispatchers.Main) {
+                application.refreshTasks()
                 onClose()
             }
         }
