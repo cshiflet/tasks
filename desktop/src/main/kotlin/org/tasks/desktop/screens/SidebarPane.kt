@@ -27,6 +27,7 @@ import org.tasks.desktop.DesktopApplication
 import org.tasks.filters.CaldavFilter
 import org.tasks.filters.CustomFilter
 import org.tasks.filters.FilterProvider
+import org.tasks.filters.PlaceFilter
 import org.tasks.filters.TagFilter
 import java.awt.Desktop
 import java.net.URI
@@ -61,7 +62,7 @@ fun SidebarPane(
                     application.navigator.navigateToTagEdit()
                 }
                 FilterProvider.REQUEST_NEW_PLACE -> {
-                    // Location creation not supported on desktop yet
+                    application.navigator.navigateToPlaceEdit()
                 }
                 FilterProvider.REQUEST_NEW_FILTER -> {
                     application.navigator.navigateToFilterEdit()
@@ -103,6 +104,11 @@ fun SidebarPane(
                 is CustomFilter -> {
                     filter.id?.let { filterId ->
                         application.navigator.navigateToFilterEdit(filterId)
+                    }
+                }
+                is PlaceFilter -> {
+                    filter.place.id.let { placeId ->
+                        application.navigator.navigateToPlaceEdit(placeId)
                     }
                 }
                 else -> {

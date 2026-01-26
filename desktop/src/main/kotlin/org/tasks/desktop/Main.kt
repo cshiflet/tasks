@@ -17,6 +17,7 @@ import org.tasks.desktop.notifications.ReminderScheduler
 import org.tasks.desktop.notifications.SystemTrayManager
 import org.tasks.desktop.screens.AccountSetupScreen
 import org.tasks.desktop.screens.MainScreen
+import org.tasks.desktop.screens.PlaceEditScreen
 import org.tasks.desktop.screens.SettingsScreen
 import org.tasks.desktop.screens.TagEditScreen
 import org.tasks.desktop.sync.DesktopSyncManager
@@ -213,6 +214,17 @@ fun main() = application {
                             application = app,
                             onNavigateBack = {
                                 app.loadFilters() // Refresh sidebar tags
+                                app.navigator.goBack()
+                            },
+                        )
+                    }
+                    is Screen.PlaceEdit -> {
+                        val placeScreen = currentScreen as Screen.PlaceEdit
+                        PlaceEditScreen(
+                            placeId = placeScreen.placeId,
+                            application = app,
+                            onNavigateBack = {
+                                app.loadFilters() // Refresh sidebar places
                                 app.navigator.goBack()
                             },
                         )

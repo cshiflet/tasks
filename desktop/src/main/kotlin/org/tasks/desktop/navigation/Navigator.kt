@@ -56,4 +56,8 @@ class Navigator {
     fun navigateToFilterEdit(filterId: Long? = null) {
         navigate(Screen.FilterEdit(filterId))
     }
+
+    fun navigateToPlaceEdit(placeId: Long? = null) {
+        navigate(Screen.PlaceEdit(placeId))
+    }
 }

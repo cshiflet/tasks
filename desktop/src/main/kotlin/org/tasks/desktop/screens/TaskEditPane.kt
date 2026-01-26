@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material3.AssistChip
@@ -65,6 +66,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.tasks.data.entity.CaldavCalendar
 import org.tasks.data.entity.CaldavTask
+import org.tasks.data.entity.Geofence
+import org.tasks.data.entity.Place
 import org.tasks.data.entity.TagData
 import org.tasks.data.entity.Task
 import org.tasks.desktop.DesktopApplication
@@ -95,23 +98,31 @@ fun TaskEditPane(
     var selectedTags by remember { mutableStateOf<List<TagData>>(emptyList()) }
     var isNew by remember { mutableStateOf(taskId == null) }
 
-    // Available lists and tags
+    // Available lists, tags, and places
     var availableLists by remember { mutableStateOf<List<CaldavCalendar>>(emptyList()) }
     var availableTags by remember { mutableStateOf<List<TagData>>(emptyList()) }
+    var availablePlaces by remember { mutableStateOf<List<Place>>(emptyList()) }
+
+    // Place/Location state
+    var selectedPlace by remember { mutableStateOf<Place?>(null) }
+    var arrivalEnabled by remember { mutableStateOf(true) }
+    var departureEnabled by remember { mutableStateOf(false) }
 
     // Dropdowns
     var showPriorityMenu by remember { mutableStateOf(false) }
     var showListMenu by remember { mutableStateOf(false) }
     var showTagMenu by remember { mutableStateOf(false) }
+    var showPlaceMenu by remember { mutableStateOf(false) }
     var showDatePicker by remember { mutableStateOf(false) }
     var showCalendarDialog by remember { mutableStateOf(false) }
     var showTimePicker by remember { mutableStateOf(false) }
 
     LaunchedEffect(taskId) {
         withContext(Dispatchers.IO) {
-            // Load available lists and tags
+            // Load available lists, tags, and places
             availableLists = application.caldavDao.getCalendars()
             availableTags = application.tagDataDao.getAll()
+            availablePlaces = application.locationDao.getPlaces()
 
             if (taskId != null) {
                 val loadedTask = application.taskDao.fetch(taskId)
@@ -128,6 +139,15 @@ fun TaskEditPane(
 
                 // Load task's tags
                 selectedTags = application.tagDataDao.getTagDataForTask(taskId)
+
+                // Load task's place/geofence
+                val geofences = application.locationDao.getGeofencesForTask(taskId)
+                if (geofences.isNotEmpty()) {
+                    val geofence = geofences.first()
+                    selectedPlace = geofence.place?.let { application.locationDao.getPlace(it) }
+                    arrivalEnabled = geofence.isArrival
+                    departureEnabled = geofence.isDeparture
+                }
             } else {
                 task = Task()
                 title = ""
@@ -136,6 +156,9 @@ fun TaskEditPane(
                 dueDate = 0L
                 selectedListId = null
                 selectedTags = emptyList()
+                selectedPlace = null
+                arrivalEnabled = true
+                departureEnabled = false
                 isNew = true
             }
         }
@@ -202,6 +225,39 @@ fun TaskEditPane(
                         name = tag.name,
                     )
                 )
+            }
+
+            // Update place/geofence
+            val existingGeofences = application.locationDao.getGeofencesForTask(savedTaskId)
+            when {
+                selectedPlace != null && existingGeofences.isEmpty() -> {
+                    // Create new Geofence
+                    application.locationDao.insert(
+                        Geofence(
+                            task = savedTaskId,
+                            place = selectedPlace?.uid,
+                            isArrival = arrivalEnabled,
+                            isDeparture = departureEnabled,
+                        )
+                    )
+                }
+                selectedPlace != null && existingGeofences.isNotEmpty() -> {
+                    // Update existing Geofence
+                    val existing = existingGeofences.first()
+                    application.locationDao.update(
+                        existing.copy(
+                            place = selectedPlace?.uid,
+                            isArrival = arrivalEnabled,
+                            isDeparture = departureEnabled,
+                        )
+                    )
+                }
+                selectedPlace == null && existingGeofences.isNotEmpty() -> {
+                    // Delete Geofence (remove place from task)
+                    existingGeofences.forEach { geofence ->
+                        application.locationDao.delete(geofence)
+                    }
+                }
             }
 
             withContext(Dispatchers.Main) {
@@ -927,6 +983,138 @@ fun TaskEditPane(
                                             onClick = {
                                                 selectedTags = selectedTags + tag
                                                 showTagMenu = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Location/Place
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOn,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp).padding(top = 4.dp),
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Location",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    if (selectedPlace != null) {
+                        // Show selected place with remove option
+                        val place = selectedPlace!!
+                        val hasColor = place.color != 0
+                        val placeColor = if (hasColor) Color(place.color) else MaterialTheme.colorScheme.secondaryContainer
+                        val contentColor = if (hasColor) Color.White else MaterialTheme.colorScheme.onSecondaryContainer
+
+                        InputChip(
+                            selected = true,
+                            onClick = { selectedPlace = null },
+                            label = { Text(place.displayName, color = contentColor) },
+                            trailingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Remove",
+                                    modifier = Modifier.size(16.dp),
+                                    tint = contentColor,
+                                )
+                            },
+                            colors = InputChipDefaults.inputChipColors(
+                                selectedContainerColor = placeColor,
+                                selectedLabelColor = contentColor,
+                                selectedTrailingIconColor = contentColor,
+                            )
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Arrival/Departure options
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            FilterChip(
+                                selected = arrivalEnabled,
+                                onClick = { arrivalEnabled = !arrivalEnabled },
+                                label = { Text("On arrival") },
+                            )
+                            FilterChip(
+                                selected = departureEnabled,
+                                onClick = { departureEnabled = !departureEnabled },
+                                label = { Text("On departure") },
+                            )
+                        }
+                    } else {
+                        // Show add place button
+                        Box {
+                            AssistChip(
+                                onClick = { showPlaceMenu = true },
+                                label = { Text("Add location") },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Add,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            )
+                            DropdownMenu(
+                                expanded = showPlaceMenu,
+                                onDismissRequest = { showPlaceMenu = false }
+                            ) {
+                                if (availablePlaces.isEmpty()) {
+                                    DropdownMenuItem(
+                                        text = { Text("No places available") },
+                                        onClick = { showPlaceMenu = false },
+                                        enabled = false,
+                                    )
+                                } else {
+                                    availablePlaces.forEach { place ->
+                                        DropdownMenuItem(
+                                            text = {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                ) {
+                                                    if (place.color != 0) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .size(12.dp)
+                                                                .clip(CircleShape)
+                                                                .background(Color(place.color))
+                                                        )
+                                                    }
+                                                    Column {
+                                                        Text(place.displayName)
+                                                        place.displayAddress?.let {
+                                                            Text(
+                                                                text = it,
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            onClick = {
+                                                selectedPlace = place
+                                                showPlaceMenu = false
                                             }
                                         )
                                     }

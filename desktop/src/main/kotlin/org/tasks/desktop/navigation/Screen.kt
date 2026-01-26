@@ -11,4 +11,5 @@ sealed class Screen {
     data class ListEdit(val listId: Long? = null, val accountId: Long? = null) : Screen()
     data class TagEdit(val tagId: Long? = null) : Screen()
     data class FilterEdit(val filterId: Long? = null) : Screen()
+    data class PlaceEdit(val placeId: Long? = null) : Screen()
 }
