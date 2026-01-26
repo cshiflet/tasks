@@ -18,6 +18,7 @@ import org.tasks.desktop.notifications.SystemTrayManager
 import org.tasks.desktop.screens.AccountSetupScreen
 import org.tasks.desktop.screens.MainScreen
 import org.tasks.desktop.screens.SettingsScreen
+import org.tasks.desktop.screens.TagEditScreen
 import org.tasks.desktop.sync.DesktopSyncManager
 import org.tasks.themes.TasksTheme
 
@@ -205,7 +206,18 @@ fun main() = application {
                             onEditAccount = { accountId -> app.navigator.navigateToAccountEdit(accountId) },
                         )
                     }
-                    is Screen.ListEdit, is Screen.TagEdit, is Screen.FilterEdit -> {
+                    is Screen.TagEdit -> {
+                        val tagScreen = currentScreen as Screen.TagEdit
+                        TagEditScreen(
+                            tagId = tagScreen.tagId,
+                            application = app,
+                            onNavigateBack = {
+                                app.loadFilters() // Refresh sidebar tags
+                                app.navigator.goBack()
+                            },
+                        )
+                    }
+                    is Screen.ListEdit, is Screen.FilterEdit -> {
                         MainScreen(
                             application = app,
                             onNewTask = { filter ->
