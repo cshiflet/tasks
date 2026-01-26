@@ -24,7 +24,10 @@ import org.tasks.compose.drawer.DrawerItem
 import org.tasks.compose.drawer.MenuSearchBar
 import org.tasks.compose.drawer.TaskListDrawer
 import org.tasks.desktop.DesktopApplication
+import org.tasks.filters.CaldavFilter
+import org.tasks.filters.CustomFilter
 import org.tasks.filters.FilterProvider
+import org.tasks.filters.TagFilter
 import java.awt.Desktop
 import java.net.URI
 
@@ -84,6 +87,28 @@ fun SidebarPane(
                 query = drawerQuery,
                 onQueryChange = { application.updateDrawerQuery(it) }
             )
+        },
+        onEditClick = { item ->
+            when (val filter = item.filter) {
+                is TagFilter -> {
+                    filter.tagData.id?.let { tagId ->
+                        application.navigator.navigateToTagEdit(tagId)
+                    }
+                }
+                is CaldavFilter -> {
+                    filter.calendar.id?.let { listId ->
+                        application.navigator.navigateToListEdit(listId = listId)
+                    }
+                }
+                is CustomFilter -> {
+                    filter.id?.let { filterId ->
+                        application.navigator.navigateToFilterEdit(filterId)
+                    }
+                }
+                else -> {
+                    // Not editable
+                }
+            }
         }
     )
 }

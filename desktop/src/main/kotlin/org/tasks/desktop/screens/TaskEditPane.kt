@@ -41,6 +41,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.InputChip
+import androidx.compose.material3.InputChipDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -854,19 +855,29 @@ fun TaskEditPane(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         selectedTags.forEach { tag ->
+                            val hasColor = tag.color != null && tag.color != 0
+                            val tagColor = if (hasColor) Color(tag.color!!) else MaterialTheme.colorScheme.secondaryContainer
+                            val contentColor = if (hasColor) Color.White else MaterialTheme.colorScheme.onSecondaryContainer
+
                             InputChip(
                                 selected = true,
                                 onClick = {
                                     selectedTags = selectedTags - tag
                                 },
-                                label = { Text(tag.name ?: "") },
+                                label = { Text(tag.name ?: "", color = contentColor) },
                                 trailingIcon = {
                                     Icon(
                                         imageVector = Icons.Default.Close,
                                         contentDescription = "Remove",
                                         modifier = Modifier.size(16.dp),
+                                        tint = contentColor,
                                     )
-                                }
+                                },
+                                colors = InputChipDefaults.inputChipColors(
+                                    selectedContainerColor = tagColor,
+                                    selectedLabelColor = contentColor,
+                                    selectedTrailingIconColor = contentColor,
+                                )
                             )
                         }
                         Box {
@@ -897,7 +908,22 @@ fun TaskEditPane(
                                 } else {
                                     unselectedTags.forEach { tag ->
                                         DropdownMenuItem(
-                                            text = { Text(tag.name ?: "") },
+                                            text = {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                ) {
+                                                    if (tag.color != null && tag.color != 0) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .size(12.dp)
+                                                                .clip(CircleShape)
+                                                                .background(Color(tag.color!!))
+                                                        )
+                                                    }
+                                                    Text(tag.name ?: "")
+                                                }
+                                            },
                                             onClick = {
                                                 selectedTags = selectedTags + tag
                                                 showTagMenu = false

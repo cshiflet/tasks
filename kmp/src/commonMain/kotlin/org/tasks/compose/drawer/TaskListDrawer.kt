@@ -22,13 +22,17 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.HelpOutline
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AttachMoney
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.PeopleOutline
 import androidx.compose.material.icons.outlined.PermIdentity
 import androidx.compose.material.icons.outlined.SyncProblem
@@ -79,6 +83,7 @@ fun TaskListDrawer(
     onAddClick: (DrawerItem.Header) -> Unit,
     onErrorClick: () -> Unit,
     searchBar: @Composable RowScope.() -> Unit,
+    onEditClick: ((DrawerItem.Filter) -> Unit)? = null,
 ) {
     val bottomAppBarScrollBehavior = BottomAppBarDefaults.exitAlwaysScrollBehavior()
     var bottomBarHeight by remember { mutableStateOf(0.dp) }
@@ -137,7 +142,8 @@ fun TaskListDrawer(
                 when (it) {
                     is DrawerItem.Filter -> FilterItem(
                         item = it,
-                        onClick = { onClick(it) }
+                        onClick = { onClick(it) },
+                        onEditClick = onEditClick?.let { callback -> { callback(it) } },
                     )
 
                     is DrawerItem.Header -> HeaderItem(
@@ -158,6 +164,7 @@ internal fun FilterItem(
     modifier: Modifier = Modifier,
     item: DrawerItem.Filter,
     onClick: () -> Unit,
+    onEditClick: (() -> Unit)? = null,
 ) {
     MenuRow(
         modifier = modifier
@@ -170,13 +177,23 @@ internal fun FilterItem(
             .clickable(onClick = onClick),
         onClick = onClick,
     ) {
-        TasksIcon(
-            label = item.icon,
-            tint = when (item.color) {
-                0 -> MaterialTheme.colorScheme.onSurface
-                else -> Color(color = item.color)
-            }
-        )
+        // Show colored circle indicator when there's a color but no icon
+        if (item.icon == null && item.color != 0) {
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .clip(CircleShape)
+                    .background(Color(color = item.color))
+            )
+        } else {
+            TasksIcon(
+                label = item.icon,
+                tint = when (item.color) {
+                    0 -> MaterialTheme.colorScheme.onSurface
+                    else -> Color(color = item.color)
+                }
+            )
+        }
         Spacer(modifier = Modifier.width(16.dp))
         Text(
             text = item.title,
@@ -194,6 +211,16 @@ internal fun FilterItem(
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurface,
             )
+        }
+        if (onEditClick != null) {
+            IconButton(onClick = onEditClick) {
+                Icon(
+                    imageVector = Icons.Outlined.Edit,
+                    contentDescription = "Edit",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
         }
         Box(
             contentAlignment = Alignment.CenterEnd,
