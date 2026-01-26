@@ -34,6 +34,8 @@ import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -68,7 +70,10 @@ import org.tasks.desktop.DesktopApplication
 import org.tasks.kmp.formatDate
 import org.tasks.kmp.org.tasks.time.DateStyle
 import org.tasks.time.DateTimeUtils2.currentTimeMillis
+import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.ZoneId
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -98,6 +103,8 @@ fun TaskEditPane(
     var showListMenu by remember { mutableStateOf(false) }
     var showTagMenu by remember { mutableStateOf(false) }
     var showDatePicker by remember { mutableStateOf(false) }
+    var showCalendarDialog by remember { mutableStateOf(false) }
+    var showTimePicker by remember { mutableStateOf(false) }
 
     LaunchedEffect(taskId) {
         withContext(Dispatchers.IO) {
@@ -354,10 +361,18 @@ fun TaskEditPane(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(modifier = Modifier.weight(1f))
+
+                // Date button
                 Box {
                     TextButton(onClick = { showDatePicker = !showDatePicker }) {
                         Text(
-                            text = if (dueDate > 0) formatDate(dueDate, DateStyle.MEDIUM) else "Set date",
+                            text = if (dueDate > 0) {
+                                val dateTime = LocalDateTime.ofInstant(
+                                    Instant.ofEpochMilli(dueDate),
+                                    ZoneId.systemDefault()
+                                )
+                                dateTime.toLocalDate().toString()
+                            } else "Set date",
                             color = if (dueDate > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary,
                         )
                     }
@@ -368,8 +383,12 @@ fun TaskEditPane(
                         DropdownMenuItem(
                             text = { Text("Today") },
                             onClick = {
+                                val currentTime = if (dueDate > 0) {
+                                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault()).toLocalTime()
+                                } else LocalTime.MIDNIGHT
                                 dueDate = LocalDate.now()
-                                    .atStartOfDay(ZoneId.systemDefault())
+                                    .atTime(currentTime)
+                                    .atZone(ZoneId.systemDefault())
                                     .toInstant()
                                     .toEpochMilli()
                                 showDatePicker = false
@@ -378,8 +397,12 @@ fun TaskEditPane(
                         DropdownMenuItem(
                             text = { Text("Tomorrow") },
                             onClick = {
+                                val currentTime = if (dueDate > 0) {
+                                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault()).toLocalTime()
+                                } else LocalTime.MIDNIGHT
                                 dueDate = LocalDate.now().plusDays(1)
-                                    .atStartOfDay(ZoneId.systemDefault())
+                                    .atTime(currentTime)
+                                    .atZone(ZoneId.systemDefault())
                                     .toInstant()
                                     .toEpochMilli()
                                 showDatePicker = false
@@ -388,14 +411,27 @@ fun TaskEditPane(
                         DropdownMenuItem(
                             text = { Text("Next week") },
                             onClick = {
+                                val currentTime = if (dueDate > 0) {
+                                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault()).toLocalTime()
+                                } else LocalTime.MIDNIGHT
                                 dueDate = LocalDate.now().plusWeeks(1)
-                                    .atStartOfDay(ZoneId.systemDefault())
+                                    .atTime(currentTime)
+                                    .atZone(ZoneId.systemDefault())
                                     .toInstant()
                                     .toEpochMilli()
                                 showDatePicker = false
                             }
                         )
+                        HorizontalDivider()
+                        DropdownMenuItem(
+                            text = { Text("Pick a date...") },
+                            onClick = {
+                                showDatePicker = false
+                                showCalendarDialog = true
+                            }
+                        )
                         if (dueDate > 0) {
+                            HorizontalDivider()
                             DropdownMenuItem(
                                 text = { Text("Clear", color = MaterialTheme.colorScheme.error) },
                                 onClick = {
@@ -406,6 +442,335 @@ fun TaskEditPane(
                         }
                     }
                 }
+
+                // Time button (only show if date is set)
+                if (dueDate > 0) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    val currentDateTime = LocalDateTime.ofInstant(
+                        Instant.ofEpochMilli(dueDate),
+                        ZoneId.systemDefault()
+                    )
+                    val hasTime = currentDateTime.toLocalTime() != LocalTime.MIDNIGHT
+                    TextButton(onClick = { showTimePicker = true }) {
+                        Text(
+                            text = if (hasTime) {
+                                String.format("%02d:%02d", currentDateTime.hour, currentDateTime.minute)
+                            } else "Set time",
+                            color = if (hasTime) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+            }
+
+            // Date Picker Dialog (custom implementation for desktop compatibility)
+            if (showCalendarDialog) {
+                val initialDateTime = if (dueDate > 0) {
+                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault())
+                } else LocalDateTime.now()
+
+                val currentYear = LocalDate.now().year
+                val years = (currentYear - 2..currentYear + 5).toList()
+                val months = listOf(
+                    1 to "January", 2 to "February", 3 to "March", 4 to "April",
+                    5 to "May", 6 to "June", 7 to "July", 8 to "August",
+                    9 to "September", 10 to "October", 11 to "November", 12 to "December"
+                )
+
+                var selectedYear by remember { mutableStateOf(initialDateTime.year) }
+                var selectedMonth by remember { mutableStateOf(initialDateTime.monthValue) }
+                var selectedDay by remember { mutableStateOf(initialDateTime.dayOfMonth) }
+
+                var showYearDropdown by remember { mutableStateOf(false) }
+                var showMonthDropdown by remember { mutableStateOf(false) }
+                var showDayDropdown by remember { mutableStateOf(false) }
+
+                // Calculate days in selected month
+                val daysInMonth = try {
+                    LocalDate.of(selectedYear, selectedMonth, 1).lengthOfMonth()
+                } catch (e: Exception) { 31 }
+                val days = (1..daysInMonth).toList()
+
+                // Adjust day if it exceeds days in month
+                if (selectedDay > daysInMonth) {
+                    selectedDay = daysInMonth
+                }
+
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { showCalendarDialog = false },
+                    title = { Text("Select date") },
+                    text = {
+                        Column {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                // Year dropdown
+                                ExposedDropdownMenuBox(
+                                    expanded = showYearDropdown,
+                                    onExpandedChange = { showYearDropdown = it },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    OutlinedTextField(
+                                        value = selectedYear.toString(),
+                                        onValueChange = {},
+                                        label = { Text("Year") },
+                                        readOnly = true,
+                                        singleLine = true,
+                                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = showYearDropdown) },
+                                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                                    )
+                                    ExposedDropdownMenu(
+                                        expanded = showYearDropdown,
+                                        onDismissRequest = { showYearDropdown = false }
+                                    ) {
+                                        years.forEach { year ->
+                                            DropdownMenuItem(
+                                                text = { Text(year.toString()) },
+                                                onClick = {
+                                                    selectedYear = year
+                                                    showYearDropdown = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+
+                                // Month dropdown
+                                ExposedDropdownMenuBox(
+                                    expanded = showMonthDropdown,
+                                    onExpandedChange = { showMonthDropdown = it },
+                                    modifier = Modifier.weight(1.5f)
+                                ) {
+                                    OutlinedTextField(
+                                        value = months.find { it.first == selectedMonth }?.second ?: "",
+                                        onValueChange = {},
+                                        label = { Text("Month") },
+                                        readOnly = true,
+                                        singleLine = true,
+                                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = showMonthDropdown) },
+                                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                                    )
+                                    ExposedDropdownMenu(
+                                        expanded = showMonthDropdown,
+                                        onDismissRequest = { showMonthDropdown = false }
+                                    ) {
+                                        months.forEach { (num, name) ->
+                                            DropdownMenuItem(
+                                                text = { Text(name) },
+                                                onClick = {
+                                                    selectedMonth = num
+                                                    showMonthDropdown = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+
+                                // Day dropdown
+                                ExposedDropdownMenuBox(
+                                    expanded = showDayDropdown,
+                                    onExpandedChange = { showDayDropdown = it },
+                                    modifier = Modifier.weight(0.8f)
+                                ) {
+                                    OutlinedTextField(
+                                        value = selectedDay.toString(),
+                                        onValueChange = {},
+                                        label = { Text("Day") },
+                                        readOnly = true,
+                                        singleLine = true,
+                                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = showDayDropdown) },
+                                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                                    )
+                                    ExposedDropdownMenu(
+                                        expanded = showDayDropdown,
+                                        onDismissRequest = { showDayDropdown = false }
+                                    ) {
+                                        days.forEach { day ->
+                                            DropdownMenuItem(
+                                                text = { Text(day.toString()) },
+                                                onClick = {
+                                                    selectedDay = day
+                                                    showDayDropdown = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                val selectedDate = LocalDate.of(selectedYear, selectedMonth, selectedDay)
+                                val existingTime = if (dueDate > 0) {
+                                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault()).toLocalTime()
+                                } else LocalTime.MIDNIGHT
+
+                                dueDate = selectedDate
+                                    .atTime(existingTime)
+                                    .atZone(ZoneId.systemDefault())
+                                    .toInstant()
+                                    .toEpochMilli()
+                                showCalendarDialog = false
+                            }
+                        ) {
+                            Text("OK")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showCalendarDialog = false }) {
+                            Text("Cancel")
+                        }
+                    }
+                )
+            }
+
+            // Time Picker Dialog (custom implementation for desktop compatibility)
+            if (showTimePicker) {
+                val currentDateTime = if (dueDate > 0) {
+                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault())
+                } else LocalDateTime.now()
+
+                val hours = (0..23).toList()
+                val minutes = (0..59 step 5).toList() // 5-minute increments for easier selection
+
+                var selectedHour by remember { mutableStateOf(currentDateTime.hour) }
+                var selectedMinute by remember { mutableStateOf((currentDateTime.minute / 5) * 5) } // Round to nearest 5
+
+                var showHourDropdown by remember { mutableStateOf(false) }
+                var showMinuteDropdown by remember { mutableStateOf(false) }
+
+                val existingHasTime = if (dueDate > 0) {
+                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault()).toLocalTime() != LocalTime.MIDNIGHT
+                } else false
+
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { showTimePicker = false },
+                    title = { Text("Select time") },
+                    text = {
+                        Column {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                // Hour dropdown
+                                ExposedDropdownMenuBox(
+                                    expanded = showHourDropdown,
+                                    onExpandedChange = { showHourDropdown = it },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    OutlinedTextField(
+                                        value = String.format("%02d", selectedHour),
+                                        onValueChange = {},
+                                        label = { Text("Hour") },
+                                        readOnly = true,
+                                        singleLine = true,
+                                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = showHourDropdown) },
+                                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                                    )
+                                    ExposedDropdownMenu(
+                                        expanded = showHourDropdown,
+                                        onDismissRequest = { showHourDropdown = false }
+                                    ) {
+                                        hours.forEach { hour ->
+                                            DropdownMenuItem(
+                                                text = { Text(String.format("%02d", hour)) },
+                                                onClick = {
+                                                    selectedHour = hour
+                                                    showHourDropdown = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+
+                                Text(":", style = MaterialTheme.typography.headlineMedium)
+
+                                // Minute dropdown
+                                ExposedDropdownMenuBox(
+                                    expanded = showMinuteDropdown,
+                                    onExpandedChange = { showMinuteDropdown = it },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    OutlinedTextField(
+                                        value = String.format("%02d", selectedMinute),
+                                        onValueChange = {},
+                                        label = { Text("Minute") },
+                                        readOnly = true,
+                                        singleLine = true,
+                                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = showMinuteDropdown) },
+                                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                                    )
+                                    ExposedDropdownMenu(
+                                        expanded = showMinuteDropdown,
+                                        onDismissRequest = { showMinuteDropdown = false }
+                                    ) {
+                                        minutes.forEach { minute ->
+                                            DropdownMenuItem(
+                                                text = { Text(String.format("%02d", minute)) },
+                                                onClick = {
+                                                    selectedMinute = minute
+                                                    showMinuteDropdown = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            Text(
+                                text = "24-hour format",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                val currentDate = if (dueDate > 0) {
+                                    LocalDateTime.ofInstant(Instant.ofEpochMilli(dueDate), ZoneId.systemDefault()).toLocalDate()
+                                } else LocalDate.now()
+
+                                dueDate = currentDate
+                                    .atTime(selectedHour, selectedMinute)
+                                    .atZone(ZoneId.systemDefault())
+                                    .toInstant()
+                                    .toEpochMilli()
+                                showTimePicker = false
+                            }
+                        ) {
+                            Text("OK")
+                        }
+                    },
+                    dismissButton = {
+                        Row {
+                            if (existingHasTime) {
+                                TextButton(
+                                    onClick = {
+                                        // Clear the time, keep only the date
+                                        val currentDate = LocalDateTime.ofInstant(
+                                            Instant.ofEpochMilli(dueDate),
+                                            ZoneId.systemDefault()
+                                        ).toLocalDate()
+                                        dueDate = currentDate
+                                            .atStartOfDay(ZoneId.systemDefault())
+                                            .toInstant()
+                                            .toEpochMilli()
+                                        showTimePicker = false
+                                    }
+                                ) {
+                                    Text("Clear time", color = MaterialTheme.colorScheme.error)
+                                }
+                            }
+                            TextButton(onClick = { showTimePicker = false }) {
+                                Text("Cancel")
+                            }
+                        }
+                    }
+                )
             }
 
             Spacer(modifier = Modifier.height(12.dp))
