@@ -15,7 +15,10 @@ import org.tasks.desktop.di.DesktopContainer
 import org.tasks.desktop.navigation.Screen
 import org.tasks.desktop.notifications.ReminderScheduler
 import org.tasks.desktop.notifications.SystemTrayManager
+import org.tasks.desktop.screens.AccountEditScreen
 import org.tasks.desktop.screens.AccountSetupScreen
+import org.tasks.desktop.screens.FilterEditScreen
+import org.tasks.desktop.screens.ListEditScreen
 import org.tasks.desktop.screens.MainScreen
 import org.tasks.desktop.screens.PlaceEditScreen
 import org.tasks.desktop.screens.SettingsScreen
@@ -200,11 +203,14 @@ fun main() = application {
                         )
                     }
                     is Screen.AccountEdit -> {
-                        SettingsScreen(
+                        val accountScreen = currentScreen as Screen.AccountEdit
+                        AccountEditScreen(
+                            accountId = accountScreen.accountId,
                             application = app,
-                            onNavigateBack = { app.navigator.goBack() },
-                            onAddAccount = { app.navigator.navigateToAccountSetup() },
-                            onEditAccount = { accountId -> app.navigator.navigateToAccountEdit(accountId) },
+                            onNavigateBack = {
+                                app.loadFilters()
+                                app.navigator.goBack()
+                            },
                         )
                     }
                     is Screen.TagEdit -> {
@@ -229,16 +235,33 @@ fun main() = application {
                             },
                         )
                     }
-                    is Screen.ListEdit, is Screen.FilterEdit -> {
-                        MainScreen(
+                    is Screen.ListEdit -> {
+                        val listScreen = currentScreen as Screen.ListEdit
+                        ListEditScreen(
+                            listId = listScreen.listId,
+                            accountId = listScreen.accountId,
                             application = app,
-                            onNewTask = { filter ->
-                                app.navigator.navigate(Screen.TaskEdit(taskId = null, filter = filter))
-                            },
-                            onEditTask = { taskId ->
-                                app.navigator.navigate(Screen.TaskEdit(taskId = taskId))
+                            onNavigateBack = {
+                                app.loadFilters()
+                                app.navigator.goBack()
                             },
                         )
+                    }
+                    is Screen.FilterEdit -> {
+                        val filterScreen = currentScreen as Screen.FilterEdit
+                        if (filterScreen.filterId != null) {
+                            FilterEditScreen(
+                                filterId = filterScreen.filterId,
+                                application = app,
+                                onNavigateBack = {
+                                    app.loadFilters()
+                                    app.navigator.goBack()
+                                },
+                            )
+                        } else {
+                            // New filter creation requires the filter builder — not yet supported
+                            app.navigator.goBack()
+                        }
                     }
                 }
             }
