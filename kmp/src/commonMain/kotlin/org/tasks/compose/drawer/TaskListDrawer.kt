@@ -84,6 +84,7 @@ fun TaskListDrawer(
     onErrorClick: () -> Unit,
     searchBar: @Composable RowScope.() -> Unit,
     onEditClick: ((DrawerItem.Filter) -> Unit)? = null,
+    headerTrailing: (@Composable (DrawerItem.Header) -> Unit)? = null,
 ) {
     val bottomAppBarScrollBehavior = BottomAppBarDefaults.exitAlwaysScrollBehavior()
     var bottomBarHeight by remember { mutableStateOf(0.dp) }
@@ -152,6 +153,7 @@ fun TaskListDrawer(
                         toggleCollapsed = { onClick(it) },
                         onAddClick = { onAddClick(it) },
                         onErrorClick = onErrorClick,
+                        trailingContent = headerTrailing?.let { trailing -> { trailing(it) } },
                     )
                 }
             }
@@ -243,6 +245,7 @@ internal fun HeaderItem(
     toggleCollapsed: () -> Unit,
     onAddClick: () -> Unit,
     onErrorClick: () -> Unit,
+    trailingContent: (@Composable () -> Unit)? = null,
 ) {
     Column(
         modifier = modifier,
@@ -271,6 +274,7 @@ internal fun HeaderItem(
                     )
                 }
             }
+            trailingContent?.invoke()
             if (item.hasError) {
                 IconButton(onClick = onErrorClick) {
                     Icon(

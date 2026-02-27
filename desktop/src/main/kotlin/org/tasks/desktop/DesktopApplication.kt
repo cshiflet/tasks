@@ -10,6 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import org.tasks.compose.drawer.DrawerItem
 import org.tasks.desktop.di.DesktopContainer
@@ -41,6 +42,8 @@ class DesktopApplication(
         _taskRefreshTrigger.value++
     }
 
+    val syncManager get() = container.syncManager
+
     val navigator get() = container.navigator
     val taskDao get() = container.taskDao
     val caldavDao get() = container.caldavDao
@@ -54,6 +57,12 @@ class DesktopApplication(
 
     init {
         loadFilters()
+        // Reload sidebar after every full sync cycle (all accounts finished)
+        scope.launch {
+            container.syncManager.syncCompleteTrigger
+                .drop(1) // skip the initial StateFlow value of 0
+                .collect { loadFilters() }
+        }
     }
 
     fun loadFilters() {

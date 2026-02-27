@@ -23,7 +23,6 @@ import org.tasks.desktop.screens.MainScreen
 import org.tasks.desktop.screens.PlaceEditScreen
 import org.tasks.desktop.screens.SettingsScreen
 import org.tasks.desktop.screens.TagEditScreen
-import org.tasks.desktop.sync.DesktopSyncManager
 import org.tasks.themes.TasksTheme
 
 fun main() = application {
@@ -35,16 +34,7 @@ fun main() = application {
     val themeManager = remember { container.themeManager }
 
     // Initialize sync manager
-    val syncManager = remember {
-        DesktopSyncManager.getInstance(
-            caldavDao = container.caldavDao,
-            taskDao = container.taskDao,
-            deletionDao = container.deletionDao,
-            vtodoCache = container.vtodoCache,
-        ).apply {
-            startAutoSync()
-        }
-    }
+    val syncManager = remember { container.syncManager.apply { startAutoSync() } }
 
     // Initialize system tray
     val systemTray = remember {

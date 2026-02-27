@@ -26,6 +26,7 @@ import org.tasks.desktop.navigation.Navigator
 import org.tasks.desktop.platform.DesktopPaths
 import org.tasks.desktop.platform.ThemeManager
 import org.tasks.desktop.platform.WindowStateManager
+import org.tasks.desktop.sync.DesktopSyncManager
 import org.tasks.filters.FilterProvider
 import org.tasks.kmp.createDataStore
 import org.tasks.kmp.dataStoreFileName
@@ -96,6 +97,16 @@ class DesktopContainer {
 
     // Navigation
     val navigator: Navigator = Navigator()
+
+    // Sync manager
+    val syncManager: DesktopSyncManager by lazy {
+        DesktopSyncManager.getInstance(
+            caldavDao = caldavDao,
+            taskDao = taskDao,
+            deletionDao = deletionDao,
+            vtodoCache = vtodoCache,
+        )
+    }
 
     // Platform managers
     val windowStateManager: WindowStateManager by lazy { WindowStateManager() }
