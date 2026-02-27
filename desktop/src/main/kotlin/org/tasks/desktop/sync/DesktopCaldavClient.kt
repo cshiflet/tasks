@@ -3,8 +3,10 @@ package org.tasks.desktop.sync
 import at.bitfire.dav4jvm.BasicDigestAuthHandler
 import at.bitfire.dav4jvm.DavCollection
 import at.bitfire.dav4jvm.DavResource
+import at.bitfire.dav4jvm.Property
 import at.bitfire.dav4jvm.Response
 import at.bitfire.dav4jvm.Response.HrefRelation
+import at.bitfire.dav4jvm.XmlUtils
 import at.bitfire.dav4jvm.property.CalendarColor
 import at.bitfire.dav4jvm.property.CalendarHomeSet
 import at.bitfire.dav4jvm.property.CurrentUserPrincipal
@@ -42,6 +44,48 @@ class DesktopCaldavClient(
     val httpClient: OkHttpClient,
     private val homeSetUrl: HttpUrl,
 ) {
+
+    /**
+     * Creates a new VTODO-capable calendar collection on the server under [homeSetUrl].
+     * Sends an MKCOL request with the WebDAV Extended MKCOL XML body.
+     *
+     * @return the canonical URL of the newly created calendar.
+     */
+    suspend fun makeCollection(displayName: String, color: Int): String = withContext(Dispatchers.IO) {
+        val uuid = java.util.UUID.randomUUID().toString()
+        val calendarUrl = homeSetUrl.resolve("$uuid/")
+            ?: throw IllegalStateException("Cannot resolve new calendar URL under $homeSetUrl")
+        val xmlBody = buildMkcolXml(displayName, color)
+        val resource = DavResource(httpClient, calendarUrl)
+        resource.mkCol(xmlBody) {}
+        resource.location.toString()
+    }
+
+    /**
+     * Updates the display name and (optionally) color of an existing remote calendar via PROPPATCH.
+     */
+    suspend fun updateCollection(calendarUrl: String, displayName: String, color: Int) =
+        withContext(Dispatchers.IO) {
+            val url = calendarUrl.toHttpUrl()
+            val setProps = buildMap<Property.Name, String> {
+                put(DisplayName.NAME, displayName)
+                if (color != 0) {
+                    put(
+                        CalendarColor.NAME,
+                        String.format(
+                            "#%06X%02X",
+                            color and 0xFFFFFF,
+                            (color.toLong() ushr 24 and 0xFF).toInt(),
+                        ),
+                    )
+                }
+            }
+            DavResource(httpClient, url).proppatch(
+                setProperties = setProps,
+                removeProperties = emptyList(),
+                callback = { _, _ -> },
+            )
+        }
 
     /**
      * Returns all calendars under [homeSetUrl] that support VTODOs.
@@ -205,6 +249,41 @@ class DesktopCaldavClient(
                 ?.get(CurrentUserPrincipal::class.java)
                 ?.href
                 ?.takeIf { it.isNotBlank() }
+        }
+
+        /**
+         * Builds the Extended MKCOL XML body for creating a VTODO-capable calendar collection.
+         * Mirrors the Android CaldavClient.getMkcolString().
+         */
+        private fun buildMkcolXml(displayName: String, color: Int): String {
+            val colorXml = if (color != 0) {
+                val hex = String.format(
+                    "#%06X%02X",
+                    color and 0xFFFFFF,
+                    (color.toLong() ushr 24 and 0xFF).toInt(),
+                )
+                "<IC:calendar-color xmlns:IC=\"${XmlUtils.NS_APPLE_ICAL}\">$hex</IC:calendar-color>"
+            } else ""
+            val safeName = displayName
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            return """<?xml version="1.0" encoding="UTF-8"?>
+<mkcol xmlns="${XmlUtils.NS_WEBDAV}" xmlns:CAL="${XmlUtils.NS_CALDAV}">
+  <set>
+    <prop>
+      <resourcetype>
+        <collection/>
+        <CAL:calendar/>
+      </resourcetype>
+      <displayname>$safeName</displayname>
+      $colorXml
+      <CAL:supported-calendar-component-set>
+        <CAL:comp name="VTODO"/>
+      </CAL:supported-calendar-component-set>
+    </prop>
+  </set>
+</mkcol>"""
         }
 
         /**

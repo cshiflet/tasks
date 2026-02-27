@@ -46,8 +46,11 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.tasks.data.UUIDHelper
+import org.tasks.data.entity.CaldavAccount
 import org.tasks.data.entity.CaldavCalendar
 import org.tasks.desktop.DesktopApplication
+import org.tasks.desktop.sync.DesktopCaldavClient
 
 private val LIST_COLORS = listOf(
     0 to "None",
@@ -80,6 +83,8 @@ fun ListEditScreen(
     var selectedColor by remember { mutableStateOf(0) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(!isNew) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isSaving by remember { mutableStateOf(false) }
 
     LaunchedEffect(listId) {
         if (listId != null) {
@@ -96,29 +101,54 @@ fun ListEditScreen(
     }
 
     fun saveList() {
-        if (name.isBlank()) return
+        if (name.isBlank() || isSaving) return
+        isSaving = true
+        errorMessage = null
         scope.launch(Dispatchers.IO) {
-            if (isNew) {
-                val account = accountId?.let { application.caldavDao.getAccount(it) }
-                application.caldavDao.insert(
-                    CaldavCalendar(
-                        account = account?.uuid,
-                        name = name.trim(),
-                        color = selectedColor,
-                    )
-                )
-            } else {
-                calendar?.let {
-                    application.caldavDao.update(
-                        it.copy(
-                            name = name.trim(),
+            try {
+                if (isNew) {
+                    val account = accountId?.let { application.caldavDao.getAccount(it) }
+                    val trimmedName = name.trim()
+                    val calendarUrl: String? = if (account?.accountType == CaldavAccount.TYPE_CALDAV) {
+                        // Create the calendar on the CalDAV server first, then persist the URL.
+                        val serverUrl = account.url ?: error("Account has no server URL")
+                        val username = account.username ?: error("Account has no username")
+                        val password = account.password ?: error("Account has no password")
+                        val client = DesktopCaldavClient.forAccount(serverUrl, username, password)
+                        client.makeCollection(trimmedName, selectedColor)
+                    } else null
+                    application.caldavDao.insert(
+                        CaldavCalendar(
+                            account = account?.uuid,
+                            uuid = UUIDHelper.newUUID(),
+                            name = trimmedName,
                             color = selectedColor,
+                            url = calendarUrl,
                         )
                     )
+                } else {
+                    val cal = calendar ?: return@launch
+                    // Update display name/color on the server if this is a remote CalDAV calendar.
+                    if (!cal.url.isNullOrBlank()) {
+                        val account = cal.account?.let { application.caldavDao.getAccountByUuid(it) }
+                        if (account?.accountType == CaldavAccount.TYPE_CALDAV) {
+                            val serverUrl = account.url ?: error("Account has no server URL")
+                            val username = account.username ?: error("Account has no username")
+                            val password = account.password ?: error("Account has no password")
+                            val client = DesktopCaldavClient.forAccount(serverUrl, username, password)
+                            client.updateCollection(cal.url!!, name.trim(), selectedColor)
+                        }
+                    }
+                    application.caldavDao.update(
+                        cal.copy(name = name.trim(), color = selectedColor)
+                    )
                 }
-            }
-            withContext(Dispatchers.Main) {
-                onNavigateBack()
+                withContext(Dispatchers.Main) { onNavigateBack() }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    errorMessage = e.message ?: "Failed to save list"
+                    isSaving = false
+                }
             }
         }
     }
@@ -132,6 +162,17 @@ fun ListEditScreen(
                 onNavigateBack()
             }
         }
+    }
+
+    errorMessage?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { errorMessage = null },
+            title = { Text("Error") },
+            text = { Text(msg) },
+            confirmButton = {
+                TextButton(onClick = { errorMessage = null }) { Text("OK") }
+            },
+        )
     }
 
     if (showDeleteDialog) {
@@ -182,7 +223,7 @@ fun ListEditScreen(
                     }
                     IconButton(
                         onClick = { saveList() },
-                        enabled = name.isNotBlank(),
+                        enabled = name.isNotBlank() && !isSaving,
                     ) {
                         Icon(
                             imageVector = Icons.Default.Check,
