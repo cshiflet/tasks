@@ -106,6 +106,7 @@ fun MainScreen(
                             taskId = screen.taskId,
                             application = application,
                             onClose = { application.navigator.goBack() },
+                            initialFilter = screen.filter,
                         )
                     }
                 }

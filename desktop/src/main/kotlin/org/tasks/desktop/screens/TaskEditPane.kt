@@ -71,6 +71,8 @@ import org.tasks.data.entity.Place
 import org.tasks.data.entity.TagData
 import org.tasks.data.entity.Task
 import org.tasks.desktop.DesktopApplication
+import org.tasks.filters.CaldavFilter
+import org.tasks.filters.Filter
 import org.tasks.kmp.formatDate
 import org.tasks.kmp.org.tasks.time.DateStyle
 import org.tasks.time.DateTimeUtils2.currentTimeMillis
@@ -87,6 +89,7 @@ fun TaskEditPane(
     application: DesktopApplication,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
+    initialFilter: Filter? = null,
 ) {
     val scope = rememberCoroutineScope()
     var task by remember { mutableStateOf<Task?>(null) }
@@ -154,7 +157,9 @@ fun TaskEditPane(
                 notes = ""
                 priority = 3
                 dueDate = 0L
-                selectedListId = null
+                // Pre-select the current CalDAV list so tasks created while viewing
+                // a list filter are automatically saved to that list.
+                selectedListId = (initialFilter as? CaldavFilter)?.uuid
                 selectedTags = emptyList()
                 selectedPlace = null
                 arrivalEnabled = true

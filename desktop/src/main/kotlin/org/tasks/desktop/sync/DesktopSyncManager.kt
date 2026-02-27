@@ -10,7 +10,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.tasks.caldav.VtodoCache
 import org.tasks.data.dao.CaldavDao
+import org.tasks.data.dao.DeletionDao
 import org.tasks.data.dao.TaskDao
 import org.tasks.data.entity.CaldavAccount
 import java.util.concurrent.TimeUnit
@@ -18,6 +20,8 @@ import java.util.concurrent.TimeUnit
 class DesktopSyncManager(
     private val caldavDao: CaldavDao,
     private val taskDao: TaskDao,
+    private val deletionDao: DeletionDao,
+    private val vtodoCache: VtodoCache,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var syncJob: Job? = null
@@ -82,15 +86,12 @@ class DesktopSyncManager(
     }
 
     private suspend fun syncCaldavAccount(account: CaldavAccount) {
-        // TODO: Implement full CalDAV sync using CaldavClient from dav4jvm
-        // This will involve:
-        // 1. Fetching calendar list from server
-        // 2. Syncing each calendar's tasks
-        // 3. Uploading local changes
-        // 4. Downloading remote changes
-
-        // For now, just a placeholder that marks sync as completed
-        // The actual implementation would use the CaldavClient class
+        DesktopCaldavSynchronizer(
+            caldavDao = caldavDao,
+            taskDao = taskDao,
+            deletionDao = deletionDao,
+            vtodoCache = vtodoCache,
+        ).sync(account)
     }
 
     private suspend fun syncGoogleTasksAccount(account: CaldavAccount) {
@@ -102,9 +103,16 @@ class DesktopSyncManager(
         @Volatile
         private var instance: DesktopSyncManager? = null
 
-        fun getInstance(caldavDao: CaldavDao, taskDao: TaskDao): DesktopSyncManager {
+        fun getInstance(
+            caldavDao: CaldavDao,
+            taskDao: TaskDao,
+            deletionDao: DeletionDao,
+            vtodoCache: VtodoCache,
+        ): DesktopSyncManager {
             return instance ?: synchronized(this) {
-                instance ?: DesktopSyncManager(caldavDao, taskDao).also { instance = it }
+                instance ?: DesktopSyncManager(caldavDao, taskDao, deletionDao, vtodoCache).also {
+                    instance = it
+                }
             }
         }
     }

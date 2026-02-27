@@ -36,8 +36,9 @@ dependencies {
     implementation(libs.androidx.sqlite)
     implementation(libs.okhttp)
     implementation(libs.bitfire.dav4jvm)
-    // Note: ical4android and etebase are Android-only (AAR)
-    // CalDAV sync will need alternative iCal parsing for desktop
+    // ical4j is available transitively via dav4jvm but we declare it explicitly for clarity.
+    // ical4android is Android-only (AAR) so we use net.fortuna.ical4j directly here.
+    implementation("org.mnode.ical4j:ical4j:3.2.19")
     implementation(libs.google.api.tasks)
     implementation(libs.google.oauth2)
 }

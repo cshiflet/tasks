@@ -5,6 +5,8 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.room.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import kotlinx.coroutines.Dispatchers
+import org.tasks.caldav.FileStorage
+import org.tasks.caldav.VtodoCache
 import org.tasks.compose.drawer.DrawerConfiguration
 import org.tasks.data.dao.AlarmDao
 import org.tasks.data.dao.CaldavDao
@@ -69,6 +71,15 @@ class DesktopContainer {
     val userActivityDao: UserActivityDao by lazy { database.userActivityDao() }
     val googleTaskDao: GoogleTaskDao by lazy { database.googleTaskDao() }
     val taskListMetadataDao: TaskListMetadataDao by lazy { database.taskListMetadataDao() }
+
+    // VTODO file cache — stores raw iCalendar strings for conflict detection and upload.
+    // FileStorage uses appDataDir as its root; VtodoCache adds a "vtodo/" subdirectory.
+    val vtodoCache: VtodoCache by lazy {
+        VtodoCache(
+            caldavDao = caldavDao,
+            fileStorage = FileStorage(DesktopPaths.appDataDir.absolutePath),
+        )
+    }
 
     // Filter provider
     val filterProvider: FilterProvider by lazy {

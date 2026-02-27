@@ -36,7 +36,12 @@ fun main() = application {
 
     // Initialize sync manager
     val syncManager = remember {
-        DesktopSyncManager.getInstance(container.caldavDao, container.taskDao).apply {
+        DesktopSyncManager.getInstance(
+            caldavDao = container.caldavDao,
+            taskDao = container.taskDao,
+            deletionDao = container.deletionDao,
+            vtodoCache = container.vtodoCache,
+        ).apply {
             startAutoSync()
         }
     }
