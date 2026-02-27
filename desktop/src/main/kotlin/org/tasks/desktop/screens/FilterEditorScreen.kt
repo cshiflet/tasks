@@ -27,10 +27,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -57,6 +56,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import com.todoroo.astrid.api.PermaSql
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -64,7 +64,6 @@ import org.tasks.data.NO_ORDER
 import org.tasks.data.dao.TaskDao.TaskCriteria.activeAndVisible
 import org.tasks.data.entity.Alarm
 import org.tasks.data.entity.CaldavTask
-import org.tasks.data.entity.Filter
 import org.tasks.data.entity.Tag
 import org.tasks.data.entity.Task
 import org.tasks.data.sql.Criterion.Companion.and
@@ -75,15 +74,15 @@ import org.tasks.data.sql.Join.Companion.inner
 import org.tasks.data.sql.Query.Companion.select
 import org.tasks.data.sql.UnaryCriterion
 import org.tasks.data.sql.UnaryCriterion.Companion.isNotNull
-import com.todoroo.astrid.api.PermaSql
 import org.tasks.desktop.DesktopApplication
+import org.tasks.filters.CustomFilter
 import org.tasks.filters.SEPARATOR_ESCAPE
 import org.tasks.filters.SERIALIZATION_SEPARATOR
 import org.tasks.filters.mapToSerializedString
 import java.util.UUID
 
 // ────────────────────────────────────────────────────────────────────────────
-// Data model
+// Constants
 // ────────────────────────────────────────────────────────────────────────────
 
 private const val ID_UNIVERSE = "active"
@@ -105,6 +104,10 @@ private const val TYPE_ADD = 0
 private const val TYPE_SUBTRACT = 1
 private const val TYPE_INTERSECT = 2
 private const val TYPE_UNIVERSE = 3
+
+// ────────────────────────────────────────────────────────────────────────────
+// Data model
+// ────────────────────────────────────────────────────────────────────────────
 
 /** Describes a single criterion template (not yet instantiated with a value). */
 sealed class DesktopCriterionDef(
@@ -147,7 +150,7 @@ private data class DesktopCondition(
     val sql: String?,
     val value: String?,
     val valuesForNewTasks: Map<String, Any>?,
-    val conditionType: Int,   // TYPE_UNIVERSE, TYPE_INTERSECT, TYPE_ADD, TYPE_SUBTRACT
+    val conditionType: Int,  // TYPE_UNIVERSE, TYPE_INTERSECT, TYPE_ADD, TYPE_SUBTRACT
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -255,8 +258,7 @@ private val PRIORITY_ENTRY_VALUES = listOf(
     Task.Priority.NONE.toString(),
 )
 
-// Colors (same as in FilterEditScreen / TagEditScreen)
-private val CREATE_FILTER_COLORS = listOf(
+private val EDITOR_COLORS = listOf(
     0 to "None",
     0xFFE57373.toInt() to "Red",
     0xFFFF8A65.toInt() to "Orange",
@@ -271,8 +273,18 @@ private val CREATE_FILTER_COLORS = listOf(
 )
 
 // ────────────────────────────────────────────────────────────────────────────
-// SQL / criterion serialization helpers
+// Helpers
 // ────────────────────────────────────────────────────────────────────────────
+
+private fun universeCondition() = DesktopCondition(
+    criterionId = ID_UNIVERSE,
+    textTemplate = "Active",
+    displayText = "Active tasks",
+    sql = null,
+    value = null,
+    valuesForNewTasks = null,
+    conditionType = TYPE_UNIVERSE,
+)
 
 private fun escapeField(s: String?): String =
     s?.replace(SERIALIZATION_SEPARATOR, SEPARATOR_ESCAPE) ?: ""
@@ -285,7 +297,7 @@ private fun buildFilterSql(conditions: List<DesktopCondition>): String {
             TYPE_ADD -> sb.append(" OR ")
             TYPE_SUBTRACT -> sb.append(" AND NOT ")
             TYPE_INTERSECT -> sb.append(" AND ")
-            // TYPE_UNIVERSE: no prefix on the first item
+            // TYPE_UNIVERSE: no prefix
         }
         if (c.conditionType == TYPE_UNIVERSE || c.sql == null) {
             sb.append(activeAndVisible())
@@ -298,17 +310,16 @@ private fun buildFilterSql(conditions: List<DesktopCondition>): String {
 }
 
 /** Build the serialized criterion string (stored in Filter.criterion). */
-private fun buildCriterionString(conditions: List<DesktopCondition>): String {
-    return conditions.joinToString("\n") { c ->
+private fun buildCriterionString(conditions: List<DesktopCondition>): String =
+    conditions.joinToString("\n") { c ->
         listOf(
             escapeField(c.criterionId),
             escapeField(c.value),
             escapeField(c.textTemplate),
             c.conditionType,
-            c.sql ?: ""
+            c.sql ?: "",
         ).joinToString(SERIALIZATION_SEPARATOR)
     }.trim()
-}
 
 /** Build the serialized values string for new-task defaults (stored in Filter.values). */
 private fun buildValuesString(conditions: List<DesktopCondition>): String {
@@ -323,86 +334,314 @@ private fun buildValuesString(conditions: List<DesktopCondition>): String {
     return mapToSerializedString(values)
 }
 
+/**
+ * Parse a stored criterion string back into a list of conditions.
+ *
+ * Format per line: `identifier|value|textTemplate|type|sqlTemplate`
+ * Pipes in identifier/value/textTemplate are escaped as `!PIPE!`.
+ * The sqlTemplate field is unescaped and may contain literal pipes.
+ */
+private fun parseCriterion(
+    criterion: String?,
+    criterionDefs: List<DesktopCriterionDef>,
+): List<DesktopCondition> {
+    if (criterion.isNullOrBlank()) return listOf(universeCondition())
+
+    val parsed = criterion.split("\n")
+        .filter { it.isNotBlank() }
+        .mapNotNull { line ->
+            // Split into at most 5 parts so that the SQL field (last) can contain pipes.
+            val parts = line.split("|", limit = 5)
+            if (parts.size < 4) return@mapNotNull null
+
+            val id = parts[0].replace(SEPARATOR_ESCAPE, SERIALIZATION_SEPARATOR)
+            val rawValue = parts[1].replace(SEPARATOR_ESCAPE, SERIALIZATION_SEPARATOR)
+            val value = rawValue.takeIf { it.isNotEmpty() }
+            val textTemplate = parts[2].replace(SEPARATOR_ESCAPE, SERIALIZATION_SEPARATOR)
+            val conditionType = parts[3].toIntOrNull() ?: return@mapNotNull null
+            val sql = parts.getOrNull(4)?.takeIf { it.isNotEmpty() }
+
+            val displayText = when {
+                conditionType == TYPE_UNIVERSE -> "Active tasks"
+                value == null -> textTemplate  // Boolean criterion
+                else -> {
+                    val def = criterionDefs.find { it.identifier == id }
+                    when (def) {
+                        is DesktopCriterionDef.MultipleSelect -> {
+                            val idx = def.entryValues.indexOf(value)
+                            if (idx >= 0) textTemplate.replace("?", def.displayLabels[idx])
+                            else textTemplate.replace("?", value)
+                        }
+                        else -> textTemplate.replace("?", value)
+                    }
+                }
+            }
+
+            val valuesForNewTasks = criterionDefs.find { it.identifier == id }?.valuesForNewTasks
+
+            DesktopCondition(
+                criterionId = id,
+                textTemplate = textTemplate,
+                displayText = displayText,
+                sql = sql,
+                value = value,
+                valuesForNewTasks = valuesForNewTasks,
+                conditionType = conditionType,
+            )
+        }
+    return parsed.ifEmpty { listOf(universeCondition()) }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Criterion definitions builder
+// ────────────────────────────────────────────────────────────────────────────
+
+private fun buildCriterionDefs(
+    tagNames: List<String>,
+    calendarNames: List<String>,
+    calendarUuids: List<String>,
+): List<DesktopCriterionDef> = buildList {
+    if (tagNames.isNotEmpty()) {
+        add(
+            DesktopCriterionDef.MultipleSelect(
+                identifier = ID_TAG_IS,
+                name = "Tag is",
+                textTemplate = "Tag is: ?",
+                sql = select(Tag.TASK).from(Tag.TABLE)
+                    .join(inner(Task.TABLE, Tag.TASK.eq(Task.ID)))
+                    .where(and(activeAndVisible(), Tag.NAME.eq("?")))
+                    .toString(),
+                displayLabels = tagNames,
+                entryValues = tagNames,
+                valuesForNewTasks = mapOf(Tag.KEY to "?"),
+            )
+        )
+    }
+    add(
+        DesktopCriterionDef.TextInput(
+            identifier = ID_TAG_CONTAINS,
+            name = "Tag contains",
+            textTemplate = "Tag contains: ?",
+            sql = TAG_CONTAINS_SQL,
+        )
+    )
+    add(
+        DesktopCriterionDef.MultipleSelect(
+            identifier = ID_STARTDATE,
+            name = "Start date before",
+            textTemplate = "Starts before: ?",
+            sql = START_BEFORE_SQL,
+            displayLabels = DATE_DISPLAY_LABELS,
+            entryValues = DATE_ENTRY_VALUES,
+            valuesForNewTasks = mapOf(Task.HIDE_UNTIL.name to "?"),
+        )
+    )
+    add(
+        DesktopCriterionDef.MultipleSelect(
+            identifier = ID_DUEDATE,
+            name = "Due date before",
+            textTemplate = "Due before: ?",
+            sql = DUE_BEFORE_SQL,
+            displayLabels = DATE_DISPLAY_LABELS,
+            entryValues = DATE_ENTRY_VALUES,
+            valuesForNewTasks = mapOf(Task.DUE_DATE.name to "?"),
+        )
+    )
+    add(
+        DesktopCriterionDef.MultipleSelect(
+            identifier = ID_IMPORTANCE,
+            name = "Priority at most",
+            textTemplate = "Priority ≤ ?",
+            sql = PRIORITY_SQL,
+            displayLabels = PRIORITY_DISPLAY_LABELS,
+            entryValues = PRIORITY_ENTRY_VALUES,
+            valuesForNewTasks = mapOf(Task.IMPORTANCE.name to "?"),
+        )
+    )
+    add(
+        DesktopCriterionDef.TextInput(
+            identifier = ID_TITLE,
+            name = "Title contains",
+            textTemplate = "Title contains: ?",
+            sql = TITLE_CONTAINS_SQL,
+        )
+    )
+    if (calendarNames.isNotEmpty()) {
+        add(
+            DesktopCriterionDef.MultipleSelect(
+                identifier = ID_CALDAV,
+                name = "List is",
+                textTemplate = "List is: ?",
+                sql = select(CaldavTask.TASK).from(CaldavTask.TABLE)
+                    .join(inner(Task.TABLE, CaldavTask.TASK.eq(Task.ID)))
+                    .where(and(activeAndVisible(), CaldavTask.DELETED.eq(0), CaldavTask.CALENDAR.eq("?")))
+                    .toString(),
+                displayLabels = calendarNames,
+                entryValues = calendarUuids,
+                valuesForNewTasks = mapOf(CaldavTask.KEY to "?"),
+            )
+        )
+    }
+    add(DesktopCriterionDef.Boolean(ID_RECUR, "Is recurring", RECURRING_SQL))
+    add(DesktopCriterionDef.Boolean(ID_COMPLETED, "Is completed", COMPLETED_SQL))
+    add(DesktopCriterionDef.Boolean(ID_HIDDEN, "Is unstarted", HIDDEN_SQL))
+    add(DesktopCriterionDef.Boolean(ID_PARENT, "Has subtask", PARENT_SQL))
+    add(DesktopCriterionDef.Boolean(ID_SUBTASK, "Is a subtask", SUBTASK_SQL))
+    add(DesktopCriterionDef.Boolean(ID_REMINDERS, "Has a reminder", REMINDERS_SQL))
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Main composable
 // ────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Unified filter editor: handles both creating (filterId == null) and editing
+ * (filterId != null) a custom filter.
+ *
+ * On create: inserts the filter, auto-selects it, then navigates back.
+ * On edit: loads existing conditions from the stored criterion string,
+ *          updates the filter with rebuilt SQL on save.
+ */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun FilterCreateScreen(
+fun FilterEditorScreen(
+    filterId: Long?,
     application: DesktopApplication,
     onNavigateBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val isEditMode = filterId != null
     val scope = rememberCoroutineScope()
 
+    var filterEntity by remember { mutableStateOf<org.tasks.data.entity.Filter?>(null) }
     var name by remember { mutableStateOf("") }
     var selectedColor by remember { mutableStateOf(0) }
+    var isLoading by remember { mutableStateOf(isEditMode) }
+    var showDeleteDialog by remember { mutableStateOf(false) }
 
-    // Available tags and calendars (loaded from DB)
     var tagNames by remember { mutableStateOf<List<String>>(emptyList()) }
     var calendarNames by remember { mutableStateOf<List<String>>(emptyList()) }
     var calendarUuids by remember { mutableStateOf<List<String>>(emptyList()) }
 
-    // Condition list – starts with the immutable universe row
-    val conditions = remember {
-        mutableStateListOf(
-            DesktopCondition(
-                criterionId = ID_UNIVERSE,
-                textTemplate = "Active",
-                displayText = "Active tasks",
-                sql = null,
-                value = null,
-                valuesForNewTasks = null,
-                conditionType = TYPE_UNIVERSE,
-            )
-        )
-    }
+    // Start with the universe condition; cleared/repopulated in edit mode after loading
+    val conditions = remember { mutableStateListOf(universeCondition()) }
 
     // Dialog state
     var showCriterionPicker by remember { mutableStateOf(false) }
     var pendingCriterionDef by remember { mutableStateOf<DesktopCriterionDef?>(null) }
     var showMultiSelectDialog by remember { mutableStateOf(false) }
     var showTextInputDialog by remember { mutableStateOf(false) }
-    // Edit condition-type (AND/OR/NOT) dialog
     var editingConditionId by remember { mutableStateOf<String?>(null) }
 
-    // Load tags and calendars
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            tagNames = application.tagDataDao.tagDataOrderedByName()
-                .mapNotNull { it.name }
-                .distinct()
-            val calendars = application.caldavDao.getCalendars()
-            calendarNames = calendars.mapNotNull { it.name }
-            calendarUuids = calendars.mapNotNull { it.uuid }
-        }
-    }
-
-    // Build criterion definitions (depends on loaded tags/calendars)
     val criterionDefs: List<DesktopCriterionDef> = remember(tagNames, calendarNames, calendarUuids) {
         buildCriterionDefs(tagNames, calendarNames, calendarUuids)
     }
 
+    LaunchedEffect(Unit) {
+        var loadedTagNames: List<String> = emptyList()
+        var loadedCalendarNames: List<String> = emptyList()
+        var loadedCalendarUuids: List<String> = emptyList()
+        var loadedFilter: org.tasks.data.entity.Filter? = null
+
+        withContext(Dispatchers.IO) {
+            loadedTagNames = application.tagDataDao.tagDataOrderedByName()
+                .mapNotNull { it.name }
+                .distinct()
+            val calendars = application.caldavDao.getCalendars()
+            loadedCalendarNames = calendars.mapNotNull { it.name }
+            loadedCalendarUuids = calendars.mapNotNull { it.uuid }
+
+            if (filterId != null) {
+                loadedFilter = application.filterDao.getById(filterId)
+            }
+        }
+
+        // Update state variables so criterionDefs remember-key updates
+        tagNames = loadedTagNames
+        calendarNames = loadedCalendarNames
+        calendarUuids = loadedCalendarUuids
+
+        if (isEditMode && loadedFilter != null) {
+            filterEntity = loadedFilter
+            name = loadedFilter!!.title ?: ""
+            selectedColor = loadedFilter!!.color ?: 0
+
+            // Build criterionDefs locally (same data) to parse stored conditions
+            val localDefs = buildCriterionDefs(loadedTagNames, loadedCalendarNames, loadedCalendarUuids)
+            val parsed = parseCriterion(loadedFilter!!.criterion, localDefs)
+            conditions.clear()
+            conditions.addAll(parsed)
+        }
+
+        isLoading = false
+    }
+
     fun saveFilter() {
         if (name.isBlank()) return
+        val conditionList = conditions.toList()
         scope.launch(Dispatchers.IO) {
-            val filter = Filter(
-                title = name.trim(),
-                color = selectedColor,
-                sql = buildFilterSql(conditions),
-                criterion = buildCriterionString(conditions),
-                values = buildValuesString(conditions),
-                order = NO_ORDER,
-            )
-            application.filterDao.insert(filter)
+            val newSql = buildFilterSql(conditionList)
+            val newCriterion = buildCriterionString(conditionList)
+            val newValues = buildValuesString(conditionList)
+
+            if (isEditMode && filterEntity != null) {
+                application.filterDao.update(
+                    filterEntity!!.copy(
+                        title = name.trim(),
+                        color = selectedColor,
+                        sql = newSql,
+                        criterion = newCriterion,
+                        values = newValues,
+                    )
+                )
+                withContext(Dispatchers.Main) { onNavigateBack() }
+            } else {
+                val newFilter = org.tasks.data.entity.Filter(
+                    title = name.trim(),
+                    color = selectedColor,
+                    sql = newSql,
+                    criterion = newCriterion,
+                    values = newValues,
+                    order = NO_ORDER,
+                )
+                val rowId = application.filterDao.insert(newFilter)
+                val inserted = application.filterDao.getById(rowId)
+                withContext(Dispatchers.Main) {
+                    if (inserted != null) {
+                        // Auto-select the newly created filter so its tasks appear immediately
+                        application.selectFilter(CustomFilter(inserted))
+                    }
+                    onNavigateBack()
+                }
+            }
+        }
+    }
+
+    fun deleteFilter() {
+        scope.launch(Dispatchers.IO) {
+            filterEntity?.let { application.filterDao.delete(it) }
             withContext(Dispatchers.Main) { onNavigateBack() }
         }
     }
 
     // ── Dialogs ──────────────────────────────────────────────────────────────
 
-    // 1. Pick criterion category
+    if (showDeleteDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteDialog = false },
+            title = { Text("Delete filter?") },
+            text = { Text("This will permanently delete the filter \"$name\".") },
+            confirmButton = {
+                TextButton(onClick = { showDeleteDialog = false; deleteFilter() }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
     if (showCriterionPicker) {
         PickCriterionDialog(
             criteria = criterionDefs,
@@ -436,7 +675,6 @@ fun FilterCreateScreen(
         )
     }
 
-    // 2. MultipleSelect value picker
     if (showMultiSelectDialog) {
         val def = pendingCriterionDef as? DesktopCriterionDef.MultipleSelect
         if (def != null) {
@@ -465,7 +703,6 @@ fun FilterCreateScreen(
         }
     }
 
-    // 3. TextInput value dialog
     if (showTextInputDialog) {
         val def = pendingCriterionDef as? DesktopCriterionDef.TextInput
         if (def != null) {
@@ -491,7 +728,6 @@ fun FilterCreateScreen(
         }
     }
 
-    // 4. Condition-type (AND / OR / AND NOT) editor
     editingConditionId?.let { editId ->
         val idx = conditions.indexOfFirst { it.id == editId }
         if (idx >= 0) {
@@ -507,17 +743,27 @@ fun FilterCreateScreen(
     }
 
     // ── Main scaffold ─────────────────────────────────────────────────────────
+
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = {
             TopAppBar(
-                title = { Text("New filter") },
+                title = { Text(if (isEditMode) "Edit filter" else "New filter") },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
+                    if (isEditMode && filterEntity != null) {
+                        IconButton(onClick = { showDeleteDialog = true }) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "Delete",
+                                tint = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
                     IconButton(onClick = ::saveFilter, enabled = name.isNotBlank()) {
                         Icon(Icons.Default.Check, contentDescription = "Save")
                     }
@@ -530,162 +776,64 @@ fun FilterCreateScreen(
             }
         }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                label = { Text("Filter name") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-
-            Text("Color", style = MaterialTheme.typography.titleMedium)
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+        if (isLoading) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentAlignment = Alignment.Center,
             ) {
-                CREATE_FILTER_COLORS.forEach { (colorValue, colorName) ->
-                    FilterColorOption(
-                        color = colorValue,
-                        name = colorName,
-                        isSelected = selectedColor == colorValue,
-                        onClick = { selectedColor = colorValue },
+                Text("Loading...")
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Filter name") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+
+                Text("Color", style = MaterialTheme.typography.titleMedium)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    EDITOR_COLORS.forEach { (colorValue, colorName) ->
+                        FilterEditorColorOption(
+                            color = colorValue,
+                            name = colorName,
+                            isSelected = selectedColor == colorValue,
+                            onClick = { selectedColor = colorValue },
+                        )
+                    }
+                }
+
+                Text("Conditions", style = MaterialTheme.typography.titleMedium)
+
+                conditions.forEachIndexed { index, condition ->
+                    ConditionRow(
+                        condition = condition,
+                        isUniverse = index == 0,
+                        onClickType = { editingConditionId = condition.id },
+                        onDelete = { conditions.removeAt(index) },
                     )
                 }
+
+                Spacer(modifier = Modifier.height(72.dp))
             }
-
-            Text("Conditions", style = MaterialTheme.typography.titleMedium)
-
-            conditions.forEachIndexed { index, condition ->
-                ConditionRow(
-                    condition = condition,
-                    isUniverse = index == 0,
-                    onClickType = { editingConditionId = condition.id },
-                    onDelete = { conditions.removeAt(index) },
-                )
-            }
-
-            // Leave space at the bottom for the FAB
-            Spacer(modifier = Modifier.height(72.dp))
         }
     }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Criterion definitions builder
-// ────────────────────────────────────────────────────────────────────────────
-
-private fun buildCriterionDefs(
-    tagNames: List<String>,
-    calendarNames: List<String>,
-    calendarUuids: List<String>,
-): List<DesktopCriterionDef> = buildList {
-    // Tag is (multi-select of tag names)
-    if (tagNames.isNotEmpty()) {
-        add(
-            DesktopCriterionDef.MultipleSelect(
-                identifier = ID_TAG_IS,
-                name = "Tag is",
-                textTemplate = "Tag is: ?",
-                sql = select(Tag.TASK).from(Tag.TABLE)
-                    .join(inner(Task.TABLE, Tag.TASK.eq(Task.ID)))
-                    .where(and(activeAndVisible(), Tag.NAME.eq("?")))
-                    .toString(),
-                displayLabels = tagNames,
-                entryValues = tagNames,
-                valuesForNewTasks = mapOf(Tag.KEY to "?"),
-            )
-        )
-    }
-    // Tag contains
-    add(
-        DesktopCriterionDef.TextInput(
-            identifier = ID_TAG_CONTAINS,
-            name = "Tag contains",
-            textTemplate = "Tag contains: ?",
-            sql = TAG_CONTAINS_SQL,
-        )
-    )
-    // Start date
-    add(
-        DesktopCriterionDef.MultipleSelect(
-            identifier = ID_STARTDATE,
-            name = "Start date before",
-            textTemplate = "Starts before: ?",
-            sql = START_BEFORE_SQL,
-            displayLabels = DATE_DISPLAY_LABELS,
-            entryValues = DATE_ENTRY_VALUES,
-            valuesForNewTasks = mapOf(Task.HIDE_UNTIL.name to "?"),
-        )
-    )
-    // Due date
-    add(
-        DesktopCriterionDef.MultipleSelect(
-            identifier = ID_DUEDATE,
-            name = "Due date before",
-            textTemplate = "Due before: ?",
-            sql = DUE_BEFORE_SQL,
-            displayLabels = DATE_DISPLAY_LABELS,
-            entryValues = DATE_ENTRY_VALUES,
-            valuesForNewTasks = mapOf(Task.DUE_DATE.name to "?"),
-        )
-    )
-    // Priority
-    add(
-        DesktopCriterionDef.MultipleSelect(
-            identifier = ID_IMPORTANCE,
-            name = "Priority at most",
-            textTemplate = "Priority ≤ ?",
-            sql = PRIORITY_SQL,
-            displayLabels = PRIORITY_DISPLAY_LABELS,
-            entryValues = PRIORITY_ENTRY_VALUES,
-            valuesForNewTasks = mapOf(Task.IMPORTANCE.name to "?"),
-        )
-    )
-    // Title contains
-    add(
-        DesktopCriterionDef.TextInput(
-            identifier = ID_TITLE,
-            name = "Title contains",
-            textTemplate = "Title contains: ?",
-            sql = TITLE_CONTAINS_SQL,
-        )
-    )
-    // List is (CalDAV calendar)
-    if (calendarNames.isNotEmpty()) {
-        add(
-            DesktopCriterionDef.MultipleSelect(
-                identifier = ID_CALDAV,
-                name = "List is",
-                textTemplate = "List is: ?",
-                sql = select(CaldavTask.TASK).from(CaldavTask.TABLE)
-                    .join(inner(Task.TABLE, CaldavTask.TASK.eq(Task.ID)))
-                    .where(and(activeAndVisible(), CaldavTask.DELETED.eq(0), CaldavTask.CALENDAR.eq("?")))
-                    .toString(),
-                displayLabels = calendarNames,
-                entryValues = calendarUuids,
-                valuesForNewTasks = mapOf(CaldavTask.KEY to "?"),
-            )
-        )
-    }
-    // Boolean conditions
-    add(DesktopCriterionDef.Boolean(ID_RECUR, "Is recurring", RECURRING_SQL))
-    add(DesktopCriterionDef.Boolean(ID_COMPLETED, "Is completed", COMPLETED_SQL))
-    add(DesktopCriterionDef.Boolean(ID_HIDDEN, "Is unstarted", HIDDEN_SQL))
-    add(DesktopCriterionDef.Boolean(ID_PARENT, "Has subtask", PARENT_SQL))
-    add(DesktopCriterionDef.Boolean(ID_SUBTASK, "Is a subtask", SUBTASK_SQL))
-    add(DesktopCriterionDef.Boolean(ID_REMINDERS, "Has a reminder", REMINDERS_SQL))
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Small composables
+// Private composables
 // ────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -858,10 +1006,7 @@ private fun ConditionTypeDialog(
                             .padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        RadioButton(
-                            selected = currentType == type,
-                            onClick = { onSelected(type) },
-                        )
+                        RadioButton(selected = currentType == type, onClick = { onSelected(type) })
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(label, style = MaterialTheme.typography.bodyMedium)
                     }
@@ -873,7 +1018,7 @@ private fun ConditionTypeDialog(
 }
 
 @Composable
-private fun FilterColorOption(
+private fun FilterEditorColorOption(
     color: Int,
     name: String,
     isSelected: kotlin.Boolean,

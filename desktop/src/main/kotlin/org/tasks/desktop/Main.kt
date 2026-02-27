@@ -17,8 +17,7 @@ import org.tasks.desktop.notifications.ReminderScheduler
 import org.tasks.desktop.notifications.SystemTrayManager
 import org.tasks.desktop.screens.AccountEditScreen
 import org.tasks.desktop.screens.AccountSetupScreen
-import org.tasks.desktop.screens.FilterCreateScreen
-import org.tasks.desktop.screens.FilterEditScreen
+import org.tasks.desktop.screens.FilterEditorScreen
 import org.tasks.desktop.screens.ListEditScreen
 import org.tasks.desktop.screens.MainScreen
 import org.tasks.desktop.screens.PlaceEditScreen
@@ -250,24 +249,14 @@ fun main() = application {
                     }
                     is Screen.FilterEdit -> {
                         val filterScreen = currentScreen as Screen.FilterEdit
-                        if (filterScreen.filterId != null) {
-                            FilterEditScreen(
-                                filterId = filterScreen.filterId,
-                                application = app,
-                                onNavigateBack = {
-                                    app.loadFilters()
-                                    app.navigator.goBack()
-                                },
-                            )
-                        } else {
-                            FilterCreateScreen(
-                                application = app,
-                                onNavigateBack = {
-                                    app.loadFilters()
-                                    app.navigator.goBack()
-                                },
-                            )
-                        }
+                        FilterEditorScreen(
+                            filterId = filterScreen.filterId,
+                            application = app,
+                            onNavigateBack = {
+                                app.loadFilters()
+                                app.navigator.goBack()
+                            },
+                        )
                     }
                 }
             }
