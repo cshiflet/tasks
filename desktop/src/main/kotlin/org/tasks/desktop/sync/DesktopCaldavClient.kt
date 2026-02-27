@@ -106,6 +106,9 @@ class DesktopCaldavClient(
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(120, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
+                // dav4jvm requires manual redirect handling to track URL changes
+                .followRedirects(false)
+                .followSslRedirects(false)
                 .addNetworkInterceptor(authHandler)
                 .authenticator(authHandler)
                 .addInterceptor(Interceptor { chain ->
