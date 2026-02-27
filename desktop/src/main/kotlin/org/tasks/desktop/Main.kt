@@ -17,6 +17,7 @@ import org.tasks.desktop.notifications.ReminderScheduler
 import org.tasks.desktop.notifications.SystemTrayManager
 import org.tasks.desktop.screens.AccountEditScreen
 import org.tasks.desktop.screens.AccountSetupScreen
+import org.tasks.desktop.screens.FilterCreateScreen
 import org.tasks.desktop.screens.FilterEditScreen
 import org.tasks.desktop.screens.ListEditScreen
 import org.tasks.desktop.screens.MainScreen
@@ -259,8 +260,13 @@ fun main() = application {
                                 },
                             )
                         } else {
-                            // New filter creation requires the filter builder — not yet supported
-                            app.navigator.goBack()
+                            FilterCreateScreen(
+                                application = app,
+                                onNavigateBack = {
+                                    app.loadFilters()
+                                    app.navigator.goBack()
+                                },
+                            )
                         }
                     }
                 }
