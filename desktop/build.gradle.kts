@@ -36,6 +36,7 @@ dependencies {
     implementation(libs.androidx.sqlite)
     implementation(libs.okhttp)
     implementation(libs.bitfire.dav4jvm)
+    implementation(libs.etebase.jvm)
     // ical4j is available transitively via dav4jvm but we declare it explicitly for clarity.
     // ical4android is Android-only (AAR) so we use net.fortuna.ical4j directly here.
     implementation("org.mnode.ical4j:ical4j:3.2.19")

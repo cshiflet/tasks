@@ -33,6 +33,10 @@ object DesktopPaths {
     val configDir: File
         get() = File(appDataDir, "config").also { it.mkdirs() }
 
+    /** Root directory for the Etebase file-system cache (collections + items). */
+    val etebaseCacheDir: File
+        get() = File(appDataDir, "etebase").also { it.mkdirs() }
+
     fun ensureDirectoriesExist() {
         appDataDir.mkdirs()
         attachmentsDir.mkdirs()

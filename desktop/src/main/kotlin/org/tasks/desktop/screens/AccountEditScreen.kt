@@ -66,7 +66,8 @@ fun AccountEditScreen(
                 name = it.name ?: ""
                 url = it.url ?: ""
                 username = it.username ?: ""
-                password = it.password ?: ""
+                // EteSync stores a session token (not password) — never display it.
+                password = if (it.accountType == CaldavAccount.TYPE_ETEBASE) "" else it.password ?: ""
             }
         }
         isLoading = false
@@ -74,13 +75,14 @@ fun AccountEditScreen(
 
     fun saveAccount() {
         scope.launch(Dispatchers.IO) {
-            account?.let {
+            account?.let { acc ->
                 application.caldavDao.update(
-                    it.copy(
+                    acc.copy(
                         name = name.trim().ifBlank { "CalDAV" },
                         url = url.trim(),
                         username = username.trim(),
-                        password = password,
+                        // For EteSync, preserve the existing session token — never overwrite it.
+                        password = if (acc.accountType == CaldavAccount.TYPE_ETEBASE) acc.password else password,
                     )
                 )
             }

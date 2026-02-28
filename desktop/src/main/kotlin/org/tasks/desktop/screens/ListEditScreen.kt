@@ -51,6 +51,7 @@ import org.tasks.data.entity.CaldavAccount
 import org.tasks.data.entity.CaldavCalendar
 import org.tasks.desktop.DesktopApplication
 import org.tasks.desktop.sync.DesktopCaldavClient
+import org.tasks.desktop.sync.DesktopEtebaseClient
 
 private val LIST_COLORS = listOf(
     0 to "None",
@@ -109,14 +110,25 @@ fun ListEditScreen(
                 if (isNew) {
                     val account = accountId?.let { application.caldavDao.getAccount(it) }
                     val trimmedName = name.trim()
-                    val calendarUrl: String? = if (account?.accountType == CaldavAccount.TYPE_CALDAV) {
-                        // Create the calendar on the CalDAV server first, then persist the URL.
-                        val serverUrl = account.url ?: error("Account has no server URL")
-                        val username = account.username ?: error("Account has no username")
-                        val password = account.password ?: error("Account has no password")
-                        val client = DesktopCaldavClient.forAccount(serverUrl, username, password)
-                        client.makeCollection(trimmedName, selectedColor)
-                    } else null
+                    val calendarUrl: String? = when (account?.accountType) {
+                        CaldavAccount.TYPE_CALDAV -> {
+                            // Create the calendar on the CalDAV server first, then persist the URL.
+                            val serverUrl = account.url ?: error("Account has no server URL")
+                            val username = account.username ?: error("Account has no username")
+                            val password = account.password ?: error("Account has no password")
+                            val client = DesktopCaldavClient.forAccount(serverUrl, username, password)
+                            client.makeCollection(trimmedName, selectedColor)
+                        }
+                        CaldavAccount.TYPE_ETEBASE -> {
+                            // Create the collection on the EteSync server; the returned UID is the URL.
+                            val serverUrl = account.url ?: error("Account has no server URL")
+                            val username = account.username ?: error("Account has no username")
+                            val session = account.password ?: error("Account has no session")
+                            val client = DesktopEtebaseClient.forAccount(serverUrl, username, session, application.caldavDao)
+                            client.makeCollection(trimmedName, selectedColor)
+                        }
+                        else -> null
+                    }
                     application.caldavDao.insert(
                         CaldavCalendar(
                             account = account?.uuid,
@@ -128,15 +140,25 @@ fun ListEditScreen(
                     )
                 } else {
                     val cal = calendar ?: return@launch
-                    // Update display name/color on the server if this is a remote CalDAV calendar.
-                    if (!cal.url.isNullOrBlank()) {
-                        val account = cal.account?.let { application.caldavDao.getAccountByUuid(it) }
-                        if (account?.accountType == CaldavAccount.TYPE_CALDAV) {
+                    val account = cal.account?.let { application.caldavDao.getAccountByUuid(it) }
+                    when (account?.accountType) {
+                        CaldavAccount.TYPE_CALDAV -> {
+                            // Update display name/color on the CalDAV server.
+                            if (!cal.url.isNullOrBlank()) {
+                                val serverUrl = account.url ?: error("Account has no server URL")
+                                val username = account.username ?: error("Account has no username")
+                                val password = account.password ?: error("Account has no password")
+                                val client = DesktopCaldavClient.forAccount(serverUrl, username, password)
+                                client.updateCollection(cal.url!!, name.trim(), selectedColor)
+                            }
+                        }
+                        CaldavAccount.TYPE_ETEBASE -> {
+                            // Update collection metadata on the EteSync server.
                             val serverUrl = account.url ?: error("Account has no server URL")
                             val username = account.username ?: error("Account has no username")
-                            val password = account.password ?: error("Account has no password")
-                            val client = DesktopCaldavClient.forAccount(serverUrl, username, password)
-                            client.updateCollection(cal.url!!, name.trim(), selectedColor)
+                            val session = account.password ?: error("Account has no session")
+                            val client = DesktopEtebaseClient.forAccount(serverUrl, username, session, application.caldavDao)
+                            client.updateCollection(cal, name.trim(), selectedColor)
                         }
                     }
                     application.caldavDao.update(
@@ -155,8 +177,21 @@ fun ListEditScreen(
 
     fun deleteList() {
         scope.launch(Dispatchers.IO) {
-            calendar?.let {
-                application.deletionDao.delete(it) { /* no local cleanup needed on desktop */ }
+            calendar?.let { cal ->
+                // Delete from the EteSync server before removing locally.
+                val account = cal.account?.let { application.caldavDao.getAccountByUuid(it) }
+                if (account?.accountType == CaldavAccount.TYPE_ETEBASE && !cal.url.isNullOrBlank()) {
+                    try {
+                        val serverUrl = account.url ?: error("Account has no server URL")
+                        val username = account.username ?: error("Account has no username")
+                        val session = account.password ?: error("Account has no session")
+                        val client = DesktopEtebaseClient.forAccount(serverUrl, username, session, application.caldavDao)
+                        client.deleteCollection(cal)
+                    } catch (e: Exception) {
+                        // Log but don't block local deletion
+                    }
+                }
+                application.deletionDao.delete(cal) { /* no local cleanup needed on desktop */ }
             }
             withContext(Dispatchers.Main) {
                 onNavigateBack()

@@ -105,6 +105,7 @@ class DesktopContainer {
             taskDao = taskDao,
             deletionDao = deletionDao,
             vtodoCache = vtodoCache,
+            googleTaskDao = googleTaskDao,
         )
     }
 

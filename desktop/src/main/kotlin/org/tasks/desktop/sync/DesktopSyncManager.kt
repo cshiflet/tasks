@@ -10,12 +10,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import co.touchlab.kermit.Logger
 import org.tasks.caldav.VtodoCache
 import org.tasks.data.dao.CaldavDao
 import org.tasks.data.dao.DeletionDao
+import org.tasks.data.dao.GoogleTaskDao
 import org.tasks.data.dao.TaskDao
 import org.tasks.data.entity.CaldavAccount
 import java.util.concurrent.TimeUnit
+
+private val LOG = Logger.withTag("DesktopSyncManager")
 
 enum class AccountSyncState { IDLE, SYNCING, SUCCESS, ERROR }
 
@@ -24,6 +28,7 @@ class DesktopSyncManager(
     private val taskDao: TaskDao,
     private val deletionDao: DeletionDao,
     private val vtodoCache: VtodoCache,
+    private val googleTaskDao: GoogleTaskDao,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var syncJob: Job? = null
@@ -78,6 +83,7 @@ class DesktopSyncManager(
             when (account.accountType) {
                 CaldavAccount.TYPE_CALDAV -> syncCaldavAccount(account)
                 CaldavAccount.TYPE_GOOGLE_TASKS -> syncGoogleTasksAccount(account)
+                CaldavAccount.TYPE_ETEBASE -> syncEtebaseAccount(account)
             }
             _lastSyncTime.value = System.currentTimeMillis()
             caldavDao.update(account.copy(error = null))
@@ -89,6 +95,7 @@ class DesktopSyncManager(
             }
         } catch (e: Exception) {
             val errorMessage = e.message ?: "Unknown sync error"
+            LOG.e(e) { "Sync failed for '${account.name}': $errorMessage" }
             _syncError.value = errorMessage
             caldavDao.update(account.copy(error = errorMessage))
             _accountSyncStates.value = _accountSyncStates.value + (accountId to AccountSyncState.ERROR)
@@ -115,8 +122,21 @@ class DesktopSyncManager(
     }
 
     private suspend fun syncGoogleTasksAccount(account: CaldavAccount) {
-        // TODO: Implement Google Tasks sync (requires OAuth)
-        // This will be implemented after OAuth is set up
+        DesktopGoogleTasksSynchronizer(
+            caldavDao = caldavDao,
+            taskDao = taskDao,
+            googleTaskDao = googleTaskDao,
+            deletionDao = deletionDao,
+        ).sync(account)
+    }
+
+    private suspend fun syncEtebaseAccount(account: CaldavAccount) {
+        DesktopEtesyncSynchronizer(
+            caldavDao = caldavDao,
+            taskDao = taskDao,
+            deletionDao = deletionDao,
+            vtodoCache = vtodoCache,
+        ).sync(account)
     }
 
     companion object {
@@ -128,9 +148,10 @@ class DesktopSyncManager(
             taskDao: TaskDao,
             deletionDao: DeletionDao,
             vtodoCache: VtodoCache,
+            googleTaskDao: GoogleTaskDao,
         ): DesktopSyncManager {
             return instance ?: synchronized(this) {
-                instance ?: DesktopSyncManager(caldavDao, taskDao, deletionDao, vtodoCache).also {
+                instance ?: DesktopSyncManager(caldavDao, taskDao, deletionDao, vtodoCache, googleTaskDao).also {
                     instance = it
                 }
             }
