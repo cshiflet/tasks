@@ -1,0 +1,46 @@
+name: desktop-native
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop-native/**'
+      - 'data/schemas/**'
+      - '.github/workflows/desktop-native.yml'
+  pull_request:
+    paths:
+      - 'desktop-native/**'
+      - 'data/schemas/**'
+      - '.github/workflows/desktop-native.yml'
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test (includes schema-hash guard)
+        run: cargo test --workspace --no-fail-fast

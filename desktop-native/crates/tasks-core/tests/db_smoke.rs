@@ -84,14 +84,35 @@ fn build_fixture_db(path: &Path, identity_hash: &str, day_start: i64, day_end: i
 
     // Two active, one due today, one due tomorrow.
     insert_task(&conn, "Active, no due date", 0, 0, 0, 0);
-    insert_task(&conn, "Due today morning", day_start + 9 * 3_600_000, 0, 0, 0);
+    insert_task(
+        &conn,
+        "Due today morning",
+        day_start + 9 * 3_600_000,
+        0,
+        0,
+        0,
+    );
     insert_task(&conn, "Due today evening", day_end - 60_000, 0, 0, 0);
     insert_task(&conn, "Due tomorrow", day_end + 3_600_000, 0, 0, 0);
 
     // Should be excluded: completed, deleted, hide-until in the future.
-    insert_task(&conn, "Completed today", day_start + 8 * 3_600_000, day_start, 0, 0);
+    insert_task(
+        &conn,
+        "Completed today",
+        day_start + 8 * 3_600_000,
+        day_start,
+        0,
+        0,
+    );
     insert_task(&conn, "Deleted", day_start + 8 * 3_600_000, 0, day_start, 0);
-    insert_task(&conn, "Hidden in future", day_start + 8 * 3_600_000, 0, 0, day_end + 60_000);
+    insert_task(
+        &conn,
+        "Hidden in future",
+        day_start + 8 * 3_600_000,
+        0,
+        0,
+        day_end + 60_000,
+    );
 }
 
 #[test]
@@ -157,6 +178,9 @@ fn today_filter_returns_only_tasks_due_in_window() {
     let titles: Vec<_> = rows.iter().filter_map(|t| t.title.clone()).collect();
     assert_eq!(
         titles,
-        vec!["Due today morning".to_string(), "Due today evening".to_string()]
+        vec![
+            "Due today morning".to_string(),
+            "Due today evening".to_string()
+        ]
     );
 }

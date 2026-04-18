@@ -34,13 +34,27 @@ impl CaldavAccount {
         })
     }
 
-    pub fn is_caldav(&self) -> bool { self.account_type == AccountType::CALDAV }
-    pub fn is_local(&self) -> bool { self.account_type == AccountType::LOCAL }
-    pub fn is_opentasks(&self) -> bool { self.account_type == AccountType::OPENTASKS }
-    pub fn is_tasks_org(&self) -> bool { self.account_type == AccountType::TASKS_ORG }
-    pub fn is_etebase(&self) -> bool { self.account_type == AccountType::ETEBASE }
-    pub fn is_microsoft(&self) -> bool { self.account_type == AccountType::MICROSOFT }
-    pub fn is_google_tasks(&self) -> bool { self.account_type == AccountType::GOOGLE_TASKS }
+    pub fn is_caldav(&self) -> bool {
+        self.account_type == AccountType::CALDAV
+    }
+    pub fn is_local(&self) -> bool {
+        self.account_type == AccountType::LOCAL
+    }
+    pub fn is_opentasks(&self) -> bool {
+        self.account_type == AccountType::OPENTASKS
+    }
+    pub fn is_tasks_org(&self) -> bool {
+        self.account_type == AccountType::TASKS_ORG
+    }
+    pub fn is_etebase(&self) -> bool {
+        self.account_type == AccountType::ETEBASE
+    }
+    pub fn is_microsoft(&self) -> bool {
+        self.account_type == AccountType::MICROSOFT
+    }
+    pub fn is_google_tasks(&self) -> bool {
+        self.account_type == AccountType::GOOGLE_TASKS
+    }
 }
 
 pub struct AccountType;
@@ -89,7 +103,9 @@ impl CaldavCalendar {
         })
     }
 
-    pub fn is_read_only(&self) -> bool { self.access == CalendarAccess::READ_ONLY }
+    pub fn is_read_only(&self) -> bool {
+        self.access == CalendarAccess::READ_ONLY
+    }
 }
 
 pub struct CalendarAccess;
@@ -135,5 +151,7 @@ impl CaldavTask {
         })
     }
 
-    pub fn is_deleted(&self) -> bool { self.deleted > 0 }
+    pub fn is_deleted(&self) -> bool {
+        self.deleted > 0
+    }
 }

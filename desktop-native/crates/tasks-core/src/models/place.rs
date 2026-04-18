@@ -39,7 +39,11 @@ impl Place {
     /// Mirrors Place.displayName: prefer name if not a raw coordinate pair,
     /// else address, else a formatted coordinate string.
     pub fn display_name(&self) -> String {
-        if let Some(name) = self.name.as_deref().filter(|n| !n.is_empty() && !is_coord_string(n)) {
+        if let Some(name) = self
+            .name
+            .as_deref()
+            .filter(|n| !n.is_empty() && !is_coord_string(n))
+        {
             return name.to_string();
         }
         if let Some(address) = self.address.as_deref().filter(|a| !a.is_empty()) {

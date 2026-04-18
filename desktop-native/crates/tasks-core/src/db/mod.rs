@@ -26,7 +26,9 @@ pub struct Database {
 
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Database").field("path", &self.path).finish()
+        f.debug_struct("Database")
+            .field("path", &self.path)
+            .finish()
     }
 }
 

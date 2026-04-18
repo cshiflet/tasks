@@ -20,7 +20,10 @@ pub enum TaskFilter {
     /// All active (not completed, not deleted, past hide-until) tasks.
     Active,
     /// Tasks due today (local day in the caller-supplied timezone offset).
-    Today { day_start_utc_ms: i64, day_end_utc_ms: i64 },
+    Today {
+        day_start_utc_ms: i64,
+        day_end_utc_ms: i64,
+    },
 }
 
 /// Active-tasks predicate shared across most filters. Mirrors the Android

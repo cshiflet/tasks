@@ -33,7 +33,12 @@ impl DatabaseWatcher {
         let target = db_path.as_ref().to_path_buf();
         let parent = target
             .parent()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "db path has no parent directory"))?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "db path has no parent directory",
+                )
+            })?
             .to_path_buf();
 
         let (tx, rx) = channel();
