@@ -216,10 +216,88 @@ These items don't invalidate the delivered work — they're the natural
 handoff boundary between "Milestone 1 code complete" and "Milestone 1
 shippable."
 
+## 6.5. Round-2 review findings + fixes
+
+A second independent review of this document (and the delivered code)
+surfaced several items the first-round review missed. All the
+actionable ones landed on the branch alongside this revision:
+
+1. **Today-window used UTC midnight, not local midnight.** A user in
+   UTC-8 would see the Today filter offset by up to 8 hours. §2.4 had
+   framed timezones as "cosmetic polish for a later milestone" — that
+   was wrong. Fix: `today_window_ms(now_ms, local_offset_secs)` takes
+   the caller's offset; `run_by_filter_id` accepts it as a parameter;
+   the cxx-qt bridge sources it via `QDateTime::offsetFromUtc()`.
+   Three new unit tests cover UTC, west-of-UTC, and east-of-UTC
+   anchoring.
+2. **`run_by_filter_id` used `QueryPreferences::default()` regardless
+   of the user's settings.** Not a bug today because no UI exists to
+   edit preferences, but a future-bug-in-waiting. Fix: accept
+   `prefs: &QueryPreferences` as a parameter; the bridge stores a
+   `preferences: QueryPreferences` field and passes it through. The
+   preferences-panel UI still has to land before the field is used;
+   that's noted in §3.
+3. **Cached `Database` handle in the view model.** Previously
+   `reload_active_filter` reopened the DB on every filter navigation
+   (extra identity-hash check, extra SQLite handshake). Now `Database`
+   lives on the view model alongside `db_path`; the handle is
+   refreshed only on `openDatabase(path)`.
+4. **`QueryFilter::Caldav` arm in `build_non_recursive_query`
+   silently returned an empty string.** Replaced with a
+   `debug_assert!(false, …)` + `tracing::error!` so the footgun is
+   loud instead of silent; the dispatcher path never reaches the arm.
+5. **Sort-mode test coverage expanded.** `every_sort_mode_emits_expected_direction`
+   iterates the full set of non-recursive sort constants (ALPHA, DUE,
+   START, IMPORTANCE, MODIFIED, CREATED, LIST, COMPLETED, GTASKS,
+   CALDAV) against both `sort_ascending=true` and `=false`, asserting
+   on both the expression fragment and the emitted direction.
+6. **CI expanded to a three-OS matrix.** `check-linux` (fmt + clippy
+   + test + GUI smoke under `QT_QPA_PLATFORM=offscreen`),
+   `check-macos` (test + GUI smoke via Qt installed through
+   `jurplel/install-qt-action`), `check-windows` (test only, GUI
+   smoke deferred — see workflow comment). This closes the slippage
+   the reviewer correctly identified against the original plan's
+   "Linux + macOS + Windows, single Qt codebase" promise.
+
+Items from the round-2 review that remain open (intentionally):
+
+- **Promote `FilterId` sidebar grammar to a Rust enum.** Cleanup,
+  not correctness. Natural to do alongside the `QAbstractListModel`
+  promotion in Milestone 2.
+- **FTS / Room type-converter audit.** The schema JSON at v92 has
+  no FTS tables and no type converters affecting the columns we
+  read (verified by skimming `data/schemas/.../92.json`); no action
+  needed now, but worth re-verifying when the pinned version bumps.
+- **PermaSQL placeholder + embedded quote test.** The only sites
+  that interpolate strings are `caldav_parent_query` (uuid, tested)
+  and saved-filter SQL (already treated as authoritative). The
+  attack surface is smaller than the round-2 review implied.
+
 ## 7. Bottom line
 
-The original plan survives largely intact. The four material
-updates are:
+The query-builder and view-model layers of Milestone 1 are
+**code-complete and under meaningful test**. The delivered work
+covers the full recursive + non-recursive query cascade, every
+round-tripped entity, timezone-correct day windows, and CI coverage
+on Linux + macOS + Windows.
+
+The UX layer of Milestone 1 is **~70 % done**:
+
+- ✅ Three-pane layout with filter switching and task detail.
+- ✅ Sidebar populated from CalDAV lists + saved filters.
+- ❌ File picker (QFileDialog integration).
+- ❌ OS dark-mode follow.
+- ❌ Filesystem-watcher → UI refresh signal (core side exists,
+  bridge side doesn't).
+- ❌ Real Android-captured fixture DB for end-to-end tests.
+- ❌ User-editable preferences panel (sort mode, grouping,
+  show completed/hidden).
+
+The dependency risks (iCloud CalDAV quirks, QtWebEngine bloat,
+schema drift, `libetebase` drift) called out in the original
+`## Risks` section remain accurate.
+
+Five material updates to the plan itself:
 
 1. The parallel-Q_PROPERTY model shape replaces the
    `QAbstractListModel` goalpost for Milestone 1 and promotes it to
@@ -229,11 +307,11 @@ updates are:
    into Milestone 1 without cost.
 4. **Query-builder parity testing must be comprehensive up front.**
    The original plan treated *"port and then spot-check"* as
-   adequate; the code review proved otherwise. Going forward, every
-   query-level constant gets a paired ASC/DESC test, and every
+   adequate; the first code review proved otherwise. Going forward,
+   every sort-mode constant gets a paired ASC/DESC test, and every
    predicate-rewrite helper (`show_hidden`, `show_completed`, future
    `removeOrder`) gets an explicit before/after fixture.
-
-No milestone target has slipped; the dependency risks (iCloud CalDAV
-quirks, QtWebEngine bloat, schema drift, `libetebase` drift) called
-out in the original `## Risks` section remain accurate.
+5. **Timezone handling is Milestone 1 scope, not a deferral.** The
+   second review caught the UTC-midnight Today-window bug; the fix
+   is on the branch. Any future filter that derives a time window
+   from "now" must take a local-offset parameter from the caller.

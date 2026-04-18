@@ -76,11 +76,13 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cxx_qt::CxxQtType;
-use cxx_qt_lib::{QList, QString, QStringList};
+use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
 
 use tasks_core::db::Database;
 use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, Task};
-use tasks_core::query::{run_by_filter_id, FILTER_ALL, FILTER_RECENT, FILTER_TODAY};
+use tasks_core::query::{
+    run_by_filter_id, QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
+};
 
 pub struct TaskListViewModelRust {
     // List state.
@@ -106,7 +108,12 @@ pub struct TaskListViewModelRust {
     status: QString,
     // Non-Qt bookkeeping. Held on the Rust side only; not exposed to QML.
     db_path: Option<PathBuf>,
+    db: Option<Database>,
     task_cache: Vec<Task>,
+    /// User preferences fed to `run_by_filter_id`. The UI panel for
+    /// editing these isn't wired yet (Milestone 1 scope); for now it
+    /// stays at the Android defaults.
+    preferences: QueryPreferences,
 }
 
 impl Default for TaskListViewModelRust {
@@ -130,7 +137,9 @@ impl Default for TaskListViewModelRust {
             active_filter_id: QString::from(FILTER_ALL),
             status: QString::default(),
             db_path: None,
+            db: None,
             task_cache: Vec::new(),
+            preferences: QueryPreferences::default(),
         }
     }
 }
@@ -142,6 +151,9 @@ impl qobject::TaskListViewModel {
 
         // Read sidebar (filters + calendars) eagerly, independently of the
         // list query — the sidebar is stable across filter selection.
+        // The Database handle is cached on the view model so selectFilter
+        // / selectTask don't have to re-verify the identity hash on every
+        // navigation.
         match Database::open_read_only(&path_buf) {
             Ok(db) => {
                 let (labels, ids) = build_sidebar(&db);
@@ -153,7 +165,13 @@ impl qobject::TaskListViewModel {
                     "Opened {path_string}. {} sidebar entries.",
                     labels.len()
                 )));
-                self.as_mut().rust_mut().db_path = Some(path_buf);
+                {
+                    let mut inner = self.as_mut().rust_mut();
+                    inner.db_path = Some(path_buf);
+                    inner.db = Some(db);
+                    // `inner` drops here so subsequent as_mut() calls can
+                    // re-borrow without an overlap.
+                }
                 self.as_mut().reload_active_filter();
             }
             Err(e) => {
@@ -161,7 +179,9 @@ impl qobject::TaskListViewModel {
                 tracing::warn!("{msg}");
                 self.as_mut().set_status(QString::from(&msg));
                 self.as_mut().clear_list();
-                self.as_mut().rust_mut().db_path = None;
+                let mut inner = self.as_mut().rust_mut();
+                inner.db_path = None;
+                inner.db = None;
             }
         }
     }
@@ -197,24 +217,26 @@ impl qobject::TaskListViewModel {
     /// Re-query the DB using `self.active_filter_id` and publish the
     /// parallel list arrays.
     fn reload_active_filter(mut self: Pin<&mut Self>) {
-        let Some(db_path) = self.db_path.clone() else {
+        if self.db.is_none() {
             self.as_mut().clear_list();
             return;
-        };
-
-        let db = match Database::open_read_only(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                self.as_mut()
-                    .set_status(QString::from(&format!("Reopen failed: {e}")));
-                self.as_mut().clear_list();
-                return;
-            }
-        };
+        }
 
         let now_ms = now_ms();
+        let offset = current_local_offset_secs();
         let active_id = self.active_filter_id.to_string();
-        let tasks = match run_by_filter_id(&db, &active_id, now_ms) {
+        let prefs = self.preferences.clone();
+        // Borrow `db` immutably for the duration of the query, then drop
+        // the borrow before any `rust_mut()` call below. `db` lives on
+        // `self` (no extra open), so repeated filter navigations reuse
+        // the same verified-hash handle.
+        let query_result = {
+            let Some(ref db) = self.db else {
+                unreachable!("db presence checked above");
+            };
+            run_by_filter_id(db, &active_id, now_ms, offset, &prefs)
+        };
+        let tasks = match query_result {
             Ok(t) => t,
             Err(e) => {
                 self.as_mut()
@@ -373,6 +395,15 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Current process-local UTC offset in seconds, east-positive. Used to
+/// anchor `FILTER_TODAY` to local midnight rather than UTC midnight.
+/// Delegates to Qt's `QDateTime::offsetFromUtc()` so Qt's own timezone
+/// database resolves DST transitions — we avoid pulling in a parallel
+/// time library.
+fn current_local_offset_secs() -> i32 {
+    QDateTime::current_date_time().offset_from_utc()
 }
 
 /// Format a millisecond-epoch due date as a compact local-time string.

@@ -18,7 +18,9 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  # Linux job runs fmt + clippy + the schema-hash guard in addition to
+  # `cargo test`, since those checks only need to run once per commit.
+  check-linux:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -33,7 +35,7 @@ jobs:
             qt6-base-dev qt6-declarative-dev qt6-tools-dev \
             qml6-module-qtquick qml6-module-qtquick-controls \
             qml6-module-qtquick-layouts qml6-module-qtquick-window \
-            libqt6svg6-dev pkg-config
+            libqt6svg6-dev pkg-config xvfb
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -53,3 +55,93 @@ jobs:
 
       - name: cargo test (includes schema-hash guard)
         run: cargo test --workspace --no-fail-fast
+
+      - name: GUI smoke test (offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          cargo build --workspace
+          # Launch the binary for 3 seconds under offscreen Qt; any QML
+          # import error or crash surfaces as a non-SIGTERM exit code.
+          set +e
+          timeout 3 ./target/debug/tasks-desktop
+          rc=$?
+          # timeout returns 124 on expiry or 143 when the child was
+          # SIGTERMed — either means the process ran without crashing.
+          if [ "$rc" != "124" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
+            echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            exit $rc
+          fi
+
+  # macOS and Windows jobs only run build + test — fmt/clippy/schema-hash
+  # are deterministic across OSes and would just burn CI time.
+  check-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.6.3'
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: GUI smoke test (offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          cargo build --workspace
+          set +e
+          # macOS `timeout` isn't BSD-default; use perl as a portable
+          # fallback.
+          perl -e 'alarm 3; exec @ARGV' -- ./target/debug/tasks-desktop
+          rc=$?
+          if [ "$rc" != "142" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
+            echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            exit $rc
+          fi
+
+  check-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.6.3'
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      # Skipping the GUI smoke step on Windows for now — `QT_QPA_PLATFORM
+      # =offscreen` works, but invoking a short-lived process via PowerShell
+      # requires platform-specific plumbing that's not worth the coverage.
+      # Revisit once the Qt front-end has feature tests worth running on
+      # Windows specifically.

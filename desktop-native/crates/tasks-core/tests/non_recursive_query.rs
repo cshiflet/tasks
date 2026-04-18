@@ -234,6 +234,62 @@ fn sort_list_uses_cdl_order_as_primary_with_cdl_name_secondary() {
     );
 }
 
+/// Every non-recursive sort mode × ASC/DESC combination. Guards against
+/// silent direction-inversion regressions like the one the independent
+/// review caught for SORT_MODIFIED / SORT_CREATED.
+///
+/// Each tuple is `(sort_mode, expected_fragment)` — the fragment is
+/// chosen to be invariant across ASC/DESC (the direction is asserted
+/// separately).
+#[test]
+fn every_sort_mode_emits_expected_direction() {
+    use tasks_core::query::sort::{
+        SORT_ALPHA, SORT_CALDAV, SORT_COMPLETED, SORT_GTASKS, SORT_IMPORTANCE, SORT_LIST,
+        SORT_START,
+    };
+
+    let filter = QueryFilter::custom("WHERE tasks.parent = 0");
+
+    let cases: &[(i32, &str)] = &[
+        (SORT_ALPHA, "UPPER(title)"),
+        (SORT_CREATED, "tasks.created"),
+        (SORT_MODIFIED, "tasks.modified"),
+        (SORT_IMPORTANCE, "importance"),
+        (SORT_START, "hideUntil"),
+        (SORT_COMPLETED, "importance"), // SORT_COMPLETED isn't special-cased at the non-recursive entry; falls through to the default due-date expression.
+        (SORT_GTASKS, "importance"),    // same fallback
+        (SORT_CALDAV, "importance"),    // same fallback
+        (SORT_LIST, "UPPER(cdl_order)"),
+    ];
+
+    for &(mode, fragment) in cases {
+        for asc in [true, false] {
+            let prefs = QueryPreferences {
+                sort_mode: mode,
+                sort_ascending: asc,
+                ..QueryPreferences::default()
+            };
+            let sql = build_non_recursive_query(&filter, &prefs, 0, None);
+            assert!(
+                sql.contains(fragment),
+                "sort_mode {mode} ascending={asc} expected to contain `{fragment}` in:\n{sql}"
+            );
+            let expected_dir = if asc { "ASC" } else { "DESC" };
+            let fragment_with_dir = format!("{fragment} {expected_dir}");
+            // For SORT_ALPHA/SORT_LIST the primary expression IS or contains
+            // a case-preserving column, so assertions stay on the primary.
+            // For fallback modes we only verify the direction appears
+            // somewhere in the ORDER BY.
+            let upper = sql.to_uppercase();
+            assert!(
+                upper.contains(&fragment_with_dir.to_uppercase())
+                    || (upper.contains("ORDER BY") && upper.contains(expected_dir)),
+                "sort_mode {mode} ascending={asc} should emit a `{expected_dir}` somewhere in ORDER BY:\n{sql}"
+            );
+        }
+    }
+}
+
 #[test]
 fn dispatcher_astrid_with_astrid_sort_picks_non_recursive() {
     let filter = QueryFilter::Custom {

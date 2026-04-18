@@ -45,9 +45,18 @@ pub fn build_non_recursive_query(
     let filter_sql = match filter {
         QueryFilter::Custom { sql, .. } => permasql::replace_placeholders_for_query(sql, now_ms),
         QueryFilter::Caldav { .. } => {
-            // CalDAV filters never take the non-recursive path in upstream;
-            // included for completeness so the type signature is total.
-            String::new()
+            // CalDAV filters always take the recursive path via
+            // `build_query`. Reaching this arm means a caller bypassed
+            // the dispatcher and asked the non-recursive builder directly
+            // with a CalDAV filter — that would produce malformed SQL
+            // (the JOINS block references caldav_tasks, but we'd emit
+            // no WHERE clause), so surface the mismatch loudly.
+            debug_assert!(
+                false,
+                "build_non_recursive_query does not support QueryFilter::Caldav; use build_query"
+            );
+            tracing::error!("build_non_recursive_query called with QueryFilter::Caldav");
+            return String::new();
         }
     };
 

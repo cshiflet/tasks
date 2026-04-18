@@ -122,11 +122,25 @@ pub const FILTER_RECENT: &str = "__recent__";
 /// UI-level filter dispatcher. Accepts a filter identifier from the
 /// sidebar (`__all__`, `__today__`, `__recent__`, `caldav:<uuid>`, or
 /// `filter:<id>`) and returns the matching Task rows.
-pub fn run_by_filter_id(db: &Database, id: &str, now_ms: i64) -> Result<Vec<Task>> {
+///
+/// `local_offset_secs` is the caller's current UTC offset (positive east
+/// of UTC) and is only consulted by `FILTER_TODAY` so that the day
+/// window is anchored to local midnight, not UTC midnight.
+///
+/// `prefs` is the user's stored `QueryPreferences`. The UI populates it
+/// from QSettings; the CLI / smoke path passes
+/// `&QueryPreferences::default()`.
+pub fn run_by_filter_id(
+    db: &Database,
+    id: &str,
+    now_ms: i64,
+    local_offset_secs: i32,
+    prefs: &QueryPreferences,
+) -> Result<Vec<Task>> {
     match id {
         FILTER_ALL => run(db, TaskFilter::Active, now_ms),
         FILTER_TODAY => {
-            let (start, end) = today_window_ms(now_ms);
+            let (start, end) = today_window_ms(now_ms, local_offset_secs);
             run(
                 db,
                 TaskFilter::Today {
@@ -140,13 +154,13 @@ pub fn run_by_filter_id(db: &Database, id: &str, now_ms: i64) -> Result<Vec<Task
             let filter = QueryFilter::recently_modified(
                 "WHERE tasks.deleted = 0 AND tasks.modified > 0 ORDER BY tasks.modified DESC",
             );
-            let sql = build_query(&filter, &QueryPreferences::default(), now_ms, Some(500));
+            let sql = build_query(&filter, prefs, now_ms, Some(500));
             run_sql(db, &sql)
         }
         id if id.starts_with("caldav:") => {
             let uuid = &id[7..];
             let filter = QueryFilter::caldav(uuid);
-            let sql = build_query(&filter, &QueryPreferences::default(), now_ms, Some(1000));
+            let sql = build_query(&filter, prefs, now_ms, Some(1000));
             run_sql(db, &sql)
         }
         id if id.starts_with("filter:") => {
@@ -168,7 +182,7 @@ pub fn run_by_filter_id(db: &Database, id: &str, now_ms: i64) -> Result<Vec<Task
                 return Ok(Vec::new());
             };
             let filter = QueryFilter::custom(sql_text);
-            let sql = build_query(&filter, &QueryPreferences::default(), now_ms, Some(1000));
+            let sql = build_query(&filter, prefs, now_ms, Some(1000));
             run_sql(db, &sql)
         }
         _ => Ok(Vec::new()),
@@ -181,10 +195,23 @@ fn run_sql(db: &Database, sql: &str) -> Result<Vec<Task>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn today_window_ms(now_ms: i64) -> (i64, i64) {
+/// Compute `(start_utc_ms, end_utc_ms)` anchored at local midnight on the
+/// caller's current day, expressed in UTC milliseconds. `local_offset_secs`
+/// is the POSIX-style "east of UTC is positive" offset that Qt's
+/// `QDateTime::offsetFromUtc()` and libc's `tm_gmtoff` both return.
+///
+/// For a caller in UTC-8, `local_offset_secs = -8 * 3600`; local midnight
+/// on their day is 08:00:00 UTC, so the window returned spans
+/// 08:00:00-today UTC through 07:59:59.999-tomorrow UTC. Contrast with
+/// the previous implementation which returned a UTC-midnight window —
+/// an up-to-23-hour drift from the user's "today".
+fn today_window_ms(now_ms: i64, local_offset_secs: i32) -> (i64, i64) {
     const DAY: i64 = 86_400_000;
-    let day_start = (now_ms / DAY) * DAY;
-    (day_start, day_start + DAY - 1)
+    let offset_ms = local_offset_secs as i64 * 1000;
+    let local_now_ms = now_ms + offset_ms;
+    let local_day_start_ms = (local_now_ms.div_euclid(DAY)) * DAY;
+    let utc_day_start_ms = local_day_start_ms - offset_ms;
+    (utc_day_start_ms, utc_day_start_ms + DAY - 1)
 }
 
 pub fn run(db: &Database, filter: TaskFilter, now_ms: i64) -> Result<Vec<Task>> {
@@ -220,5 +247,37 @@ pub fn run(db: &Database, filter: TaskFilter, now_ms: i64) -> Result<Vec<Task>> 
             )?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         }
+    }
+}
+
+#[cfg(test)]
+mod today_window_tests {
+    use super::today_window_ms;
+
+    #[test]
+    fn utc_offset_returns_utc_midnight() {
+        // 2023-11-14 22:13:20 UTC.
+        let now = 1_700_000_000_000;
+        let (start, end) = today_window_ms(now, 0);
+        assert_eq!(start, 1_699_920_000_000); // 2023-11-14 00:00:00 UTC
+        assert_eq!(end, start + 86_400_000 - 1);
+    }
+
+    #[test]
+    fn negative_offset_anchors_to_local_midnight() {
+        // 2023-11-14 22:13:20 UTC = 2023-11-14 14:13:20 PST (UTC-8).
+        // Local midnight is 2023-11-14 00:00:00 PST = 2023-11-14 08:00:00 UTC.
+        let now = 1_700_000_000_000;
+        let (start, _end) = today_window_ms(now, -8 * 3600);
+        assert_eq!(start, 1_699_948_800_000);
+    }
+
+    #[test]
+    fn positive_offset_rolls_day_forward() {
+        // 2023-11-14 22:13:20 UTC = 2023-11-15 09:13:20 (UTC+11).
+        // Local midnight is 2023-11-15 00:00:00 (+11) = 2023-11-14 13:00:00 UTC.
+        let now = 1_700_000_000_000;
+        let (start, _end) = today_window_ms(now, 11 * 3600);
+        assert_eq!(start, 1_699_966_800_000);
     }
 }
