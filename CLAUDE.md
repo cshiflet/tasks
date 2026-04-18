@@ -10,7 +10,7 @@
 
 ## Ignore
 
-The `desktop` branch on origin (to be renamed `jetpack-desktop`) contains a
+The `jetpack-desktop` branch on origin (formerly `desktop`) contains a
 partially-built **Compose-for-Desktop (JVM/Kotlin)** client under a top-level
 `desktop/` directory. That effort is deprecated in favour of the Rust + Qt 6
 native client under `desktop-native/`. When working on the native desktop
