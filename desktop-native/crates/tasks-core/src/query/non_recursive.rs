@@ -70,12 +70,14 @@ pub fn build_non_recursive_query(
     };
     let order_prefix = format!("{complete_at_bottom_prefix} {completion_sort_prefix}");
 
-    // Mirrors the `groupedQuery` switch: where to wedge GROUP BY.
+    // Mirrors the `groupedQuery` switch: where to wedge GROUP BY. The
+    // Android version is case-sensitive on both `contains` and `replace`,
+    // so we follow the same rule — filter SQL that happens to spell the
+    // keyword lowercase would diverge from upstream anyway, which is a
+    // symptom worth surfacing rather than silently papering over.
     let grouped = if is_recently_modified {
-        // Recently-modified keeps its own ORDER BY from the filter SQL;
-        // inject GROUP BY just before it.
         sorted.replace("ORDER BY", "GROUP BY tasks._id ORDER BY")
-    } else if sorted.to_uppercase().contains("ORDER BY") {
+    } else if sorted.contains("ORDER BY") {
         sorted.replacen(
             "ORDER BY",
             &format!("GROUP BY tasks._id ORDER BY {order_prefix}"),

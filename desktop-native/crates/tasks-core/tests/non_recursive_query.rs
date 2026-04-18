@@ -146,3 +146,42 @@ fn dispatcher_picks_recursive_for_default_custom() {
     let sql = build_query(&filter, &prefs, 0, None);
     assert!(sql.contains("WITH RECURSIVE"));
 }
+
+#[test]
+fn dispatcher_astrid_without_astrid_sort_still_picks_recursive() {
+    // Regression guard for the self-review fix: when a filter extends
+    // AstridOrderingFilter but the user is not in Astrid sort mode, the
+    // Kotlin cascade falls through to `supportsSorting()` → recursive.
+    let filter = QueryFilter::Custom {
+        sql: "WHERE tasks.parent = 0".to_string(),
+        supports_astrid_ordering: true,
+        is_recently_modified: false,
+    };
+    let prefs = QueryPreferences {
+        is_astrid_sort: false,
+        ..QueryPreferences::default()
+    };
+    let sql = build_query(&filter, &prefs, 0, None);
+    assert!(
+        sql.contains("WITH RECURSIVE"),
+        "astrid filter with astrid_sort off should still be recursive:\n{sql}"
+    );
+}
+
+#[test]
+fn dispatcher_astrid_with_astrid_sort_picks_non_recursive() {
+    let filter = QueryFilter::Custom {
+        sql: "WHERE tasks.parent = 0".to_string(),
+        supports_astrid_ordering: true,
+        is_recently_modified: false,
+    };
+    let prefs = QueryPreferences {
+        is_astrid_sort: true,
+        ..QueryPreferences::default()
+    };
+    let sql = build_query(&filter, &prefs, 0, None);
+    assert!(
+        !sql.contains("WITH RECURSIVE"),
+        "astrid filter with astrid_sort on should be non-recursive:\n{sql}"
+    );
+}

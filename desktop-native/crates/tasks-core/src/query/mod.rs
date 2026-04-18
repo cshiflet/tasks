@@ -23,8 +23,26 @@ pub use non_recursive::build_non_recursive_query;
 pub use preferences::QueryPreferences;
 pub use recursive::build_recursive_query;
 
+use rusqlite::params;
+
+use crate::db::Database;
+use crate::error::Result;
+use crate::models::Task;
+
 /// Mirrors `TaskListQuery.getQuery`: pick the recursive or non-recursive
 /// builder depending on filter capabilities and user preferences.
+///
+/// The cascade matches Kotlin's `when` ordering:
+///
+///   1. `supportsManualSort() && preferences.isManualSort` → recursive
+///   2. `filter is AstridOrderingFilter && preferences.isAstridSort` →
+///      non-recursive
+///   3. `filter.supportsSorting()` → recursive
+///   4. else → non-recursive
+///
+/// `supportsSorting()` is `false` only for `RecentlyModifiedFilter`; the
+/// other `Filter` subclasses inherit the default `true`. We therefore use
+/// `!is_recently_modified` as the stand-in for case 3.
 pub fn build_query(
     filter: &QueryFilter,
     prefs: &QueryPreferences,
@@ -47,23 +65,20 @@ pub fn build_query(
         }
     );
 
-    // Recursive path: filter supports manual sort & user is in manual sort
-    // mode; OR filter supports sorting (default for everything except
-    // AstridOrdering / RecentlyModified).
-    if (supports_manual && prefs.is_manual_sort)
-        || (!is_astrid && !is_recently_modified && !prefs.is_astrid_sort)
-    {
+    let recursive = if supports_manual && prefs.is_manual_sort {
+        true
+    } else if is_astrid && prefs.is_astrid_sort {
+        false
+    } else {
+        !is_recently_modified
+    };
+
+    if recursive {
         build_recursive_query(filter, prefs, now_ms, limit)
     } else {
         build_non_recursive_query(filter, prefs, now_ms, limit)
     }
 }
-
-use rusqlite::params;
-
-use crate::db::Database;
-use crate::error::Result;
-use crate::models::Task;
 
 /// Selectors for task list views. Mirrors a subset of the built-in filters
 /// from `app/src/main/java/org/tasks/filters/`.

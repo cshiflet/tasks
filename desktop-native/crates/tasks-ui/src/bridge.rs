@@ -273,14 +273,20 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     let titles = QStringList::from(&title_list);
     let due_labels = QStringList::from(&due_list);
 
+    // Populate the parallel arrays before count. QML delegates index into
+    // `titles[i]` etc. up to `count`, so if a re-render happened between
+    // setting a larger count and the corresponding array, it could pick up
+    // a stale/empty value for that row. In practice cxx-qt runs on the Qt
+    // event loop thread and deferred updates batch per-frame, but the
+    // defensive ordering is free.
     let count = tasks.len() as i32;
-    vm.as_mut().set_count(count);
     vm.as_mut().set_titles(titles);
     vm.as_mut().set_task_ids(task_ids);
     vm.as_mut().set_indents(indents);
     vm.as_mut().set_completed_flags(completed_flags);
     vm.as_mut().set_due_labels(due_labels);
     vm.as_mut().set_priorities(priorities);
+    vm.as_mut().set_count(count);
     vm.as_mut()
         .set_status(QString::from(&format!("{count} task(s) in view")));
     vm.as_mut().rust_mut().task_cache = tasks;
