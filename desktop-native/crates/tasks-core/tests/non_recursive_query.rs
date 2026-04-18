@@ -169,6 +169,72 @@ fn dispatcher_astrid_without_astrid_sort_still_picks_recursive() {
 }
 
 #[test]
+fn show_hidden_rewrites_hide_until_predicate() {
+    // Regression guard for review finding #1: show_hidden was a silent
+    // no-op because the literal still carried the regex's `?` character.
+    let filter = QueryFilter::custom("WHERE tasks.parent = 0");
+    let prefs = QueryPreferences {
+        show_hidden: true,
+        ..QueryPreferences::default()
+    };
+    let sql = build_non_recursive_query(&filter, &prefs, 0, None);
+    assert!(
+        !sql.contains("tasks.hideUntil<=(strftime('%s','now')*1000)"),
+        "show_hidden should rewrite the active-visible predicate:\n{sql}"
+    );
+}
+
+#[test]
+fn sort_modified_ascending_pref_produces_asc_direction() {
+    // Regression guard for review finding #2: the Kotlin reverse()
+    // dance collapses to "final direction = preferences.sortAscending".
+    // Previously we inverted for SORT_MODIFIED / SORT_CREATED.
+    let filter = QueryFilter::custom("WHERE tasks.parent = 0");
+    let prefs_asc = QueryPreferences {
+        sort_mode: SORT_MODIFIED,
+        sort_ascending: true,
+        ..QueryPreferences::default()
+    };
+    let sql_asc = build_non_recursive_query(&filter, &prefs_asc, 0, None);
+    assert!(
+        sql_asc.contains("tasks.modified ASC"),
+        "sort_ascending=true with SORT_MODIFIED should emit ASC:\n{sql_asc}"
+    );
+
+    let prefs_desc = QueryPreferences {
+        sort_mode: SORT_MODIFIED,
+        sort_ascending: false,
+        ..QueryPreferences::default()
+    };
+    let sql_desc = build_non_recursive_query(&filter, &prefs_desc, 0, None);
+    assert!(
+        sql_desc.contains("tasks.modified DESC"),
+        "sort_ascending=false with SORT_MODIFIED should emit DESC:\n{sql_desc}"
+    );
+}
+
+#[test]
+fn sort_list_uses_cdl_order_as_primary_with_cdl_name_secondary() {
+    // Regression guard for review finding #3: SORT_LIST was previously
+    // emitting `UPPER(cdl_name)` as the primary and dropping `cdl_name`
+    // as the secondary, diverging from SortHelper.ORDER_LIST.
+    let filter = QueryFilter::custom("WHERE tasks.parent = 0");
+    let prefs = QueryPreferences {
+        sort_mode: tasks_core::query::sort::SORT_LIST,
+        ..QueryPreferences::default()
+    };
+    let sql = build_non_recursive_query(&filter, &prefs, 0, None);
+    assert!(
+        sql.contains("UPPER(cdl_order) ASC"),
+        "SORT_LIST primary should be UPPER(cdl_order):\n{sql}"
+    );
+    assert!(
+        sql.contains("cdl_name ASC"),
+        "SORT_LIST should keep cdl_name as secondary:\n{sql}"
+    );
+}
+
+#[test]
 fn dispatcher_astrid_with_astrid_sort_picks_non_recursive() {
     let filter = QueryFilter::Custom {
         sql: "WHERE tasks.parent = 0".to_string(),

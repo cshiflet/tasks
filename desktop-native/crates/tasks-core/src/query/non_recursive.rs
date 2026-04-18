@@ -63,12 +63,14 @@ pub fn build_non_recursive_query(
     let sort_group_expr = sort::get_sort_group(prefs.group_mode).unwrap_or("NULL");
     let sorted = sort::adjust_query_for_flags_and_sort(prefs, joined, prefs.sort_mode);
 
-    let (complete_at_bottom_prefix, completion_sort_prefix) = if prefs.completed_tasks_at_bottom {
-        ("parentComplete ASC,", "tasks.completed DESC,")
+    // Only prepend the completed-at-bottom sort prelude when the flag is
+    // on; an empty prelude would be a harmless double-space in the SQL
+    // but masks future mistakes where only one half is populated.
+    let order_prelude = if prefs.completed_tasks_at_bottom {
+        "parentComplete ASC, tasks.completed DESC, "
     } else {
-        ("", "")
+        ""
     };
-    let order_prefix = format!("{complete_at_bottom_prefix} {completion_sort_prefix}");
 
     // Mirrors the `groupedQuery` switch: where to wedge GROUP BY. The
     // Android version is case-sensitive on both `contains` and `replace`,
@@ -80,11 +82,11 @@ pub fn build_non_recursive_query(
     } else if sorted.contains("ORDER BY") {
         sorted.replacen(
             "ORDER BY",
-            &format!("GROUP BY tasks._id ORDER BY {order_prefix}"),
+            &format!("GROUP BY tasks._id ORDER BY {order_prelude}"),
             1,
         )
     } else if prefs.completed_tasks_at_bottom {
-        format!("{sorted} GROUP BY tasks._id ORDER BY {order_prefix}")
+        format!("{sorted} GROUP BY tasks._id ORDER BY {order_prelude}")
     } else {
         format!("{sorted} GROUP BY tasks._id")
     };

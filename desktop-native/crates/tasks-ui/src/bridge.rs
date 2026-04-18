@@ -295,6 +295,10 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
 /// Enumerate the sidebar entries we surface: built-in filters, every CalDAV
 /// calendar, then every saved custom filter. Order matches the Android
 /// nav drawer's default ordering.
+///
+/// Errors from reading the `caldav_lists` / `filters` tables are logged
+/// (not fatal) so a broken/missing table shows as an incomplete sidebar
+/// rather than aborting the whole `openDatabase` flow.
 fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
     let mut labels = vec![
         "All active".to_string(),
@@ -307,32 +311,50 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
         FILTER_RECENT.to_string(),
     ];
 
-    if let Ok(mut stmt) = db
+    match db
         .connection()
         .prepare("SELECT * FROM caldav_lists ORDER BY cdl_order, cdl_name")
     {
-        if let Ok(rows) = stmt.query_map([], CaldavCalendar::from_row) {
-            for cal in rows.flatten() {
-                if let (Some(name), Some(uuid)) = (cal.name, cal.uuid) {
-                    labels.push(name);
-                    ids.push(format!("caldav:{uuid}"));
+        Ok(mut stmt) => match stmt.query_map([], CaldavCalendar::from_row) {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(cal) => {
+                            if let (Some(name), Some(uuid)) = (cal.name, cal.uuid) {
+                                labels.push(name);
+                                ids.push(format!("caldav:{uuid}"));
+                            }
+                        }
+                        Err(e) => tracing::warn!("caldav_lists row decode failed: {e}"),
+                    }
                 }
             }
-        }
+            Err(e) => tracing::warn!("caldav_lists query_map failed: {e}"),
+        },
+        Err(e) => tracing::warn!("caldav_lists prepare failed: {e}"),
     }
 
-    if let Ok(mut stmt) = db
+    match db
         .connection()
         .prepare("SELECT * FROM filters ORDER BY f_order, title")
     {
-        if let Ok(rows) = stmt.query_map([], CustomFilter::from_row) {
-            for f in rows.flatten() {
-                if let Some(title) = f.title {
-                    labels.push(title);
-                    ids.push(format!("filter:{}", f.id));
+        Ok(mut stmt) => match stmt.query_map([], CustomFilter::from_row) {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(f) => {
+                            if let Some(title) = f.title {
+                                labels.push(title);
+                                ids.push(format!("filter:{}", f.id));
+                            }
+                        }
+                        Err(e) => tracing::warn!("filters row decode failed: {e}"),
+                    }
                 }
             }
-        }
+            Err(e) => tracing::warn!("filters query_map failed: {e}"),
+        },
+        Err(e) => tracing::warn!("filters prepare failed: {e}"),
     }
 
     (labels, ids)

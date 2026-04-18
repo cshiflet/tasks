@@ -158,25 +158,22 @@ pub fn order_for_sort_type_recursive(
 /// Mirrors `QueryUtils.showHidden`: rewrites the active-visible predicate
 /// `tasks.hideUntil<=(strftime('%s','now')*1000)` to `1` so hidden tasks
 /// appear.
+///
+/// The upstream Kotlin regex is `tasks\.hideUntil<=?(strftime\('%s','now'\)\*1000)`
+/// — the `<=?` branch matches `<` or `<=`, but every SQL emitter in this
+/// module only produces `<=`, so we can keep a plain `str::replace` with
+/// the exact literal rather than pulling in a regex crate for a dormant
+/// alternative.
 pub fn show_hidden(sql: &str) -> String {
-    regex_like_replace(sql, r"tasks.hideUntil<=?(strftime('%s','now')*1000)", "1")
+    sql.replace("tasks.hideUntil<=(strftime('%s','now')*1000)", "1")
 }
 
 /// Mirrors `QueryUtils.showCompleted`: rewrites `tasks.completed<=0`
-/// (or `=0`) to `1` so completed tasks appear.
+/// or `tasks.completed=0` to `1` so completed tasks appear. The upstream
+/// regex is case-sensitive and space-sensitive and so is this.
 pub fn show_completed(sql: &str) -> String {
-    regex_like_replace(sql, "tasks.completed<=0", "1")
+    sql.replace("tasks.completed<=0", "1")
         .replace("tasks.completed=0", "1")
-        .replace("tasks.completed <= 0", "1")
-        .replace("tasks.completed = 0", "1")
-}
-
-/// Naive literal/parenthesized substitution — the Android version uses a
-/// Java `Pattern` but only against strings the code itself emits, so we can
-/// enumerate the exact forms rather than pull in a regex engine for this
-/// read-only client.
-fn regex_like_replace(haystack: &str, needle: &str, with: &str) -> String {
-    haystack.replace(needle, with)
 }
 
 /// Mirrors `SortHelper.adjustQueryForFlags`. Applied after the SQL is built
@@ -218,20 +215,24 @@ pub fn order_expr_for_sort_type(sort_type: i32) -> String {
         SORT_IMPORTANCE => "importance".to_string(),
         SORT_MODIFIED => "tasks.modified".to_string(),
         SORT_CREATED => "tasks.created".to_string(),
-        SORT_LIST => "UPPER(cdl_name)".to_string(),
+        // Mirrors `SortHelper.ORDER_LIST`: primary is `UPPER(cdl_order)`;
+        // the secondary (`cdl_name ASC`) is appended unconditionally in
+        // `adjust_query_for_flags_and_sort` so direction flips affect the
+        // primary only, matching Kotlin's `Order.reverse()` semantics.
+        SORT_LIST => "UPPER(cdl_order)".to_string(),
         _ => fallback(),
     }
-}
-
-/// For a given sort type, the intrinsic default direction (matches
-/// `asc`/`desc` choice in SortHelper.orderForSortType).
-fn default_ascending_for_sort_type(sort_type: i32) -> bool {
-    !matches!(sort_type, SORT_MODIFIED | SORT_CREATED)
 }
 
 /// Mirrors `SortHelper.adjustQueryForFlagsAndSort`: appends an ORDER BY
 /// clause to `sql` if one isn't already present, then applies the
 /// show-hidden/show-completed rewrites.
+///
+/// Direction semantics: Kotlin's `reverse()`-if-disagrees dance cancels
+/// out to "final direction = `preferences.sortAscending`" regardless of
+/// the sort type's natural direction, because each `orderForSortType`
+/// branch picks its natural `asc`/`desc` first and then only flips when
+/// it disagrees with the preference. We collapse the dance here.
 pub fn adjust_query_for_flags_and_sort(
     prefs: &QueryPreferences,
     sql: String,
@@ -239,15 +240,16 @@ pub fn adjust_query_for_flags_and_sort(
 ) -> String {
     let sql = if !sql.to_uppercase().contains("ORDER BY") {
         let expr = order_expr_for_sort_type(sort_type);
-        let natural_asc = default_ascending_for_sort_type(sort_type);
-        // `reverse()` in SortHelper flips direction when the stored
-        // preference disagrees with the sort type's natural direction.
-        let effective_asc = natural_asc == prefs.sort_ascending;
-        let dir = if effective_asc { "ASC" } else { "DESC" };
-        let with_secondary = if sort_type != SORT_ALPHA {
-            format!("{expr} {dir}, UPPER(title) ASC")
-        } else {
-            format!("{expr} {dir}")
+        let dir = if prefs.sort_ascending { "ASC" } else { "DESC" };
+        let with_secondary = match sort_type {
+            // ALPHA has no secondary; its primary IS `UPPER(title)`.
+            SORT_ALPHA => format!("{expr} {dir}"),
+            // LIST has `cdl_name ASC` as the calendar-disambiguating
+            // secondary (always ASC), plus the usual `UPPER(title)` tie-
+            // breaker.
+            SORT_LIST => format!("{expr} {dir}, cdl_name ASC, UPPER(title) ASC"),
+            // Every other sort gets `UPPER(title) ASC` as the tie-breaker.
+            _ => format!("{expr} {dir}, UPPER(title) ASC"),
         };
         format!("{sql} ORDER BY {with_secondary}")
     } else {

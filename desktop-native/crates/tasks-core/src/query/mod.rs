@@ -150,7 +150,13 @@ pub fn run_by_filter_id(db: &Database, id: &str, now_ms: i64) -> Result<Vec<Task
             run_sql(db, &sql)
         }
         id if id.starts_with("filter:") => {
-            let row_id: i64 = id[7..].parse().unwrap_or(0);
+            let row_id: i64 = match id[7..].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    tracing::warn!("invalid filter id `{id}` (expected filter:<i64>)");
+                    return Ok(Vec::new());
+                }
+            };
             let conn = db.connection();
             let mut stmt = conn.prepare("SELECT sql FROM filters WHERE _id = ?1")?;
             let sql_text: Option<String> = match stmt.query_row(params![row_id], |r| r.get(0)) {
