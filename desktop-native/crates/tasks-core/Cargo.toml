@@ -1,0 +1,18 @@
+[package]
+name = "tasks-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read-only core for the Tasks.org native desktop client: models, SQLite access, query builders, filesystem watching."
+
+[dependencies]
+rusqlite = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
