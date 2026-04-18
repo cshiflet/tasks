@@ -13,4 +13,7 @@ pub mod watch;
 
 pub use db::Database;
 pub use error::{CoreError, Result};
-pub use models::{Priority, RepeatFrom, Task};
+pub use models::{
+    AccountType, Alarm, AlarmType, CaldavAccount, CaldavCalendar, CaldavTask, CalendarAccess,
+    Filter, Geofence, Place, Priority, RepeatFrom, Tag, TagData, Task,
+};
