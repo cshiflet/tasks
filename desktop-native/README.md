@@ -4,9 +4,10 @@ Native desktop companion for Tasks.org, following the plan at
 `/root/.claude/plans/i-m-interested-in-implementing-unified-parasol.md`.
 
 **Status:** Milestone 1 — read-only companion. The `tasks-core` crate opens
-the same SQLite database the Android app writes and can run a small set of
-task-list queries. The `tasks-ui` crate currently ships only a CLI entry
-point; the Qt/QML front-end is scaffolded but not yet wired to cxx-qt.
+the same SQLite database the Android app writes and runs the same task-list
+queries as the Android client (recursive CTE, sort/group helpers, PermaSql
+placeholder expansion). The `tasks-ui` crate ships a minimal Qt 6 / QML
+shell via `cxx-qt`, plus a `--cli` fallback mode for headless smoke tests.
 
 > ⚠️ Not to be confused with the `desktop/` directory on the
 > `jetpack-desktop` branch (formerly `desktop`), which is a Compose-for-Desktop
@@ -34,31 +35,35 @@ cargo build -p tasks-core
 cargo test  -p tasks-core
 ```
 
-## Build — CLI runner (uses core)
+## Build — CLI runner (uses core; no Qt required at runtime)
 
 ```sh
 cd desktop-native
-cargo run -p tasks-ui -- /path/to/tasks.db
+cargo run -p tasks-ui -- --cli /path/to/tasks.db
 ```
 
-The runner opens the database read-only, verifies the Room identity hash
-(pinned in `tasks_core::db`), and prints the Active filter.
+Opens the database read-only, verifies the Room identity hash (pinned in
+`tasks_core::db`), and prints the Active filter.
 
-## Build — full Qt UI (pending)
+## Build — Qt 6 GUI
 
-The Qt front-end requires Qt 6.5+ and `cxx-qt-build`. Platform setup:
+The GUI requires Qt 6.4+ at build and run time.
 
-- **Linux**: install `qt6-base-dev`, `qt6-declarative-dev`,
-  `qt6-tools-dev-tools` (Debian/Ubuntu) or `qt6-qtbase-devel`,
-  `qt6-qtdeclarative-devel` (Fedora).
-- **macOS**: `brew install qt@6` and `export CMAKE_PREFIX_PATH="$(brew --prefix qt@6)"`.
-- **Windows**: install Qt 6.5+ via the Qt Online Installer and put
-  `C:\Qt\6.5.x\msvc2022_64\bin` on `PATH`.
+- **Linux**: install `qt6-base-dev`, `qt6-declarative-dev`, `qt6-tools-dev`,
+  `qml6-module-qtquick{,-controls,-layouts,-window}`, `libqt6svg6-dev`,
+  `pkg-config` (Debian/Ubuntu) or their Fedora/Arch equivalents.
+- **macOS**: `brew install qt@6` and
+  `export CMAKE_PREFIX_PATH="$(brew --prefix qt@6)"`.
+- **Windows**: install Qt 6.4+ via the Qt Online Installer and put
+  `C:\Qt\6.x\msvc2022_64\bin` on `PATH`.
 
-Once Qt is present, enable the cxx-qt deps in `crates/tasks-ui/Cargo.toml`
-and uncomment the bridge module in `tasks-ui/src/`. This gate is in place
-because committing unverified cxx-qt code would block CI on contributors
-who don't have Qt installed yet.
+```sh
+cd desktop-native
+cargo run -p tasks-ui
+```
+
+On headless CI machines, set `QT_QPA_PLATFORM=offscreen` so the window
+opens without a display server.
 
 ## Schema pinning
 
@@ -77,9 +82,15 @@ Milestone 1 (in progress — this crate):
 - [x] Task model + read-only SQLite open with identity-hash verification
 - [x] Minimal Active / Today filters
 - [x] Filesystem watcher (debounced)
-- [ ] Remaining entities (Tag, Filter, Place, CaldavCalendar, Alarm)
-- [ ] Full port of `kmp/TaskListQuery*.kt`
-- [ ] Qt/QML three-pane UI via cxx-qt
+- [x] Remaining entities (Tag, Filter, Place, CaldavCalendar, Alarm, …)
+- [x] Recursive `TaskListQuery` port (SortHelper + QueryPreferences +
+      PermaSql)
+- [x] Qt 6 / QML shell via cxx-qt (first-cut: single-window task viewer)
+- [ ] `QAbstractListModel` with per-row roles (title, due, priority,
+      tags, indent)
+- [ ] Three-pane layout (`SidebarPane.qml` / `TaskListPane.qml` /
+      `TaskDetailPane.qml`)
+- [ ] Non-recursive path (`AstridOrderingFilter` / `RecentlyModifiedFilter`)
 - [ ] Packaging (AppImage / Flatpak, notarized `.app` + DMG, MSIX)
 
 Later milestones: write path + reminder scheduling, CalDAV sync,

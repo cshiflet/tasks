@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.79"
+rust-version = "1.82"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tasks/tasks"
 
@@ -20,6 +20,10 @@ notify = "6"
 notify-debouncer-full = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cxx = "1"
+cxx-qt = "0.7"
+cxx-qt-lib = { version = "0.7", features = ["qt_gui", "qt_qml"] }
+cxx-qt-build = { version = "0.7", features = ["link_qt_object_files"] }
 
 [profile.release]
 lto = "thin"

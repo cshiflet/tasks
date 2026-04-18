@@ -1,16 +1,15 @@
-//! Placeholder entry point for the Qt front-end.
+//! Entry point for the Qt 6 front-end.
 //!
-//! The UI is intentionally a stub in this commit — wiring cxx-qt + QML
-//! requires Qt 6 to be installed at build time and hasn't been verified in
-//! the current CI environment yet (see `desktop-native/README.md`). For
-//! now the binary exposes the read-only core over the command line so the
-//! data layer can be exercised without Qt.
+//! By default launches the QML shell. When the first argument is `--cli
+//! <path-to-tasks.db>` the binary instead dumps the Active filter to stdout
+//! — useful for smoke-testing the data layer without a display.
 
 use std::env;
 use std::process::ExitCode;
 
-use tasks_core::db::Database;
-use tasks_core::query::{self, TaskFilter};
+use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
+
+mod bridge;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -21,8 +20,32 @@ fn main() -> ExitCode {
         .init();
 
     let args: Vec<String> = env::args().collect();
-    let Some(db_path) = args.get(1) else {
-        eprintln!("usage: tasks-desktop <path-to-tasks.db>");
+    if args.get(1).map(String::as_str) == Some("--cli") {
+        return run_cli(args.get(2).map(String::as_str));
+    }
+
+    let mut app = QGuiApplication::new();
+    let mut engine = QQmlApplicationEngine::new();
+
+    if let Some(engine) = engine.as_mut() {
+        engine.load(&QUrl::from("qrc:/qt/qml/com/tasks/desktop/qml/Main.qml"));
+    }
+
+    match app.as_mut().map(|app| app.exec()) {
+        Some(code) => ExitCode::from(code as u8),
+        None => {
+            eprintln!("failed to construct QGuiApplication");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_cli(db_path: Option<&str>) -> ExitCode {
+    use tasks_core::db::Database;
+    use tasks_core::query::{self, TaskFilter};
+
+    let Some(db_path) = db_path else {
+        eprintln!("usage: tasks-desktop --cli <path-to-tasks.db>");
         return ExitCode::from(2);
     };
 
