@@ -8,7 +8,13 @@ fn main() {
         .qml_module(QmlModule {
             uri: "com.tasks.desktop",
             rust_files: &["src/bridge.rs"],
-            qml_files: &["qml/Main.qml"],
+            qml_files: &[
+                "qml/Main.qml",
+                "qml/SidebarPane.qml",
+                "qml/TaskListPane.qml",
+                "qml/TaskDetailPane.qml",
+                "qml/PriorityDot.qml",
+            ],
             ..Default::default()
         })
         .build();

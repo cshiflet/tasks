@@ -12,14 +12,52 @@
 //!   `QueryPreferences` and the active `QueryFilter`.
 
 pub mod filter;
+pub mod non_recursive;
 pub mod permasql;
 pub mod preferences;
 pub mod recursive;
 pub mod sort;
 
 pub use filter::QueryFilter;
+pub use non_recursive::build_non_recursive_query;
 pub use preferences::QueryPreferences;
 pub use recursive::build_recursive_query;
+
+/// Mirrors `TaskListQuery.getQuery`: pick the recursive or non-recursive
+/// builder depending on filter capabilities and user preferences.
+pub fn build_query(
+    filter: &QueryFilter,
+    prefs: &QueryPreferences,
+    now_ms: i64,
+    limit: Option<usize>,
+) -> String {
+    let supports_manual = filter.supports_manual_sort();
+    let is_astrid = matches!(
+        filter,
+        QueryFilter::Custom {
+            supports_astrid_ordering: true,
+            ..
+        }
+    );
+    let is_recently_modified = matches!(
+        filter,
+        QueryFilter::Custom {
+            is_recently_modified: true,
+            ..
+        }
+    );
+
+    // Recursive path: filter supports manual sort & user is in manual sort
+    // mode; OR filter supports sorting (default for everything except
+    // AstridOrdering / RecentlyModified).
+    if (supports_manual && prefs.is_manual_sort)
+        || (!is_astrid && !is_recently_modified && !prefs.is_astrid_sort)
+    {
+        build_recursive_query(filter, prefs, now_ms, limit)
+    } else {
+        build_non_recursive_query(filter, prefs, now_ms, limit)
+    }
+}
 
 use rusqlite::params;
 
@@ -57,6 +95,75 @@ fn select_columns() -> &'static str {
      tasks.notificationFlags, tasks.lastNotified, tasks.recurrence, \
      tasks.repeat_from, tasks.calendarUri, tasks.remoteId, tasks.collapsed, \
      tasks.parent, tasks.\"order\", tasks.read_only"
+}
+
+/// Built-in sidebar filter identifier for "all active tasks".
+pub const FILTER_ALL: &str = "__all__";
+/// Built-in sidebar filter identifier for "due today".
+pub const FILTER_TODAY: &str = "__today__";
+/// Built-in sidebar filter identifier for "recently modified".
+pub const FILTER_RECENT: &str = "__recent__";
+
+/// UI-level filter dispatcher. Accepts a filter identifier from the
+/// sidebar (`__all__`, `__today__`, `__recent__`, `caldav:<uuid>`, or
+/// `filter:<id>`) and returns the matching Task rows.
+pub fn run_by_filter_id(db: &Database, id: &str, now_ms: i64) -> Result<Vec<Task>> {
+    match id {
+        FILTER_ALL => run(db, TaskFilter::Active, now_ms),
+        FILTER_TODAY => {
+            let (start, end) = today_window_ms(now_ms);
+            run(
+                db,
+                TaskFilter::Today {
+                    day_start_utc_ms: start,
+                    day_end_utc_ms: end,
+                },
+                now_ms,
+            )
+        }
+        FILTER_RECENT => {
+            let filter = QueryFilter::recently_modified(
+                "WHERE tasks.deleted = 0 AND tasks.modified > 0 ORDER BY tasks.modified DESC",
+            );
+            let sql = build_query(&filter, &QueryPreferences::default(), now_ms, Some(500));
+            run_sql(db, &sql)
+        }
+        id if id.starts_with("caldav:") => {
+            let uuid = &id[7..];
+            let filter = QueryFilter::caldav(uuid);
+            let sql = build_query(&filter, &QueryPreferences::default(), now_ms, Some(1000));
+            run_sql(db, &sql)
+        }
+        id if id.starts_with("filter:") => {
+            let row_id: i64 = id[7..].parse().unwrap_or(0);
+            let conn = db.connection();
+            let mut stmt = conn.prepare("SELECT sql FROM filters WHERE _id = ?1")?;
+            let sql_text: Option<String> = match stmt.query_row(params![row_id], |r| r.get(0)) {
+                Ok(v) => Some(v),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            };
+            let Some(sql_text) = sql_text else {
+                return Ok(Vec::new());
+            };
+            let filter = QueryFilter::custom(sql_text);
+            let sql = build_query(&filter, &QueryPreferences::default(), now_ms, Some(1000));
+            run_sql(db, &sql)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn run_sql(db: &Database, sql: &str) -> Result<Vec<Task>> {
+    let mut stmt = db.connection().prepare(sql)?;
+    let rows = stmt.query_map([], Task::from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn today_window_ms(now_ms: i64) -> (i64, i64) {
+    const DAY: i64 = 86_400_000;
+    let day_start = (now_ms / DAY) * DAY;
+    (day_start, day_start + DAY - 1)
 }
 
 pub fn run(db: &Database, filter: TaskFilter, now_ms: i64) -> Result<Vec<Task>> {

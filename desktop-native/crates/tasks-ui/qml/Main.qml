@@ -1,12 +1,13 @@
-// First-cut QML shell for the native desktop client.
+// Three-pane layout for the Tasks.org native desktop client.
 //
-// Presents a file path field, an Open button, and a list of the currently
-// active task titles. The view model lives in bridge.rs; all data access
-// goes through tasks-core::Database, which opens the SQLite file read-only.
+// Composition:
+//   - SidebarPane   : filters + CalDAV calendars + saved filters
+//   - TaskListPane  : active list, indented for subtasks
+//   - TaskDetailPane: title, notes, due date, priority of the selected task
 //
-// Subsequent slices will split this into a three-pane layout
-// (SidebarPane.qml / TaskListPane.qml / TaskDetailPane.qml) and drop a
-// proper QAbstractListModel in for per-row roles.
+// The data source is the `TaskListViewModel` QObject defined in
+// crates/tasks-ui/src/bridge.rs, registered in QML as
+// `com.tasks.desktop.TaskListViewModel`.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -15,8 +16,8 @@ import com.tasks.desktop
 
 ApplicationWindow {
     id: root
-    width: 900
-    height: 600
+    width: 1100
+    height: 720
     visible: true
     title: qsTr("Tasks")
 
@@ -24,56 +25,66 @@ ApplicationWindow {
         id: viewModel
     }
 
-    ColumnLayout {
-        anchors.fill: parent
-        anchors.margins: 12
-        spacing: 8
-
+    header: ToolBar {
         RowLayout {
-            Layout.fillWidth: true
+            anchors.fill: parent
+            anchors.leftMargin: 8
+            anchors.rightMargin: 8
             spacing: 8
 
             TextField {
                 id: pathField
                 Layout.fillWidth: true
-                placeholderText: qsTr("Path to tasks.db (Android sync file)")
+                placeholderText: qsTr("Path to tasks.db (e.g. ~/Sync/tasks.db)")
                 selectByMouse: true
+                onAccepted: if (text.length > 0) viewModel.openDatabase(text)
             }
-
             Button {
                 text: qsTr("Open")
                 enabled: pathField.text.length > 0
                 onClicked: viewModel.openDatabase(pathField.text)
             }
         }
+    }
 
+    footer: ToolBar {
         Label {
-            Layout.fillWidth: true
-            text: viewModel.status.length > 0
-                  ? viewModel.status
-                  : qsTr("Enter the path to an Android Tasks database to view its active tasks.")
-            wrapMode: Text.WordWrap
-            color: palette.mid
+            anchors.fill: parent
+            anchors.leftMargin: 8
+            verticalAlignment: Text.AlignVCenter
+            text: viewModel.status
+            elide: Text.ElideRight
+        }
+    }
+
+    SplitView {
+        id: root_split
+        anchors.fill: parent
+        orientation: Qt.Horizontal
+
+        SidebarPane {
+            id: sidebar
+            SplitView.preferredWidth: 240
+            SplitView.minimumWidth: 180
+            vm: viewModel
         }
 
-        Label {
-            Layout.fillWidth: true
-            text: viewModel.count === 1
-                  ? qsTr("%1 active task").arg(viewModel.count)
-                  : qsTr("%1 active tasks").arg(viewModel.count)
-            font.bold: true
-        }
+        SplitView {
+            orientation: Qt.Horizontal
+            SplitView.fillWidth: true
 
-        ListView {
-            id: taskList
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            clip: true
-            model: viewModel.titles
-            boundsBehavior: Flickable.StopAtBounds
-            delegate: ItemDelegate {
-                width: taskList.width
-                text: modelData
+            TaskListPane {
+                id: listPane
+                SplitView.preferredWidth: 420
+                SplitView.minimumWidth: 280
+                vm: viewModel
+            }
+
+            TaskDetailPane {
+                id: detailPane
+                SplitView.fillWidth: true
+                SplitView.minimumWidth: 260
+                vm: viewModel
             }
         }
     }

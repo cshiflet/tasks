@@ -16,6 +16,9 @@ pub enum QueryFilter {
         /// Some filters allow Astrid ordering; that path uses the
         /// non-recursive builder. Mirrors `AstridOrderingFilter`.
         supports_astrid_ordering: bool,
+        /// `RecentlyModifiedFilter` is special-cased in the non-recursive
+        /// builder to skip the "completed at bottom" sort prelude.
+        is_recently_modified: bool,
     },
     /// A CalDAV / Google Tasks / Microsoft To Do list scoped by calendar
     /// UUID. Mirrors `CaldavFilter`.
@@ -30,6 +33,15 @@ impl QueryFilter {
         QueryFilter::Custom {
             sql: sql.into(),
             supports_astrid_ordering: false,
+            is_recently_modified: false,
+        }
+    }
+
+    pub fn recently_modified(sql: impl Into<String>) -> Self {
+        QueryFilter::Custom {
+            sql: sql.into(),
+            supports_astrid_ordering: false,
+            is_recently_modified: true,
         }
     }
 

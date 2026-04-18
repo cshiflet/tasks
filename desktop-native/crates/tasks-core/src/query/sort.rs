@@ -191,3 +191,67 @@ pub fn adjust_query_for_flags(prefs: &QueryPreferences, sql: String) -> String {
     }
     adjusted
 }
+
+/// Non-recursive ORDER BY expression for a given sort type. Mirrors
+/// `SortHelper.orderForSortType` (the private companion of
+/// `orderForSortTypeRecursive`) — uses bare column names (no `tasks.` prefix)
+/// because the non-recursive query has `tasks.*` selected directly rather
+/// than aliased through a CTE.
+///
+/// Returns the raw expression *without* a direction suffix; the caller pairs
+/// it with `ASC` or `DESC` based on `sort_ascending` and the semantics of
+/// the particular sort type (`SORT_MODIFIED`/`SORT_CREATED` default to DESC).
+pub fn order_expr_for_sort_type(sort_type: i32) -> String {
+    let fallback = || {
+        format!(
+            "(CASE WHEN (dueDate=0) THEN (strftime('%s','now')*1000)*2 ELSE ({ADJUSTED_DUE_DATE}) END) + 172799999 * importance"
+        )
+    };
+    match sort_type {
+        SORT_ALPHA => "UPPER(title)".to_string(),
+        SORT_DUE => format!(
+            "(CASE WHEN (dueDate=0) THEN (strftime('%s','now')*1000)*2 ELSE {ADJUSTED_DUE_DATE} END)+importance"
+        ),
+        SORT_START => format!(
+            "(CASE WHEN (hideUntil=0) THEN (strftime('%s','now')*1000)*2 ELSE {ADJUSTED_START_DATE} END)+importance"
+        ),
+        SORT_IMPORTANCE => "importance".to_string(),
+        SORT_MODIFIED => "tasks.modified".to_string(),
+        SORT_CREATED => "tasks.created".to_string(),
+        SORT_LIST => "UPPER(cdl_name)".to_string(),
+        _ => fallback(),
+    }
+}
+
+/// For a given sort type, the intrinsic default direction (matches
+/// `asc`/`desc` choice in SortHelper.orderForSortType).
+fn default_ascending_for_sort_type(sort_type: i32) -> bool {
+    !matches!(sort_type, SORT_MODIFIED | SORT_CREATED)
+}
+
+/// Mirrors `SortHelper.adjustQueryForFlagsAndSort`: appends an ORDER BY
+/// clause to `sql` if one isn't already present, then applies the
+/// show-hidden/show-completed rewrites.
+pub fn adjust_query_for_flags_and_sort(
+    prefs: &QueryPreferences,
+    sql: String,
+    sort_type: i32,
+) -> String {
+    let sql = if !sql.to_uppercase().contains("ORDER BY") {
+        let expr = order_expr_for_sort_type(sort_type);
+        let natural_asc = default_ascending_for_sort_type(sort_type);
+        // `reverse()` in SortHelper flips direction when the stored
+        // preference disagrees with the sort type's natural direction.
+        let effective_asc = natural_asc == prefs.sort_ascending;
+        let dir = if effective_asc { "ASC" } else { "DESC" };
+        let with_secondary = if sort_type != SORT_ALPHA {
+            format!("{expr} {dir}, UPPER(title) ASC")
+        } else {
+            format!("{expr} {dir}")
+        };
+        format!("{sql} ORDER BY {with_secondary}")
+    } else {
+        sql
+    };
+    adjust_query_for_flags(prefs, sql)
+}
