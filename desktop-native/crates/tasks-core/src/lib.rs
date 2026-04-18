@@ -11,6 +11,8 @@ pub mod models;
 pub mod query;
 pub mod watch;
 
+pub use query::{build_recursive_query, QueryFilter, QueryPreferences};
+
 pub use db::Database;
 pub use error::{CoreError, Result};
 pub use models::{

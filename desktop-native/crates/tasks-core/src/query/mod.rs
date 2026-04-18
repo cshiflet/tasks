@@ -1,11 +1,25 @@
 //! SQL builders for task list views.
 //!
-//! The Android client composes list queries from many small fragments in
-//! `kmp/src/commonMain/kotlin/org/tasks/data/TaskListQuery*.kt`, wrapped
-//! around a Kotlin `Query` DSL. Porting that DSL is tracked as a later
-//! milestone — for the read-only companion we only need enough to render
-//! the most common filters, so we emit the SQL directly here and extend as
-//! more filters come online.
+//! Two paths live here:
+//!
+//! * `TaskFilter` + `run` — a tiny, concrete filter set used by the
+//!   read-only desktop client's initial screens. Each filter emits its own
+//!   hand-rolled `SELECT` and binds through the prepared-statement path, so
+//!   there's no string interpolation of user data.
+//! * `build_recursive_query` — a faithful port of the Android
+//!   `TaskListQueryRecursive` builder. Produces the full CTE-based query
+//!   the main task list uses; the UI layer pairs it with a user's
+//!   `QueryPreferences` and the active `QueryFilter`.
+
+pub mod filter;
+pub mod permasql;
+pub mod preferences;
+pub mod recursive;
+pub mod sort;
+
+pub use filter::QueryFilter;
+pub use preferences::QueryPreferences;
+pub use recursive::build_recursive_query;
 
 use rusqlite::params;
 
