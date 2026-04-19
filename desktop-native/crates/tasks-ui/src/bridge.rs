@@ -69,13 +69,21 @@ pub mod qobject {
         #[qinvokable]
         fn select_task(self: Pin<&mut TaskListViewModel>, id: i64);
     }
+
+    // Opt the view model into cxx-qt's Threading surface so the
+    // filesystem-watcher thread can queue reloads back on the Qt
+    // event loop thread.
+    impl cxx_qt::Threading for TaskListViewModel {}
 }
 
 use core::pin::Pin;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cxx_qt::CxxQtType;
+use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
 
 use tasks_core::db::Database;
@@ -83,6 +91,7 @@ use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, Task}
 use tasks_core::query::{
     run_by_filter_id, QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
 };
+use tasks_core::watch::DatabaseWatcher;
 
 pub struct TaskListViewModelRust {
     // List state.
@@ -114,6 +123,11 @@ pub struct TaskListViewModelRust {
     /// editing these isn't wired yet (Milestone 1 scope); for now it
     /// stays at the Android defaults.
     preferences: QueryPreferences,
+    /// Flag the filesystem-watcher thread checks periodically to exit
+    /// when a new DB is opened (or the view model is dropped). Shared
+    /// with the spawned thread via `Arc`. `None` when no watcher is
+    /// currently active.
+    watcher_stop: Option<Arc<AtomicBool>>,
 }
 
 impl Default for TaskListViewModelRust {
@@ -140,6 +154,16 @@ impl Default for TaskListViewModelRust {
             db: None,
             task_cache: Vec::new(),
             preferences: QueryPreferences::default(),
+            watcher_stop: None,
+        }
+    }
+}
+
+impl Drop for TaskListViewModelRust {
+    fn drop(&mut self) {
+        // Ensure the watcher thread exits when the view model does.
+        if let Some(stop) = self.watcher_stop.take() {
+            stop.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -154,6 +178,10 @@ impl qobject::TaskListViewModel {
         // The Database handle is cached on the view model so selectFilter
         // / selectTask don't have to re-verify the identity hash on every
         // navigation.
+        // Stop any prior watcher before opening a new DB. The spawned
+        // thread observes `stop` and exits cleanly on its next tick.
+        stop_prior_watcher(self.as_mut());
+
         match Database::open_read_only(&path_buf) {
             Ok(db) => {
                 let (labels, ids) = build_sidebar(&db);
@@ -167,12 +195,13 @@ impl qobject::TaskListViewModel {
                 )));
                 {
                     let mut inner = self.as_mut().rust_mut();
-                    inner.db_path = Some(path_buf);
+                    inner.db_path = Some(path_buf.clone());
                     inner.db = Some(db);
                     // `inner` drops here so subsequent as_mut() calls can
                     // re-borrow without an overlap.
                 }
                 self.as_mut().reload_active_filter();
+                start_watcher(self.as_mut(), path_buf);
             }
             Err(e) => {
                 let msg = format!("Couldn't open {path_string}: {e}");
@@ -388,6 +417,62 @@ fn string_list_from_iter<'a>(iter: impl Iterator<Item = &'a str>) -> QStringList
         list.append(QString::from(s));
     }
     QStringList::from(&list)
+}
+
+/// Tell any previously-running watcher thread to exit. The thread
+/// observes the shared atomic on its next 500 ms tick and returns.
+fn stop_prior_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if let Some(stop) = vm.as_mut().rust_mut().watcher_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spawn a background thread that watches the directory containing
+/// `path` and queues a `reload_active_filter` on the Qt thread when
+/// the debouncer fires.
+///
+/// The thread takes its own `DatabaseWatcher` so the `Receiver`
+/// stays thread-local and the Debouncer is kept alive for the watch
+/// duration. A shared `AtomicBool` lets `open_database` terminate
+/// the prior watcher when a new file is selected.
+fn start_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    vm.as_mut().rust_mut().watcher_stop = Some(stop);
+
+    let qt_thread = vm.as_ref().qt_thread();
+
+    std::thread::spawn(move || {
+        let watcher = match DatabaseWatcher::start(&path) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("DatabaseWatcher::start failed for {:?}: {e}", path);
+                return;
+            }
+        };
+        tracing::info!("watching {} for changes", path.display());
+        loop {
+            if stop_thread.load(Ordering::Relaxed) {
+                tracing::debug!("watcher thread stopping for {:?}", path);
+                return;
+            }
+            match watcher.events.recv_timeout(Duration::from_millis(500)) {
+                Ok(_event) => {
+                    if let Err(e) = qt_thread.queue(|pinned| {
+                        pinned.reload_active_filter();
+                    }) {
+                        tracing::warn!("couldn't queue reload on Qt thread: {e}");
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    tracing::debug!("watcher channel closed; thread exiting");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 fn now_ms() -> i64 {

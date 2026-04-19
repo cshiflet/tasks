@@ -85,13 +85,21 @@ Milestone 1 (in progress — this crate):
 - [x] Remaining entities (Tag, Filter, Place, CaldavCalendar, Alarm, …)
 - [x] Recursive `TaskListQuery` port (SortHelper + QueryPreferences +
       PermaSql)
-- [x] Qt 6 / QML shell via cxx-qt (first-cut: single-window task viewer)
-- [ ] `QAbstractListModel` with per-row roles (title, due, priority,
-      tags, indent)
-- [ ] Three-pane layout (`SidebarPane.qml` / `TaskListPane.qml` /
+- [x] Qt 6 / QML shell via cxx-qt
+- [x] Three-pane layout (`SidebarPane.qml` / `TaskListPane.qml` /
       `TaskDetailPane.qml`)
-- [ ] Non-recursive path (`AstridOrderingFilter` / `RecentlyModifiedFilter`)
-- [ ] Packaging (AppImage / Flatpak, notarized `.app` + DMG, MSIX)
+- [x] Non-recursive path (`AstridOrderingFilter` / `RecentlyModifiedFilter`)
+- [x] File picker (QML `FileDialog`)
+- [x] OS dark-mode follow (`Material.theme: Material.System`)
+- [x] Filesystem-watcher → UI refresh (auto-reload on DB change)
+- [ ] `QAbstractListModel` with per-row roles (title, due, priority,
+      tags, indent) — deferred to Milestone 2 alongside writes.
+- [ ] User-editable preferences panel (sort mode / grouping /
+      show completed+hidden).
+- [ ] Real Android-captured fixture DB for end-to-end tests.
+- [ ] JSON-import from Tasks.org's backup format (Milestone 1.5 /
+      bridge to Milestone 2).
+- [ ] Packaging (AppImage / Flatpak, notarized `.app` + DMG, MSIX).
 
 Later milestones: write path + reminder scheduling, CalDAV sync,
 Google Tasks / Microsoft To Do, EteSync, geofencing + widget equivalents.

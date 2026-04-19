@@ -24,6 +24,17 @@ fn main() -> ExitCode {
         return run_cli(args.get(2).map(String::as_str));
     }
 
+    // Pick the Material style so `Material.theme: Material.System` in
+    // QML follows the OS dark-mode toggle. Set before QGuiApplication
+    // constructs so QQuickStyle picks it up.
+    //
+    // Respect an operator-set override (e.g. QT_QUICK_CONTROLS_STYLE=
+    // Fusion) — useful for debugging and for users who prefer a
+    // platform-native look.
+    if env::var_os("QT_QUICK_CONTROLS_STYLE").is_none() {
+        env::set_var("QT_QUICK_CONTROLS_STYLE", "Material");
+    }
+
     let mut app = QGuiApplication::new();
     let mut engine = QQmlApplicationEngine::new();
 

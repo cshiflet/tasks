@@ -10,6 +10,8 @@
 // `com.tasks.desktop.TaskListViewModel`.
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Material
+import QtQuick.Dialogs
 import QtQuick.Layouts
 
 import com.tasks.desktop
@@ -21,8 +23,37 @@ ApplicationWindow {
     visible: true
     title: qsTr("Tasks")
 
+    // Auto-follow OS light/dark mode. When the user flips their system
+    // theme, Qt updates Material.theme to match on the next paint.
+    Material.theme: Material.System
+    Material.accent: Material.Blue
+
     TaskListViewModel {
         id: viewModel
+    }
+
+    FileDialog {
+        id: openDialog
+        title: qsTr("Open Tasks database")
+        // SQLite databases have no registered MIME type, so accept all
+        // files and let `Database::open_read_only` verify the Room
+        // identity hash.
+        nameFilters: [
+            qsTr("SQLite database (*.db *.sqlite *.sqlite3)"),
+            qsTr("All files (*)")
+        ]
+        fileMode: FileDialog.OpenFile
+
+        onAccepted: {
+            // selectedFile is a file:// URL; strip the scheme so
+            // Database::open_read_only gets a plain path.
+            let path = selectedFile.toString();
+            if (path.startsWith("file://")) {
+                path = path.substring(7);
+            }
+            pathField.text = path;
+            viewModel.openDatabase(path);
+        }
     }
 
     header: ToolBar {
@@ -35,9 +66,13 @@ ApplicationWindow {
             TextField {
                 id: pathField
                 Layout.fillWidth: true
-                placeholderText: qsTr("Path to tasks.db (e.g. ~/Sync/tasks.db)")
+                placeholderText: qsTr("Path to tasks.db (or click Browse…)")
                 selectByMouse: true
                 onAccepted: if (text.length > 0) viewModel.openDatabase(text)
+            }
+            Button {
+                text: qsTr("Browse…")
+                onClicked: openDialog.open()
             }
             Button {
                 text: qsTr("Open")
