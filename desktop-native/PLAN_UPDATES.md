@@ -273,6 +273,70 @@ Items from the round-2 review that remain open (intentionally):
   and saved-filter SQL (already treated as authoritative). The
   attack surface is smaller than the round-2 review implied.
 
+## 6.6. Corrected premise: SQLite is local-per-client, not shared
+
+The original plan framed Milestone 1 as "open the same SQLite database
+the Android app writes (delivered over Syncthing, iCloud Drive,
+OneDrive, USB, etc.)" That premise was wrong. Verified against the
+Android app source:
+
+1. **The DB lives in Android's per-app sandbox.** `ProductionModule.kt`
+   line 44 calls `context.getDatabasePath(Database.NAME)`, which
+   resolves to `/data/data/org.tasks/databases/*`. That path is not
+   reachable by other apps, other users, or cloud-sync tools without
+   root access.
+2. **Tasks.org's own backup format is JSON, not SQLite.**
+   `TasksJsonExporter.kt` serialises entities via
+   `kotlinx.serialization.json`. The SQLite file itself is never
+   part of the user-facing export surface.
+3. **Cross-device data flow is via sync backends** (CalDAV, Google
+   Tasks, Microsoft To Do, EteSync), not via shared local storage.
+   Each installed client keeps its own Room DB and reconciles
+   against a remote.
+
+Implications:
+
+- **Concurrent-writer contention is a non-concern.** The desktop
+  client owns its SQLite file. `db::Database::open_read_only`
+  previously held a 500 ms `busy_timeout` to tolerate a
+  simultaneous-writer Android. That comment and duration have been
+  dropped — a 50 ms defensive belt remains only in case a second
+  desktop process briefly contends.
+- **Milestone 1's "read-only companion" story needs a clearer
+  data-in path.** In the current environment the fixtures are
+  synthetic; a realistic Milestone 1 user would need either:
+  - an **ADB pull** of the Android DB file (advanced users on a
+    rooted device or with `adb backup` tooling) — good for
+    debugging, not a shipping UX.
+  - a **JSON-import path** that reads the existing Android backup
+    JSON and materialises a local SQLite at the pinned schema.
+    This is the natural Milestone 1.5 / Milestone 2 bridge.
+  - a **fresh DB populated by the desktop's own CalDAV sync**
+    (Milestone 3), at which point the "read-only companion" framing
+    gets retired entirely in favour of "first-class client".
+
+The originally-planned `## Risks` item #3 ("SQLite concurrency when
+Android is writing while desktop reads. Mitigation: open with
+WAL-friendly settings…") should be struck from the plan — the
+scenario it mitigates doesn't exist.
+
+Plan amendments this implies:
+
+- Remove Risk #3 from the plan.
+- Re-scope Milestone 1 delivery: the query and view-model layers are
+  useful on their own (they'll back every subsequent milestone), but
+  the end-user-visible feature depends on a data-in path that the
+  current plan doesn't specify.
+- Add a new Milestone 1.5 or merge into Milestone 2: **JSON-import
+  from Tasks.org's backup format**. The code for the Android side
+  lives at `app/src/main/java/org/tasks/backup/TasksJsonExporter.kt`
+  (writer) and `TasksJsonImporter.kt` (reader); the Rust port can
+  mirror the serialized shape.
+- Reframe Milestone 3 (CalDAV) and onwards as **the authoritative
+  data-in path**. The desktop's SQLite is seeded either by JSON
+  import or by a fresh sync against the user's existing CalDAV
+  account — never by sharing Android's sandbox file.
+
 ## 7. Bottom line
 
 The query-builder and view-model layers of Milestone 1 are

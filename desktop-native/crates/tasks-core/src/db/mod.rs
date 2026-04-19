@@ -39,8 +39,15 @@ impl Database {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&path, flags)?;
 
-        // Retry busy transactions briefly — the Android app may be writing.
-        conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        // Low-threshold busy_timeout as a defensive belt only: the
+        // desktop client owns its SQLite file exclusively. Android's
+        // copy lives in its app-sandbox at `/data/data/<pkg>/databases`,
+        // is never shared over cloud sync (the Android backup format
+        // is JSON, not SQLite), and can't be reached by another
+        // process without root. Contention, if it ever happens, is
+        // another desktop reader — not the Android app — and resolves
+        // instantly.
+        conn.busy_timeout(std::time::Duration::from_millis(50))?;
 
         let actual_hash = read_identity_hash(&conn)?;
         if actual_hash != PINNED_IDENTITY_HASH {

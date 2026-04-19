@@ -178,3 +178,29 @@ that owns both the SQL string and the bindings.
 (notably `Box::pin` sugar in position bodies). We bumped the workspace
 `rust-version` rather than pinning an older cxx-qt or working around
 the macro output. Rust 1.82 has been stable since late 2024.
+
+## 12. **Desktop SQLite is exclusive-access, not shared with Android**
+
+The original plan treated the Android-written DB as a file the desktop
+could open over Syncthing / iCloud Drive / etc. Verified against the
+Android app: that's not how the product works.
+
+- `ProductionModule.kt` stores the DB at
+  `context.getDatabasePath(Database.NAME)` — an
+  `/data/data/<pkg>/databases/*` path that lives in Android's per-app
+  sandbox and is not reachable by other apps or cloud-sync tools
+  without root.
+- `TasksJsonExporter.kt` is the user-facing backup path; it emits
+  JSON, not a SQLite copy.
+- Cross-device state is synchronised via CalDAV / Google Tasks / MS
+  To Do / EteSync over the wire.
+
+So the desktop client owns its SQLite file exclusively — no
+Android-process writes it concurrently. `Database::open_read_only`
+therefore holds only a short (50 ms) `busy_timeout` as a safety net
+against a second desktop process, and the plan's Risk #3 ("SQLite
+concurrency when Android is writing while desktop reads") is struck
+entirely. See `PLAN_UPDATES.md` §6.6 for the knock-on effects on
+Milestone 1 framing (a JSON-import path or CalDAV sync must
+eventually seed the file; "read-only companion against a live
+Android DB" was never a realistic UX).
