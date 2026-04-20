@@ -3,67 +3,45 @@
 Native desktop companion for Tasks.org, following the plan at
 `/root/.claude/plans/i-m-interested-in-implementing-unified-parasol.md`.
 
-**Status:** Milestone 1 — read-only companion. The `tasks-core` crate opens
-the same SQLite database the Android app writes and runs the same task-list
-queries as the Android client (recursive CTE, sort/group helpers, PermaSql
-placeholder expansion). The `tasks-ui` crate ships a minimal Qt 6 / QML
-shell via `cxx-qt`, plus a `--cli` fallback mode for headless smoke tests.
+**Status:** Milestone 1 — read-only companion. The `tasks-core` crate
+opens the SQLite database the Android app writes and runs the same
+task-list queries as the Android client (recursive CTE, sort/group
+helpers, PermaSql placeholder expansion). The `tasks-ui` crate ships
+a minimal Qt 6 / QML shell via `cxx-qt`, plus a `--cli` fallback mode
+for headless smoke tests.
 
 > ⚠️ Not to be confused with the `desktop/` directory on the
-> `jetpack-desktop` branch (formerly `desktop`), which is a Compose-for-Desktop
-> JVM client and is deprecated. See `CLAUDE.md` at the repo root.
+> `jetpack-desktop` branch (formerly `desktop`), which is a deprecated
+> Compose-for-Desktop JVM client. See `CLAUDE.md` at the repo root.
 
-## Layout
+## Build & run
+
+See **[`BUILD.md`](BUILD.md)** for the canonical setup guide (Docker,
+bare Ubuntu, Fedora/Arch, macOS, Windows), the dev loop, runtime env
+vars, and troubleshooting.
+
+Quick start with Docker:
+
+```sh
+docker build -t tasks-dev -f desktop-native/docker/Dockerfile.dev .
+docker run --rm -it -v "$PWD":/workspace -w /workspace/desktop-native tasks-dev \
+    bash -c 'cargo test --workspace && QT_QPA_PLATFORM=offscreen cargo run -p tasks-ui'
+```
+
+## Crate layout
 
 ```
 desktop-native/
-  Cargo.toml              # workspace
+  Cargo.toml              # cargo workspace
   crates/
-    tasks-core/           # pure Rust: models, DB open, queries, fs watcher
-    tasks-ui/             # Qt/QML front-end (cxx-qt integration pending)
-  resources/              # shared assets (icons, translations)
-  packaging/{linux,macos,windows}/
+    tasks-core/           # pure Rust: models, DB open, queries, watcher
+    tasks-ui/             # cxx-qt QObject + QML shell
+      cxx/                # hand-written C++ shims (e.g. TaskListModelBase)
+      qml/                # QML: Main.qml + three panes + PriorityDot
+  docker/                 # reproducible toolchain recipes
+  resources/              # icons, translations (stubs)
+  packaging/{linux,macos,windows}/  # packaging stubs for future release work
 ```
-
-## Build — core only
-
-Qt is not required for the core crate:
-
-```sh
-cd desktop-native
-cargo build -p tasks-core
-cargo test  -p tasks-core
-```
-
-## Build — CLI runner (uses core; no Qt required at runtime)
-
-```sh
-cd desktop-native
-cargo run -p tasks-ui -- --cli /path/to/tasks.db
-```
-
-Opens the database read-only, verifies the Room identity hash (pinned in
-`tasks_core::db`), and prints the Active filter.
-
-## Build — Qt 6 GUI
-
-The GUI requires Qt 6.4+ at build and run time.
-
-- **Linux**: install `qt6-base-dev`, `qt6-declarative-dev`, `qt6-tools-dev`,
-  `qml6-module-qtquick{,-controls,-layouts,-window}`, `libqt6svg6-dev`,
-  `pkg-config` (Debian/Ubuntu) or their Fedora/Arch equivalents.
-- **macOS**: `brew install qt@6` and
-  `export CMAKE_PREFIX_PATH="$(brew --prefix qt@6)"`.
-- **Windows**: install Qt 6.4+ via the Qt Online Installer and put
-  `C:\Qt\6.x\msvc2022_64\bin` on `PATH`.
-
-```sh
-cd desktop-native
-cargo run -p tasks-ui
-```
-
-On headless CI machines, set `QT_QPA_PLATFORM=offscreen` so the window
-opens without a display server.
 
 ## Schema pinning
 
@@ -71,12 +49,12 @@ opens without a display server.
 match a snapshot in
 `data/schemas/org.tasks.data.db.Database/<version>.json`. When upstream
 Room migrations land, bump both constants together and re-run
-`cargo test`. A CI job will later diff the pinned hash against the newest
-schema file and flag drift.
+`cargo test`. A CI job (`tests/schema_guard.rs`) flags drift on PRs
+that touch either file.
 
 ## Roadmap
 
-Milestone 1 (in progress — this crate):
+Milestone 1 (read-only companion):
 
 - [x] Workspace scaffolding
 - [x] Task model + read-only SQLite open with identity-hash verification
@@ -85,22 +63,33 @@ Milestone 1 (in progress — this crate):
 - [x] Remaining entities (Tag, Filter, Place, CaldavCalendar, Alarm, …)
 - [x] Recursive `TaskListQuery` port (SortHelper + QueryPreferences +
       PermaSql)
+- [x] Non-recursive path (`AstridOrderingFilter` / `RecentlyModifiedFilter`)
 - [x] Qt 6 / QML shell via cxx-qt
 - [x] Three-pane layout (`SidebarPane.qml` / `TaskListPane.qml` /
       `TaskDetailPane.qml`)
-- [x] Non-recursive path (`AstridOrderingFilter` / `RecentlyModifiedFilter`)
 - [x] File picker (QML `FileDialog`)
 - [x] OS dark-mode follow (`Material.theme: Material.System`)
 - [x] Filesystem-watcher → UI refresh (auto-reload on DB change)
-- [ ] `QAbstractListModel` with per-row roles (title, due, priority,
-      tags, indent) — deferred to Milestone 2 alongside writes.
+- [x] Synthesized fixture DB integration tests
+- [x] Reproducible toolchain (`docker/Dockerfile.dev`)
+- [ ] `QAbstractListModel` with per-row roles (scaffolding committed;
+      bridge/QML wiring pending)
 - [ ] User-editable preferences panel (sort mode / grouping /
-      show completed+hidden).
-- [ ] Real Android-captured fixture DB for end-to-end tests.
-- [ ] JSON-import from Tasks.org's backup format (Milestone 1.5 /
-      bridge to Milestone 2).
-- [ ] Packaging (AppImage / Flatpak, notarized `.app` + DMG, MSIX).
+      show completed+hidden)
+- [ ] Real Android-captured fixture DB for end-to-end tests
+- [ ] JSON-import from Tasks.org's backup format (Milestone 1.5 bridge
+      to Milestone 2)
+- [ ] Packaging (AppImage / Flatpak, notarized `.app` + DMG, MSIX)
 
 Later milestones: write path + reminder scheduling, CalDAV sync,
-Google Tasks / Microsoft To Do, EteSync, geofencing + widget equivalents.
-Full detail in the plan file.
+Google Tasks / Microsoft To Do, EteSync, geofencing + widget
+equivalents. Full detail in the plan file and in
+`desktop-native/PLAN_UPDATES.md`.
+
+## See also
+
+- [`BUILD.md`](BUILD.md) — build, test, and troubleshooting.
+- [`DECISIONS.md`](DECISIONS.md) — non-obvious technical choices and
+  the reasoning behind them.
+- [`PLAN_UPDATES.md`](PLAN_UPDATES.md) — how the delivered work drifted
+  from the original plan, and what amendments follow.
