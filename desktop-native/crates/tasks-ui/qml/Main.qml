@@ -21,7 +21,9 @@ ApplicationWindow {
     width: 1100
     height: 720
     visible: true
-    title: qsTr("Tasks")
+    title: viewModel.dbPathDisplay.length > 0
+           ? qsTr("Tasks — %1").arg(viewModel.dbPathDisplay)
+           : qsTr("Tasks")
 
     // Auto-follow OS light/dark mode. When the user flips their system
     // theme, Qt updates Material.theme to match on the next paint.
@@ -32,12 +34,17 @@ ApplicationWindow {
         id: viewModel
     }
 
+    // On first launch the default DB doesn't exist yet; openDefaultDatabase
+    // creates it at the OS-appropriate data path (see
+    // tasks_core::db::default_db_path) and loads it read-only.
+    Component.onCompleted: viewModel.openDefaultDatabase()
+
     FileDialog {
         id: openDialog
-        title: qsTr("Open Tasks database")
-        // SQLite databases have no registered MIME type, so accept all
-        // files and let `Database::open_read_only` verify the Room
-        // identity hash.
+        title: qsTr("Open a Tasks database")
+        // SQLite databases have no registered MIME type, so accept
+        // all files and let `Database::open_read_only` verify the
+        // Room identity hash before committing to anything.
         nameFilters: [
             qsTr("SQLite database (*.db *.sqlite *.sqlite3)"),
             qsTr("All files (*)")
@@ -51,7 +58,6 @@ ApplicationWindow {
             if (path.startsWith("file://")) {
                 path = path.substring(7);
             }
-            pathField.text = path;
             viewModel.openDatabase(path);
         }
     }
@@ -63,21 +69,25 @@ ApplicationWindow {
             anchors.rightMargin: 8
             spacing: 8
 
-            TextField {
-                id: pathField
+            // Read-only display of the current DB. Users who want to
+            // point the viewer at a different file (e.g. an Android
+            // export) use the Open… button.
+            Label {
                 Layout.fillWidth: true
-                placeholderText: qsTr("Path to tasks.db (or click Browse…)")
-                selectByMouse: true
-                onAccepted: if (text.length > 0) viewModel.openDatabase(text)
+                text: viewModel.dbPathDisplay.length > 0
+                      ? viewModel.dbPathDisplay
+                      : qsTr("(no database open)")
+                elide: Text.ElideMiddle
+                font.family: "monospace"
+                opacity: 0.75
             }
             Button {
-                text: qsTr("Browse…")
+                text: qsTr("Open different\u2026")
                 onClicked: openDialog.open()
             }
             Button {
-                text: qsTr("Open")
-                enabled: pathField.text.length > 0
-                onClicked: viewModel.openDatabase(pathField.text)
+                text: qsTr("Reset to default")
+                onClicked: viewModel.openDefaultDatabase()
             }
         }
     }

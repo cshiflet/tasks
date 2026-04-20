@@ -31,6 +31,14 @@ pub mod qobject {
         type QList_bool = cxx_qt_lib::QList<bool>;
     }
 
+    // `auto_cxx_name` tells cxx-qt to snake_case → camelCase every
+    // C++-side name it generates from this block (Q_PROPERTY names,
+    // setters, change signals, Q_INVOKABLE methods). Without it,
+    // cxx-qt 0.7 emits the raw Rust identifier, so QML bindings
+    // written as `viewModel.dbPathDisplay` / `viewModel.sidebarLabels`
+    // would silently resolve to `undefined` and the UI would render
+    // with no data even though the bridge was otherwise healthy.
+    #[auto_cxx_name]
     unsafe extern "RustQt" {
         #[qobject]
         #[qml_element]
@@ -58,10 +66,17 @@ pub mod qobject {
         #[qproperty(QString, active_filter_id)]
         // Status bar text.
         #[qproperty(QString, status)]
+        // Absolute path of the currently-open database, surfaced in
+        // the window title + Browse path field so users know which
+        // file they're looking at.
+        #[qproperty(QString, db_path_display)]
         type TaskListViewModel = super::TaskListViewModelRust;
 
         #[qinvokable]
         fn open_database(self: Pin<&mut TaskListViewModel>, path: QString);
+
+        #[qinvokable]
+        fn open_default_database(self: Pin<&mut TaskListViewModel>);
 
         #[qinvokable]
         fn select_filter(self: Pin<&mut TaskListViewModel>, id: QString);
@@ -86,7 +101,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
 
-use tasks_core::db::Database;
+use tasks_core::db::{default_db_path, Database};
 use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, Task};
 use tasks_core::query::{
     run_by_filter_id, QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
@@ -115,6 +130,7 @@ pub struct TaskListViewModelRust {
     active_filter_id: QString,
     // Status.
     status: QString,
+    db_path_display: QString,
     // Non-Qt bookkeeping. Held on the Rust side only; not exposed to QML.
     db_path: Option<PathBuf>,
     db: Option<Database>,
@@ -150,6 +166,7 @@ impl Default for TaskListViewModelRust {
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
             status: QString::default(),
+            db_path_display: QString::default(),
             db_path: None,
             db: None,
             task_cache: Vec::new(),
@@ -169,48 +186,26 @@ impl Drop for TaskListViewModelRust {
 }
 
 impl qobject::TaskListViewModel {
-    pub fn open_database(mut self: Pin<&mut Self>, path: QString) {
-        let path_string = path.to_string();
-        let path_buf = PathBuf::from(&path_string);
+    /// Open a user-specified database file read-only. Used by the
+    /// Browse… button in the QML toolbar.
+    pub fn open_database(self: Pin<&mut Self>, path: QString) {
+        let path_buf = PathBuf::from(path.to_string());
+        open_at_path(self, path_buf, OpenMode::ReadOnlyOnly);
+    }
 
-        // Read sidebar (filters + calendars) eagerly, independently of the
-        // list query — the sidebar is stable across filter selection.
-        // The Database handle is cached on the view model so selectFilter
-        // / selectTask don't have to re-verify the identity hash on every
-        // navigation.
-        // Stop any prior watcher before opening a new DB. The spawned
-        // thread observes `stop` and exits cleanly on its next tick.
-        stop_prior_watcher(self.as_mut());
-
-        match Database::open_read_only(&path_buf) {
-            Ok(db) => {
-                let (labels, ids) = build_sidebar(&db);
-                self.as_mut()
-                    .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
-                self.as_mut()
-                    .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
-                self.as_mut().set_status(QString::from(&format!(
-                    "Opened {path_string}. {} sidebar entries.",
-                    labels.len()
-                )));
-                {
-                    let mut inner = self.as_mut().rust_mut();
-                    inner.db_path = Some(path_buf.clone());
-                    inner.db = Some(db);
-                    // `inner` drops here so subsequent as_mut() calls can
-                    // re-borrow without an overlap.
-                }
-                self.as_mut().reload_active_filter();
-                start_watcher(self.as_mut(), path_buf);
-            }
-            Err(e) => {
-                let msg = format!("Couldn't open {path_string}: {e}");
-                tracing::warn!("{msg}");
-                self.as_mut().set_status(QString::from(&msg));
-                self.as_mut().clear_list();
-                let mut inner = self.as_mut().rust_mut();
-                inner.db_path = None;
-                inner.db = None;
+    /// Open the desktop client's managed database at the default
+    /// per-OS path, creating an empty schema if the file doesn't
+    /// exist yet. Called from `Main.qml`'s `Component.onCompleted`
+    /// so users don't have to pick a file on first launch.
+    pub fn open_default_database(self: Pin<&mut Self>) {
+        match default_db_path() {
+            Some(path) => open_at_path(self, path, OpenMode::CreateIfMissing),
+            None => {
+                // No resolvable data directory — very rare; surface
+                // to the status bar and let the user pick via Browse.
+                self.set_status(QString::from(
+                    "Couldn't resolve a default data directory; use Browse\u{2026}",
+                ));
             }
         }
     }
@@ -350,6 +345,62 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
 /// Errors from reading the `caldav_lists` / `filters` tables are logged
 /// (not fatal) so a broken/missing table shows as an incomplete sidebar
 /// rather than aborting the whole `openDatabase` flow.
+/// Whether an open operation is allowed to bootstrap a missing
+/// database file. `openDatabase(path)` from the Browse button only
+/// opens what already exists; `openDefaultDatabase` creates-on-miss.
+enum OpenMode {
+    ReadOnlyOnly,
+    CreateIfMissing,
+}
+
+/// Shared implementation behind `open_database` and
+/// `open_default_database`. Tears down the prior watcher, opens (or
+/// initialises) the file, rebuilds the sidebar, and kicks off the
+/// initial query. Status-line text and error branches stay the same
+/// regardless of which entry point called us.
+fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mode: OpenMode) {
+    stop_prior_watcher(vm.as_mut());
+
+    let path_display = path.display().to_string();
+    let result = match mode {
+        OpenMode::ReadOnlyOnly => Database::open_read_only(&path),
+        OpenMode::CreateIfMissing => Database::open_or_create_read_only(&path),
+    };
+
+    match result {
+        Ok(db) => {
+            let (labels, ids) = build_sidebar(&db);
+            vm.as_mut()
+                .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
+            vm.as_mut()
+                .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
+            vm.as_mut().set_status(QString::from(&format!(
+                "Opened {path_display} ({} sidebar entries)",
+                labels.len()
+            )));
+            vm.as_mut()
+                .set_db_path_display(QString::from(&path_display));
+            {
+                let mut inner = vm.as_mut().rust_mut();
+                inner.db_path = Some(path.clone());
+                inner.db = Some(db);
+            }
+            vm.as_mut().reload_active_filter();
+            start_watcher(vm.as_mut(), path);
+        }
+        Err(e) => {
+            let msg = format!("Couldn't open {path_display}: {e}");
+            tracing::warn!("{msg}");
+            vm.as_mut().set_status(QString::from(&msg));
+            vm.as_mut().set_db_path_display(QString::default());
+            vm.as_mut().clear_list();
+            let mut inner = vm.as_mut().rust_mut();
+            inner.db_path = None;
+            inner.db = None;
+        }
+    }
+}
+
 fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
     let mut labels = vec![
         "All active".to_string(),

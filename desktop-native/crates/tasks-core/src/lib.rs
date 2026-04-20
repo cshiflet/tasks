@@ -16,7 +16,7 @@ pub use query::{
     QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
 };
 
-pub use db::Database;
+pub use db::{default_db_path, Database};
 pub use error::{CoreError, Result};
 pub use models::{
     AccountType, Alarm, AlarmType, CaldavAccount, CaldavCalendar, CaldavTask, CalendarAccess,
