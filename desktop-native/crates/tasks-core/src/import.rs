@@ -287,6 +287,25 @@ struct CaldavCalendarJson {
     last_sync: i64,
 }
 
+/// Strip the stray leading slash a QML FileDialog leaves in front
+/// of a Windows drive letter after the `file://` prefix has been
+/// removed (e.g. `/C:/Users/...` → `C:/Users/...`). No-op on other
+/// inputs. Kept here defensively in addition to the QML-side
+/// cleanup so any future caller — tests, a bespoke CLI path,
+/// another platform dialog — can't repeat the same mistake.
+fn normalize_windows_path(input: &Path) -> std::path::PathBuf {
+    let s = match input.to_str() {
+        Some(s) => s,
+        None => return input.to_path_buf(),
+    };
+    let bytes = s.as_bytes();
+    // "/X:..." where X is an ASCII letter.
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        return std::path::PathBuf::from(&s[1..]);
+    }
+    input.to_path_buf()
+}
+
 /// Read a Tasks.org JSON backup from `source_path` and apply it to
 /// the database at `target_path`. The target file must already
 /// exist — call `Database::open_or_create_read_only` once before
@@ -295,6 +314,8 @@ struct CaldavCalendarJson {
 /// The import runs inside a single SQLite transaction, so a parse
 /// or constraint failure leaves the destination untouched.
 pub fn import_json_backup(target_path: &Path, source_path: &Path) -> Result<ImportStats> {
+    let source_path = normalize_windows_path(source_path);
+    let source_path = source_path.as_path();
     let raw = std::fs::read_to_string(source_path).map_err(|e| {
         CoreError::Io(std::io::Error::new(
             e.kind(),
@@ -529,4 +550,47 @@ fn apply(tx: &rusqlite::Transaction<'_>, data: &BackupData) -> Result<ImportStat
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::normalize_windows_path;
+    use std::path::Path;
+
+    #[test]
+    fn strips_leading_slash_before_drive_letter() {
+        // Reported Windows regression: QML `file:///C:/...` stripped
+        // naively gives `/C:/...`, which CreateFileW rejects with
+        // OS error 123. normalizer must remove the leading slash.
+        assert_eq!(
+            normalize_windows_path(Path::new("/C:/Users/cshiflet/x.json")),
+            Path::new("C:/Users/cshiflet/x.json")
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new("/z:/data")),
+            Path::new("z:/data")
+        );
+    }
+
+    #[test]
+    fn leaves_real_unix_paths_alone() {
+        assert_eq!(
+            normalize_windows_path(Path::new("/home/user/x.json")),
+            Path::new("/home/user/x.json")
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new("/Users/foo/Downloads/x.json")),
+            Path::new("/Users/foo/Downloads/x.json")
+        );
+    }
+
+    #[test]
+    fn leaves_native_windows_paths_alone() {
+        // Users who paste an already-native path via a CLI shouldn't
+        // have it re-mangled.
+        assert_eq!(
+            normalize_windows_path(Path::new("C:/Users/cshiflet/x.json")),
+            Path::new("C:/Users/cshiflet/x.json")
+        );
+    }
 }

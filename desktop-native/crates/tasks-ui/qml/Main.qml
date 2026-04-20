@@ -52,7 +52,7 @@ ApplicationWindow {
         fileMode: FileDialog.OpenFile
 
         onAccepted: {
-            let path = stripFileScheme(selectedFile.toString());
+            let path = urlToLocalFile(selectedFile);
             viewModel.openDatabase(path);
         }
     }
@@ -67,18 +67,35 @@ ApplicationWindow {
         fileMode: FileDialog.OpenFile
 
         onAccepted: {
-            viewModel.importJsonBackup(stripFileScheme(selectedFile.toString()));
+            viewModel.importJsonBackup(urlToLocalFile(selectedFile));
         }
     }
 
-    // QML's selectedFile is a file:// URL; every caller needs a
-    // plain absolute path. Hoisted into a helper so the Open and
-    // Import dialogs don't duplicate the logic.
-    function stripFileScheme(url) {
-        if (url.startsWith("file://")) {
-            return url.substring(7);
+    // Turn a QML FileDialog.selectedFile (a `file://` URL) into a
+    // native absolute path the Rust side can hand straight to
+    // std::fs::open(). Three platform wrinkles:
+    //
+    //   1. URL encoding — spaces and other characters come back as
+    //      `%20` etc. decodeURIComponent undoes that.
+    //   2. Unix: "file:///home/user/foo" → "/home/user/foo".
+    //      Strip the "file://" prefix (7 chars) and keep the leading
+    //      slash intact.
+    //   3. Windows: "file:///C:/Users/foo" → "C:/Users/foo".
+    //      After stripping "file://" we're left with "/C:/...", but
+    //      Windows path APIs reject the leading slash ("os error 123:
+    //      filename, directory name, or volume label syntax is
+    //      incorrect"), so drop it when a drive letter follows.
+    //      Rust handles forward-slash-separated Windows paths fine.
+    function urlToLocalFile(url) {
+        let s = url.toString();
+        if (!s.startsWith("file://")) {
+            return s;
         }
-        return url;
+        s = decodeURIComponent(s).substring(7);
+        if (/^\/[A-Za-z]:/.test(s)) {
+            s = s.substring(1);
+        }
+        return s;
     }
 
     header: ToolBar {
