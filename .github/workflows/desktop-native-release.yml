@@ -35,6 +35,12 @@ env:
   # Ubuntu 24.04) because that's what `apt-get` resolves and matches
   # the CI workflow.
   QT_VERSION: '6.6.3'
+  # Opt every JavaScript-based action into Node 24. GitHub forces
+  # this default on 2026-06-02 anyway; enabling it now clears the
+  # deprecation warning Linux emits on `actions/upload-artifact@v4`
+  # and flushes any Node-version-related issues before they show up
+  # as hard failures.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build-linux:

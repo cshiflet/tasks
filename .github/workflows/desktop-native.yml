@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Opt JS-based actions into Node 24 ahead of the 2026-06-02 default
+  # flip. See desktop-native-release.yml for the full rationale.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   # Linux job runs fmt + clippy + the schema-hash guard in addition to
   # `cargo test`, since those checks only need to run once per commit.
