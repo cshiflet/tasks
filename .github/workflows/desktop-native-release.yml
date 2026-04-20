@@ -35,11 +35,13 @@ env:
   # Ubuntu 24.04) because that's what `apt-get` resolves and matches
   # the CI workflow.
   QT_VERSION: '6.6.3'
-  # Opt every JavaScript-based action into Node 24. GitHub forces
-  # this default on 2026-06-02 anyway; enabling it now clears the
-  # deprecation warning Linux emits on `actions/upload-artifact@v4`
-  # and flushes any Node-version-related issues before they show up
-  # as hard failures.
+  # Opt every JavaScript-based action into Node 24. Our own pins
+  # (actions/checkout@v6, actions/upload-artifact@v5,
+  # actions/download-artifact@v5) are already Node-24-native; this env
+  # var guards the remaining third-party actions (Swatinem/rust-cache,
+  # jurplel/install-qt-action, softprops/action-gh-release) whose
+  # current majors still ship on Node 20. GitHub forces the switch
+  # on 2026-06-02 regardless; enabling now flushes any issues early.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
@@ -94,7 +96,7 @@ jobs:
           echo "name=${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artefact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: ${{ steps.pkg.outputs.archive }}
@@ -172,7 +174,7 @@ jobs:
           echo "name=${OUT}.dmg" >> "$GITHUB_OUTPUT"
 
       - name: Upload artefact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: ${{ steps.pkg.outputs.archive }}
@@ -228,7 +230,7 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$Out.zip"
 
       - name: Upload artefact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: ${{ steps.pkg.outputs.archive }}
@@ -242,7 +244,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artefacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
 
