@@ -337,6 +337,57 @@ Plan amendments this implies:
   import or by a fresh sync against the user's existing CalDAV
   account — never by sharing Android's sandbox file.
 
+## 6.7. Milestone 1 shipped; Milestone 1.5 (JSON import) landed
+
+Manual testing on Windows confirmed Milestone 1 behaves end-to-end
+— the managed `tasks.db` auto-creates at the OS data dir on first
+launch, the three-pane UI renders, and the QML bindings now
+resolve to real values (caught and fixed the cxx-qt `auto_cxx_name`
+gotcha while verifying).
+
+Follow-up work, in the order the user prioritised:
+
+- **Milestone 1.5 — JSON import (shipped).** Ports
+  `org.tasks.backup.TasksJsonExporter`'s output format into a
+  `tasks_core::import` module that materialises Tasks.org's
+  Android-side backup into the desktop's own SQLite. The entry
+  point lives in `Main.qml`'s toolbar as an "Import backup"
+  button; it opens a `FileDialog` scoped to `*.json`, hands the
+  selected path to the bridge, and the bridge invokes the importer
+  on the currently-open DB inside a single transaction.
+
+  Deliberate limitations captured in module docs:
+
+  * Task.parent is `@Transient` in Kotlin and therefore absent from
+    the JSON; subtasks import as flat tasks until we add a
+    re-linking pass that walks `caldavTasks.remoteParent` →
+    `remoteId`.
+  * Attachments (file-content) and user-activity comments are
+    counted but skipped — the export carries their metadata but
+    the content lives in URI references.
+  * Task-list metadata + Astrid-era legacy locations are not
+    imported; rare on modern installs.
+
+  Three integration tests pin the behaviour:
+  `import_backup_populates_every_entity` (including re-running the
+  same backup twice to prove `INSERT OR REPLACE` on `tasks.remoteId`
+  keeps things idempotent), `import_rolls_back_on_parse_error`,
+  and `import_missing_file_reports_io_error`.
+
+- **Milestone 2 — writes (next).** Per the user's selection:
+  complete + delete + full task-edit dialog, promoted alongside
+  the `QAbstractListModel` upgrade (scaffolding already in tree at
+  `cxx/task_list_model_base.h`). The parallel-Q_PROPERTY shape was
+  right for read-only but won't scale to per-row dataChanged
+  signals.
+
+- **Milestone 2.5 — OS-native reminders.** Deferred from M2 to
+  keep the write-path validation tractable. libnotify on Linux,
+  `NSUserNotification` on macOS, Windows Toast on Windows.
+
+- **Milestone 3 — CalDAV sync.** Unchanged; still the right
+  substrate.
+
 ## 7. Bottom line
 
 The query-builder and view-model layers of Milestone 1 are

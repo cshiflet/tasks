@@ -7,6 +7,7 @@
 
 pub mod db;
 pub mod error;
+pub mod import;
 pub mod models;
 pub mod query;
 pub mod watch;
@@ -18,6 +19,7 @@ pub use query::{
 
 pub use db::{default_db_path, Database};
 pub use error::{CoreError, Result};
+pub use import::{import_json_backup, ImportStats};
 pub use models::{
     AccountType, Alarm, AlarmType, CaldavAccount, CaldavCalendar, CaldavTask, CalendarAccess,
     Filter, Geofence, Place, Priority, RepeatFrom, Tag, TagData, Task,

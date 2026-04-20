@@ -10,6 +10,9 @@ build = "build.rs"
 [dependencies]
 rusqlite = { workspace = true }
 serde = { workspace = true }
+# JSON backup import — reads `TasksJsonExporter.kt`'s output and
+# materialises it into the desktop's managed SQLite.
+serde_json = "1"
 thiserror = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }

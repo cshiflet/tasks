@@ -79,6 +79,9 @@ pub mod qobject {
         fn open_default_database(self: Pin<&mut TaskListViewModel>);
 
         #[qinvokable]
+        fn import_json_backup(self: Pin<&mut TaskListViewModel>, path: QString);
+
+        #[qinvokable]
         fn select_filter(self: Pin<&mut TaskListViewModel>, id: QString);
 
         #[qinvokable]
@@ -206,6 +209,59 @@ impl qobject::TaskListViewModel {
                 self.set_status(QString::from(
                     "Couldn't resolve a default data directory; use Browse\u{2026}",
                 ));
+            }
+        }
+    }
+
+    /// Import a Tasks.org JSON backup (the file produced by the
+    /// Android app's Settings → Backups → Export JSON flow) into
+    /// the currently-open database. Tears down the watcher while
+    /// the write happens, then reopens the DB read-only and reloads
+    /// the active filter so the new rows show up immediately.
+    pub fn import_json_backup(mut self: Pin<&mut Self>, path: QString) {
+        let source = PathBuf::from(path.to_string());
+        // Import targets the currently-open DB. If none is open yet
+        // (first launch, pre-openDefault), surface a clear error
+        // rather than silently targeting the default.
+        let target = match self.db_path.clone() {
+            Some(p) => p,
+            None => {
+                self.as_mut().set_status(QString::from(
+                    "Open or create a database first, then import.",
+                ));
+                return;
+            }
+        };
+
+        // Close the read-only handle + stop the watcher so the
+        // importer's writable open has exclusive access. The target
+        // is our own file; no other process touches it.
+        stop_prior_watcher(self.as_mut());
+        self.as_mut().rust_mut().db = None;
+
+        let outcome = tasks_core::import::import_json_backup(&target, &source);
+        match outcome {
+            Ok(stats) => {
+                let msg = format!(
+                    "Imported {} tasks, {} places, {} tags, {} filters from {}",
+                    stats.tasks,
+                    stats.places,
+                    stats.tag_data,
+                    stats.filters,
+                    source.display()
+                );
+                tracing::info!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                // Reopen the DB read-only and refresh the views.
+                open_at_path(self.as_mut(), target, OpenMode::ReadOnlyOnly);
+            }
+            Err(e) => {
+                let msg = format!("Import failed: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                // Reopen the target so the UI isn't stuck in a closed
+                // state.
+                open_at_path(self.as_mut(), target, OpenMode::ReadOnlyOnly);
             }
         }
     }

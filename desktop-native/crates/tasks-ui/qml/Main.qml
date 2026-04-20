@@ -52,14 +52,33 @@ ApplicationWindow {
         fileMode: FileDialog.OpenFile
 
         onAccepted: {
-            // selectedFile is a file:// URL; strip the scheme so
-            // Database::open_read_only gets a plain path.
-            let path = selectedFile.toString();
-            if (path.startsWith("file://")) {
-                path = path.substring(7);
-            }
+            let path = stripFileScheme(selectedFile.toString());
             viewModel.openDatabase(path);
         }
+    }
+
+    FileDialog {
+        id: importDialog
+        title: qsTr("Import a Tasks.org JSON backup")
+        nameFilters: [
+            qsTr("Tasks.org JSON backup (*.json)"),
+            qsTr("All files (*)")
+        ]
+        fileMode: FileDialog.OpenFile
+
+        onAccepted: {
+            viewModel.importJsonBackup(stripFileScheme(selectedFile.toString()));
+        }
+    }
+
+    // QML's selectedFile is a file:// URL; every caller needs a
+    // plain absolute path. Hoisted into a helper so the Open and
+    // Import dialogs don't duplicate the logic.
+    function stripFileScheme(url) {
+        if (url.startsWith("file://")) {
+            return url.substring(7);
+        }
+        return url;
     }
 
     header: ToolBar {
@@ -84,6 +103,12 @@ ApplicationWindow {
             Button {
                 text: qsTr("Open different\u2026")
                 onClicked: openDialog.open()
+            }
+            Button {
+                text: qsTr("Import backup")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Import a Tasks.org JSON backup file into the open database")
+                onClicked: importDialog.open()
             }
             Button {
                 text: qsTr("Reset to default")

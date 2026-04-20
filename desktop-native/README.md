@@ -72,18 +72,38 @@ Milestone 1 (read-only companion):
 - [x] Filesystem-watcher → UI refresh (auto-reload on DB change)
 - [x] Synthesized fixture DB integration tests
 - [x] Reproducible toolchain (`docker/Dockerfile.dev`)
-- [ ] `QAbstractListModel` with per-row roles (scaffolding committed;
-      bridge/QML wiring pending)
+- [x] Managed `tasks.db` at default OS data dir; creates empty schema
+      on first launch
+- [x] GitHub Actions release workflow (tag `desktop-native-v*` →
+      draft release with Linux .tar.gz + macOS .dmg + Windows .zip
+      artefacts)
+
+Milestone 1.5 (bridge to writes):
+
+- [x] JSON import from Tasks.org's Android backup format
+      (File → Import in the toolbar; `tasks_core::import`)
+- [ ] Parent-child subtask re-linking on import
+      (walk `caldavTasks.remoteParent` → `remoteId` and backfill
+      `tasks.parent`)
+- [ ] Real Android-captured fixture DB for end-to-end tests
+
+Milestone 2 (writes):
+
+- [ ] `QAbstractListModel` with per-row roles (scaffolding committed
+      in `cxx/task_list_model_base.h`; bridge/QML wiring pending)
+- [ ] Click-to-complete + swipe-to-delete with
+      recurring-task next-occurrence rescheduling
+- [ ] Task edit dialog (title / notes / due / priority / hide-until)
+- [ ] Add-new-task, bulk complete, undo/redo
 - [ ] User-editable preferences panel (sort mode / grouping /
       show completed+hidden)
-- [ ] Real Android-captured fixture DB for end-to-end tests
-- [ ] JSON-import from Tasks.org's backup format (Milestone 1.5 bridge
-      to Milestone 2)
-- [ ] Packaging (AppImage / Flatpak, notarized `.app` + DMG, MSIX)
 
-Later milestones: write path + reminder scheduling, CalDAV sync,
-Google Tasks / Microsoft To Do, EteSync, geofencing + widget
-equivalents. Full detail in the plan file and in
+Milestone 2.5: OS-native reminder notifications (libnotify on
+Linux, NSUserNotification on macOS, WinRT Toast on Windows).
+
+Later milestones: CalDAV sync, Google Tasks / Microsoft To Do,
+EteSync, geofencing + widgets, packaging (AppImage / Flatpak,
+notarized `.app` + DMG, MSIX). Full detail in the plan file and in
 `desktop-native/PLAN_UPDATES.md`.
 
 ## See also
