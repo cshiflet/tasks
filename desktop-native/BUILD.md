@@ -189,5 +189,18 @@ want for "does QML parse?"
   made.
 - `desktop-native/PLAN_UPDATES.md` — amendments to the original plan
   at `/root/.claude/plans/i-m-interested-in-implementing-unified-parasol.md`.
-- `.github/workflows/desktop-native.yml` — canonical CI recipe for
-  Linux + macOS + Windows.
+- `.github/workflows/desktop-native.yml` — CI workflow: fmt, clippy,
+  tests, and offscreen GUI smoke on Linux + macOS + Windows.
+- `.github/workflows/desktop-native-release.yml` — release-build
+  workflow. Triggers on tags matching `desktop-native-v*` (full
+  release with draft GitHub Release) or on manual `workflow_dispatch`
+  runs (one-off builds of a branch tip). Produces three artefacts
+  per run:
+    * Linux: `tasks-desktop-<version>-linux-x86_64.tar.gz`
+    * macOS: `tasks-desktop-<version>-macos-universal.dmg` (bundled
+      Qt libraries via `macdeployqt`)
+    * Windows: `tasks-desktop-<version>-windows-x86_64.zip` (bundled
+      DLLs + QML runtime via `windeployqt`)
+  None of these are signed or notarized — on macOS clear the
+  quarantine with `xattr -d com.apple.quarantine tasks-desktop.app`,
+  on Windows expect a SmartScreen "unrecognized publisher" warning.
