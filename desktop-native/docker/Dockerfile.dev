@@ -47,13 +47,13 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
         qt6-tools-dev-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# Rustup + stable toolchain (1.94.x at the time of writing). rustfmt
-# and clippy are in the default profile; we explicitly request them
-# so CI parity holds.
+# Rustup + stable toolchain (1.94.x at the time of writing). The
+# `default` profile already installs clippy + rustfmt, so don't pass
+# `--component` — rustup-init errors on the second positional arg.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable --profile default \
-                   --component clippy rustfmt \
-    && rustc --version && cargo --version
+    && rustc --version && cargo --version \
+    && rustfmt --version && cargo clippy --version
 
 WORKDIR /workspace
 CMD ["bash"]

@@ -38,9 +38,11 @@ sudo apt-get install -y --no-install-recommends \
     qt6-tools-dev-tools
 
 if ! command -v rustup >/dev/null; then
+    # `--profile default` already installs clippy + rustfmt; do NOT pass
+    # `--component rustfmt` separately — rustup-init rejects it as an
+    # unexpected positional argument.
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --profile default \
-                   --component clippy rustfmt
+        | sh -s -- -y --default-toolchain stable --profile default
     # shellcheck disable=SC1090
     source "$HOME/.cargo/env"
 fi
