@@ -108,7 +108,11 @@ jobs:
         with:
           version: ${{ env.QT_VERSION }}
           cache: true
-          modules: 'qtdeclarative qtsvg'
+          # `modules:` is for add-on packages (qtwebengine / qtmultimedia /
+          # qtpositioning / …). qtbase + qtdeclarative + qtsvg + qttools
+          # are part of the default Qt install and must NOT be listed
+          # here — aqtinstall errors with "packages [...] were not found
+          # while parsing XML".
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -183,7 +187,8 @@ jobs:
         with:
           version: ${{ env.QT_VERSION }}
           cache: true
-          modules: 'qtdeclarative qtsvg'
+          # See build-macos: no `modules:` — qtdeclarative / qtsvg /
+          # qttools are part of the default base install.
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
