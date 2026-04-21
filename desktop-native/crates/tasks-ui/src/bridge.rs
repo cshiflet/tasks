@@ -116,10 +116,11 @@ use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
 
 use tasks_core::db::{default_db_path, Database};
-use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, Task};
+use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, RepeatFrom, Task};
 use tasks_core::query::{
     run_by_filter_id, QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
 };
+use tasks_core::recurrence::humanize_rrule;
 use tasks_core::watch::DatabaseWatcher;
 
 pub struct TaskListViewModelRust {
@@ -378,8 +379,16 @@ impl qobject::TaskListViewModel {
             .set_selected_due_label(QString::from(&format_due_label(task.due_date)));
         self.as_mut().set_selected_priority(task.priority);
         self.as_mut().set_selected_completed(task.is_completed());
+        // Humanise the RRULE (FREQ/INTERVAL/BYDAY/UNTIL/COUNT) and
+        // mark repeat-from-completion so the user sees the semantic
+        // difference from repeat-from-due-date without needing to
+        // decode RRULE text.
+        let humanized = humanize_rrule(
+            task.recurrence.as_deref().unwrap_or(""),
+            task.repeat_from == RepeatFrom::COMPLETION_DATE,
+        );
         self.as_mut()
-            .set_selected_recurrence(QString::from(task.recurrence.as_deref().unwrap_or("")));
+            .set_selected_recurrence(QString::from(&humanized));
     }
 
     /// Re-query the DB using `self.active_filter_id` and publish the

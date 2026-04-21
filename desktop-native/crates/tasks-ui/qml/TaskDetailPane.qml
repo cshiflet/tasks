@@ -44,10 +44,11 @@ Pane {
             }
         }
 
-        // Recurrence (RRULE). Shown verbatim — "FREQ=DAILY;INTERVAL=1"
-        // isn't pretty, but hiding it entirely was worse. A Milestone 2
-        // pass can port the Android client's RepeatRuleToString to
-        // render "Every day" / "Every other Tuesday" etc.
+        // Recurrence summary. The view model hands us a humanised
+        // phrase ("Every other week on Mon, Wed") produced by
+        // `tasks_core::recurrence::humanize_rrule`, already tagged
+        // with "(from completion)" when `tasks.repeat_from` says so.
+        // Rules we can't parse show through verbatim.
         RowLayout {
             spacing: 8
             visible: root.vm && root.vm.selectedRecurrence.length > 0
@@ -58,7 +59,6 @@ Pane {
             Label {
                 Layout.fillWidth: true
                 text: root.vm ? root.vm.selectedRecurrence : ""
-                font.family: "monospace"
                 elide: Text.ElideRight
             }
         }

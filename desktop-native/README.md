@@ -97,14 +97,24 @@ Milestone 2 (writes):
 - [x] Click-to-complete + click-to-delete (soft). Each write opens a
       short-lived read-write SQLite connection in
       `tasks_core::write`, keeping the GUI's read-only handle intact.
+- [x] Recurrence summary in the detail pane — `humanize_rrule` turns
+      `FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE,FR` into
+      "Every other week on Mon, Wed, Fri"; repeat-from-completion
+      tasks get a `(from completion)` suffix. Complex rule parts
+      (BYMONTHDAY, BYSETPOS, positional BYDAY) are dropped silently;
+      full Android-parity RRULE rendering is a later pass.
 - [ ] Recurring-task next-occurrence rescheduling on complete
       (needs RRULE parsing + timezone-aware dates)
-- [ ] Task edit dialog (title / notes / due / priority / hide-until)
+- [ ] Task edit dialog (title / notes / due / priority / hide-until /
+      recurrence)
 - [ ] Add-new-task, bulk complete, undo/redo
 - [ ] `QAbstractListModel` with per-row roles (scaffolding committed
       in `cxx/task_list_model_base.h`; bridge/QML wiring pending)
 - [ ] User-editable preferences panel (sort mode / grouping /
       show completed+hidden)
+- [ ] Full Android-parity RRULE humanisation (port of
+      `RepeatRuleToString`: positional BYDAY, BYMONTHDAY, locale-aware
+      weekday names, etc.)
 
 Milestone 2.5: OS-native reminder notifications (libnotify on
 Linux, NSUserNotification on macOS, WinRT Toast on Windows).
