@@ -54,6 +54,38 @@ Pane {
         }
 
         Item { Layout.fillHeight: true }
+
+        // Bottom action row. Delete is a soft-delete — the row is
+        // flagged `deleted = now_ms` and disappears from the active
+        // list, but the record stays so a future "Trash" view or an
+        // undo path can surface it again.
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+            Item { Layout.fillWidth: true }
+            Button {
+                text: qsTr("Delete")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Mark this task deleted (hides it from the active list)")
+                onClicked: confirmDelete.open()
+            }
+        }
+    }
+
+    // Two-step confirm for delete. Cheap insurance until an undo
+    // stack lands.
+    Dialog {
+        id: confirmDelete
+        anchors.centerIn: parent
+        modal: true
+        title: qsTr("Delete task?")
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        Label {
+            text: qsTr("Remove “%1” from the active list?")
+                  .arg(root.vm ? root.vm.selectedTitle : "")
+            wrapMode: Text.Wrap
+        }
+        onAccepted: if (root.vm) root.vm.deleteSelectedTask()
     }
 
     Label {

@@ -86,6 +86,12 @@ pub mod qobject {
 
         #[qinvokable]
         fn select_task(self: Pin<&mut TaskListViewModel>, id: i64);
+
+        #[qinvokable]
+        fn toggle_task_completion(self: Pin<&mut TaskListViewModel>, id: i64, completed: bool);
+
+        #[qinvokable]
+        fn delete_selected_task(self: Pin<&mut TaskListViewModel>);
     }
 
     // Opt the view model into cxx-qt's Threading surface so the
@@ -269,6 +275,77 @@ impl qobject::TaskListViewModel {
     pub fn select_filter(mut self: Pin<&mut Self>, id: QString) {
         self.as_mut().set_active_filter_id(id);
         self.as_mut().reload_active_filter();
+    }
+
+    /// Mark task `id` as completed (or restore it to active when
+    /// `completed = false`). Delegates to `tasks_core::write` and
+    /// reloads the active filter so the UI reflects the change
+    /// immediately — the filesystem watcher would pick it up on its
+    /// next tick anyway, but clicking a checkbox should feel
+    /// instantaneous.
+    pub fn toggle_task_completion(mut self: Pin<&mut Self>, id: i64, completed: bool) {
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't mark task."));
+            return;
+        };
+        match tasks_core::set_task_completion(&path, id, completed, now_ms()) {
+            Ok(true) => {
+                self.as_mut().reload_active_filter();
+                // reload_active_filter rewrites the status line with a
+                // task count; the write feedback is implicit in that.
+                // If the selected task was the one we toggled, refresh
+                // its detail pane to match.
+                if self.selected_id == id {
+                    self.as_mut().set_selected_completed(completed);
+                }
+            }
+            Ok(false) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Task {id} not found")));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't update task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// Soft-delete the task currently shown in the detail pane. No-op
+    /// when nothing is selected. After a successful delete the detail
+    /// pane clears itself, matching the Android "swipe to delete"
+    /// behaviour minus the animation.
+    pub fn delete_selected_task(mut self: Pin<&mut Self>) {
+        let id = self.selected_id;
+        if id <= 0 {
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't delete."));
+            return;
+        };
+        match tasks_core::set_task_deleted(&path, id, now_ms()) {
+            Ok(true) => {
+                self.as_mut().set_selected_id(0);
+                self.as_mut().set_selected_title(QString::default());
+                self.as_mut().set_selected_notes(QString::default());
+                self.as_mut().set_selected_due_label(QString::default());
+                self.as_mut().set_selected_priority(Priority::NONE);
+                self.as_mut().set_selected_completed(false);
+                self.as_mut().reload_active_filter();
+            }
+            Ok(false) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Task {id} not found")));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't delete task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
     }
 
     pub fn select_task(mut self: Pin<&mut Self>, id: i64) {

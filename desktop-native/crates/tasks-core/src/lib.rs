@@ -11,6 +11,7 @@ pub mod import;
 pub mod models;
 pub mod query;
 pub mod watch;
+pub mod write;
 
 pub use query::{
     build_non_recursive_query, build_query, build_recursive_query, run_by_filter_id, QueryFilter,
@@ -24,3 +25,4 @@ pub use models::{
     AccountType, Alarm, AlarmType, CaldavAccount, CaldavCalendar, CaldavTask, CalendarAccess,
     Filter, Geofence, Place, Priority, RepeatFrom, Tag, TagData, Task,
 };
+pub use write::{set_task_completion, set_task_deleted};

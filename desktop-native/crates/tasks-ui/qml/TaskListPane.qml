@@ -47,6 +47,29 @@ Pane {
                         implicitHeight: 1
                     }
 
+                    // Completion toggle. We return the *current* check
+                    // state from nextCheckState so QML doesn't flip
+                    // its own internal `checked` (which would break
+                    // the binding to completedFlags); the actual flip
+                    // happens via the view model round trip, which
+                    // fires the property change and re-evaluates this
+                    // CheckBox's `checked` binding.
+                    CheckBox {
+                        id: completeBox
+                        padding: 0
+                        checked: root.vm && root.vm.completedFlags[index]
+                        nextCheckState: function() {
+                            if (root.vm) {
+                                root.vm.toggleTaskCompletion(
+                                    root.vm.taskIds[index],
+                                    !completeBox.checked);
+                            }
+                            return completeBox.checked
+                                ? Qt.Checked
+                                : Qt.Unchecked;
+                        }
+                    }
+
                     PriorityDot {
                         priority: root.vm ? root.vm.priorities[index] : 3
                     }

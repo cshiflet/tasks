@@ -89,12 +89,15 @@ Milestone 1.5 (bridge to writes):
 
 Milestone 2 (writes):
 
-- [ ] `QAbstractListModel` with per-row roles (scaffolding committed
-      in `cxx/task_list_model_base.h`; bridge/QML wiring pending)
-- [ ] Click-to-complete + swipe-to-delete with
-      recurring-task next-occurrence rescheduling
+- [x] Click-to-complete + click-to-delete (soft). Each write opens a
+      short-lived read-write SQLite connection in
+      `tasks_core::write`, keeping the GUI's read-only handle intact.
+- [ ] Recurring-task next-occurrence rescheduling on complete
+      (needs RRULE parsing + timezone-aware dates)
 - [ ] Task edit dialog (title / notes / due / priority / hide-until)
 - [ ] Add-new-task, bulk complete, undo/redo
+- [ ] `QAbstractListModel` with per-row roles (scaffolding committed
+      in `cxx/task_list_model_base.h`; bridge/QML wiring pending)
 - [ ] User-editable preferences panel (sort mode / grouping /
       show completed+hidden)
 

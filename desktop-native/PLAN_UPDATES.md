@@ -374,12 +374,40 @@ Follow-up work, in the order the user prioritised:
   keeps things idempotent), `import_rolls_back_on_parse_error`,
   and `import_missing_file_reports_io_error`.
 
-- **Milestone 2 — writes (next).** Per the user's selection:
+- **Milestone 2 — writes (in progress).** Per the user's selection:
   complete + delete + full task-edit dialog, promoted alongside
   the `QAbstractListModel` upgrade (scaffolding already in tree at
   `cxx/task_list_model_base.h`). The parallel-Q_PROPERTY shape was
   right for read-only but won't scale to per-row dataChanged
   signals.
+
+  **Phase A (shipped):** click-to-complete and soft-delete.
+  `tasks_core::write` exposes `set_task_completion` and
+  `set_task_deleted`, each of which opens its own short-lived
+  read-write SQLite connection, runs a one-statement transaction,
+  and closes. The read-only handle the GUI holds stays valid
+  throughout — SQLite's per-connection locking is enough without any
+  coordination. The bridge gets `toggleTaskCompletion(id, bool)` and
+  `deleteSelectedTask()` Q_INVOKABLEs; the QML layer surfaces a
+  CheckBox on each list row and a Delete button plus confirm dialog
+  in the detail pane. Three integration tests cover
+  complete/uncomplete, soft-delete, and unknown-id handling.
+
+  Deliberately deferred to Phase B:
+
+  * **Recurring-task rescheduling on complete.** Android's behaviour
+    is to advance `dueDate` to the next RRULE occurrence rather than
+    set `completed = now`. That requires an RRULE parser (candidate:
+    the `rrule` crate, which we haven't pulled in yet) and a
+    timezone-aware date crate. For Phase A, completing a recurring
+    task just stamps `completed` — good enough for verification, not
+    behaviour-equivalent to the Android client.
+  * **Edit dialog.** Title/notes/due/priority/hide-until comes with
+    Phase B.
+  * **Add-new-task and undo/redo.** Phase C.
+  * **QAbstractListModel promotion.** Phase D; the parallel-property
+    shape still works for Phase A/B since each completion toggle
+    already reloads the whole list via `reload_active_filter`.
 
 - **Milestone 2.5 — OS-native reminders.** Deferred from M2 to
   keep the write-path validation tractable. libnotify on Linux,
