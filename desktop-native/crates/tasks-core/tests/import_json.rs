@@ -149,6 +149,8 @@ fn import_backup_populates_every_entity() {
             caldav_calendars: 1,
             skipped_attachments: 1,
             skipped_comments: 1,
+            // No remote_parent in this fixture.
+            subtask_links: 0,
         },
         "row counts should match the fixture"
     );
@@ -221,6 +223,115 @@ fn import_rolls_back_on_parse_error() {
         .query_row("SELECT count(*) FROM places", [], |r| r.get(0))
         .unwrap();
     assert_eq!(places, 0);
+}
+
+#[test]
+fn import_restores_parent_child_subtask_links() {
+    // Three tasks in one calendar:
+    //   root   → no remoteParent
+    //   child  → remoteParent = root's cd_remote_id
+    //   orphan → remoteParent = "missing-uid" (not in this backup)
+    //
+    // After import we expect tasks.parent to be:
+    //   root   → 0
+    //   child  → root's new _id
+    //   orphan → 0  (parent UID doesn't resolve; log+skip)
+    let payload = serde_json::json!({
+        "version": 140200,
+        "timestamp": 1_700_000_000_000_i64,
+        "data": {
+            "tasks": [
+                {
+                    "task": { "title": "root", "priority": 3, "remoteId": "root-uid" },
+                    "caldavTasks": [{ "calendar": "list-1", "remoteId": "root-uid" }]
+                },
+                {
+                    "task": { "title": "child", "priority": 3, "remoteId": "child-uid" },
+                    "caldavTasks": [{
+                        "calendar": "list-1",
+                        "remoteId": "child-uid",
+                        "remoteParent": "root-uid"
+                    }]
+                },
+                {
+                    "task": { "title": "orphan", "priority": 3, "remoteId": "orphan-uid" },
+                    "caldavTasks": [{
+                        "calendar": "list-1",
+                        "remoteId": "orphan-uid",
+                        "remoteParent": "missing-uid"
+                    }]
+                }
+            ],
+            "caldavCalendars": [
+                { "uuid": "list-1", "name": "Work", "color": 0, "order": 0,
+                  "access": 0, "lastSync": 0 }
+            ]
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    let json_path = tmp.path().join("backup.json");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    std::fs::write(&json_path, payload.to_string()).unwrap();
+
+    let stats = import_json_backup(&db_path, &json_path).unwrap();
+    assert_eq!(stats.tasks, 3);
+    assert_eq!(stats.caldav_tasks, 3);
+    assert_eq!(
+        stats.subtask_links, 1,
+        "only child→root should be linked; orphan's target isn't in the backup"
+    );
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let conn = db.connection();
+
+    let root_id: i64 = conn
+        .query_row(
+            "SELECT _id FROM tasks WHERE remoteId = 'root-uid'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (child_parent, child_title): (i64, String) = conn
+        .query_row(
+            "SELECT parent, title FROM tasks WHERE remoteId = 'child-uid'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(child_title, "child");
+    assert_eq!(
+        child_parent, root_id,
+        "child's parent should point at root's new _id"
+    );
+
+    let orphan_parent: i64 = conn
+        .query_row(
+            "SELECT parent FROM tasks WHERE remoteId = 'orphan-uid'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        orphan_parent, 0,
+        "orphan stays flat when parent UID is absent"
+    );
+
+    let root_parent: i64 = conn
+        .query_row(
+            "SELECT parent FROM tasks WHERE remoteId = 'root-uid'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(root_parent, 0, "root has no parent");
+
+    // Re-running the same backup should stay idempotent: task rows
+    // INSERT-or-REPLACE by rowid (new _ids each time), but the
+    // re-link pass picks the fresh ids up and stamps parent again.
+    let stats2 = import_json_backup(&db_path, &json_path).unwrap();
+    assert_eq!(stats2.subtask_links, 1);
 }
 
 #[test]

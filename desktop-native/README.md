@@ -82,9 +82,10 @@ Milestone 1.5 (bridge to writes):
 
 - [x] JSON import from Tasks.org's Android backup format
       (File → Import in the toolbar; `tasks_core::import`)
-- [ ] Parent-child subtask re-linking on import
-      (walk `caldavTasks.remoteParent` → `remoteId` and backfill
-      `tasks.parent`)
+- [x] Parent-child subtask re-linking on import
+      (walks `caldavTasks.remoteParent` → `remoteId` and backfills
+      `tasks.parent`; orphans whose parent UID isn't in the backup
+      stay flat)
 - [ ] Real Android-captured fixture DB for end-to-end tests
 
 Milestone 2 (writes):

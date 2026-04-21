@@ -57,6 +57,11 @@ pub mod qobject {
         #[qproperty(QString, selected_due_label)]
         #[qproperty(i32, selected_priority)]
         #[qproperty(bool, selected_completed)]
+        // Raw RRULE from `tasks.recurrence` (e.g. "FREQ=DAILY;INTERVAL=1")
+        // or empty when the task doesn't repeat. Humanising this to
+        // prose ("Every day", "Every other Tuesday") is a later milestone;
+        // for now showing the literal rule is better than hiding it.
+        #[qproperty(QString, selected_recurrence)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -133,6 +138,7 @@ pub struct TaskListViewModelRust {
     selected_due_label: QString,
     selected_priority: i32,
     selected_completed: bool,
+    selected_recurrence: QString,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -171,6 +177,7 @@ impl Default for TaskListViewModelRust {
             selected_due_label: QString::default(),
             selected_priority: Priority::NONE,
             selected_completed: false,
+            selected_recurrence: QString::default(),
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -334,6 +341,7 @@ impl qobject::TaskListViewModel {
                 self.as_mut().set_selected_due_label(QString::default());
                 self.as_mut().set_selected_priority(Priority::NONE);
                 self.as_mut().set_selected_completed(false);
+                self.as_mut().set_selected_recurrence(QString::default());
                 self.as_mut().reload_active_filter();
             }
             Ok(false) => {
@@ -357,6 +365,7 @@ impl qobject::TaskListViewModel {
             self.as_mut().set_selected_due_label(QString::default());
             self.as_mut().set_selected_priority(Priority::NONE);
             self.as_mut().set_selected_completed(false);
+            self.as_mut().set_selected_recurrence(QString::default());
             return;
         };
 
@@ -369,6 +378,8 @@ impl qobject::TaskListViewModel {
             .set_selected_due_label(QString::from(&format_due_label(task.due_date)));
         self.as_mut().set_selected_priority(task.priority);
         self.as_mut().set_selected_completed(task.is_completed());
+        self.as_mut()
+            .set_selected_recurrence(QString::from(task.recurrence.as_deref().unwrap_or("")));
     }
 
     /// Re-query the DB using `self.active_filter_id` and publish the

@@ -7,11 +7,6 @@
 //!
 //! Known limitations (explicit, documented):
 //!
-//! * **Parent-child subtask links are not restored.** Kotlin marks
-//!   `Task.parent: Long` as `@Transient`, so the JSON doesn't carry
-//!   it. Subtasks appear as flat tasks after import. A future pass
-//!   can re-link them by walking `caldavTasks.remoteParent` (a UUID
-//!   pointing at the owning task's `remoteId`).
 //! * **Attachments and user-activity comments are skipped.** The
 //!   export carries their metadata but the file contents live
 //!   elsewhere (URI references); restoring those faithfully is its
@@ -19,6 +14,12 @@
 //! * **Task list metadata and Astrid-era legacy locations** are
 //!   skipped for the same reason — rarely populated on a modern
 //!   install.
+//!
+//! Parent-child subtask links *are* restored, indirectly: Kotlin marks
+//! `Task.parent: Long` as `@Transient` so the JSON doesn't carry it,
+//! but the per-task `caldavTasks.remoteParent` field points at the
+//! owning task's CalDAV UID (`caldavTasks.remoteId`). After the
+//! main insert pass we walk that graph and stamp `tasks.parent`.
 //!
 //! Import is transactional: either every row lands or nothing
 //! does. Existing rows at the same primary key are *replaced*
@@ -47,6 +48,10 @@ pub struct ImportStats {
     pub caldav_calendars: usize,
     pub skipped_attachments: usize,
     pub skipped_comments: usize,
+    /// Number of tasks whose `parent` was set by the post-insert
+    /// re-link pass. Orphans (remoteParent points at a UID not in
+    /// this backup) stay at `parent = 0` and don't contribute.
+    pub subtask_links: usize,
 }
 
 /// Root of the Android JSON backup. Everything under `data` is what
@@ -549,7 +554,89 @@ fn apply(tx: &rusqlite::Transaction<'_>, data: &BackupData) -> Result<ImportStat
         stats.skipped_comments += bundle.comments.len();
     }
 
+    stats.subtask_links = relink_subtasks(tx)?;
+
     Ok(stats)
+}
+
+/// Walk the caldav-task graph and stamp `tasks.parent` for every
+/// subtask whose parent is also in this import.
+///
+/// We key on `caldav_tasks.cd_remote_id` (the CalDAV object UID,
+/// which the Android app uses as the stable cross-device identity
+/// for a task): every child row contributes its own
+/// `cd_remote_parent` pointing at its parent's `cd_remote_id`. The
+/// local `tasks._id` isn't portable, so we resolve
+/// remote-id → local-id via an in-memory HashMap built from
+/// the newly-inserted caldav_tasks rows.
+///
+/// Notes:
+/// - One CalDAV calendar can hold a whole subtask tree; we don't
+///   scope the lookup to a single calendar because the backup format
+///   already guarantees one CalDAV row per task per calendar.
+/// - If a child's `cd_remote_parent` points at a UID not present in
+///   this backup, we log at debug and leave `tasks.parent = 0`
+///   (orphan); re-importing alongside the missing parent will pick
+///   the link up on the second pass.
+/// - A task may appear in multiple CalDAV rows (rare, but possible
+///   if the same task is replicated across calendars). We key the
+///   map on `cd_remote_id` and accept the last writer wins — all
+///   values should point at the same `tasks._id` for a given UID
+///   because `tasks.remoteId` is UNIQUE.
+fn relink_subtasks(tx: &rusqlite::Transaction<'_>) -> Result<usize> {
+    let mut remote_to_task_id: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT cd_task, cd_remote_id FROM caldav_tasks \
+             WHERE cd_remote_id IS NOT NULL AND cd_remote_id != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (task_id, remote_id) = row?;
+            remote_to_task_id.insert(remote_id, task_id);
+        }
+    }
+
+    // Drop the prepared statement explicitly before the map-prepared
+    // UPDATE below runs — otherwise clippy's let_and_return fights
+    // borrowck's drop order on the nested `query_map` temporary.
+    let mut edge_stmt = tx.prepare(
+        "SELECT cd_task, cd_remote_parent FROM caldav_tasks \
+         WHERE cd_remote_parent IS NOT NULL AND cd_remote_parent != ''",
+    )?;
+    let edges: Vec<(i64, String)> = edge_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(edge_stmt);
+
+    let mut update_stmt = tx.prepare("UPDATE tasks SET parent = ?1 WHERE _id = ?2")?;
+    let mut linked = 0;
+    for (child_task_id, remote_parent) in edges {
+        match remote_to_task_id.get(&remote_parent) {
+            Some(&parent_task_id) if parent_task_id != child_task_id => {
+                update_stmt.execute(params![parent_task_id, child_task_id])?;
+                linked += 1;
+            }
+            Some(_) => {
+                // Self-parent: the remote_parent UID resolved back to
+                // the same task. Malformed; don't write a cycle.
+                tracing::warn!(
+                    "task {child_task_id} claims itself as remote parent ('{remote_parent}'); skipping"
+                );
+            }
+            None => {
+                tracing::debug!(
+                    "orphan subtask: task {child_task_id} points at remote parent '{remote_parent}' with no match in this backup"
+                );
+            }
+        }
+    }
+    Ok(linked)
 }
 
 #[cfg(test)]

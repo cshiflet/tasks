@@ -44,6 +44,25 @@ Pane {
             }
         }
 
+        // Recurrence (RRULE). Shown verbatim — "FREQ=DAILY;INTERVAL=1"
+        // isn't pretty, but hiding it entirely was worse. A Milestone 2
+        // pass can port the Android client's RepeatRuleToString to
+        // render "Every day" / "Every other Tuesday" etc.
+        RowLayout {
+            spacing: 8
+            visible: root.vm && root.vm.selectedRecurrence.length > 0
+            Label {
+                text: qsTr("Repeats:")
+                opacity: 0.6
+            }
+            Label {
+                Layout.fillWidth: true
+                text: root.vm ? root.vm.selectedRecurrence : ""
+                font.family: "monospace"
+                elide: Text.ElideRight
+            }
+        }
+
         Label {
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -74,13 +93,21 @@ Pane {
 
     // Two-step confirm for delete. Cheap insurance until an undo
     // stack lands.
+    //
+    // `implicitWidth` is pinned explicitly so the wrap-mode Label
+    // inside doesn't circularly drive the Dialog's own implicit
+    // width. Without that pin, Qt logs "Binding loop detected for
+    // property 'implicitWidth'" every time the dialog opens.
     Dialog {
         id: confirmDelete
         anchors.centerIn: parent
         modal: true
         title: qsTr("Delete task?")
         standardButtons: Dialog.Cancel | Dialog.Ok
+        implicitWidth: 360
+
         Label {
+            width: parent.width
             text: qsTr("Remove “%1” from the active list?")
                   .arg(root.vm ? root.vm.selectedTitle : "")
             wrapMode: Text.Wrap
