@@ -375,13 +375,23 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     let titles = QStringList::from(&title_list);
     let due_labels = QStringList::from(&due_list);
 
-    // Populate the parallel arrays before count. QML delegates index into
-    // `titles[i]` etc. up to `count`, so if a re-render happened between
-    // setting a larger count and the corresponding array, it could pick up
-    // a stale/empty value for that row. In practice cxx-qt runs on the Qt
-    // event loop thread and deferred updates batch per-frame, but the
-    // defensive ordering is free.
+    // Two-phase publish to keep QML delegate bindings out of the
+    // stale-array race:
+    //
+    //   1. `set_count(0)` tears down every existing delegate. Each
+    //      tear-down reads the old (still consistent) arrays one
+    //      last time.
+    //   2. Refill the parallel arrays with the new data.
+    //   3. `set_count(new_count)` creates fresh delegates which
+    //      index into the already-updated arrays.
+    //
+    // Without this, a filter change from an N-row list to an
+    // M-row one (M < N) would leave M+1..N delegates briefly bound
+    // to `titles[k>=M]` etc., which resolves to `undefined` and
+    // QML emits "Unable to assign [undefined] to QString" warnings.
+    // The extra set_count(0) is the price of a clean transition.
     let count = tasks.len() as i32;
+    vm.as_mut().set_count(0);
     vm.as_mut().set_titles(titles);
     vm.as_mut().set_task_ids(task_ids);
     vm.as_mut().set_indents(indents);
