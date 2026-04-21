@@ -87,6 +87,10 @@ Milestone 1.5 (bridge to writes):
       `tasks.parent`; orphans whose parent UID isn't in the backup
       stay flat)
 - [ ] Real Android-captured fixture DB for end-to-end tests
+      *(optional — kept around as a convenience for debugging, not a
+      blocker. Cross-device data exchange is JSON export/import and
+      CalDAV/EteSync sync, not copying the SQLite file; see
+      `PLAN_UPDATES.md §6.6`.)*
 
 Milestone 2 (writes):
 
