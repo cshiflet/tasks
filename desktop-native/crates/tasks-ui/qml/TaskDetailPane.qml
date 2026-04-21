@@ -5,6 +5,8 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
+import com.tasks.desktop
+
 Pane {
     id: root
     padding: 16
@@ -83,12 +85,38 @@ Pane {
             spacing: 8
             Item { Layout.fillWidth: true }
             Button {
+                text: qsTr("Edit…")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Change title, notes, due/hide dates, or priority")
+                onClicked: {
+                    if (!root.vm) {
+                        return;
+                    }
+                    editDialog.initialTitle = root.vm.selectedTitle;
+                    editDialog.initialNotes = root.vm.selectedNotes;
+                    editDialog.initialDueText = root.vm.selectedDueLabel;
+                    editDialog.initialHideUntilText =
+                        root.vm.selectedHideUntilLabel;
+                    editDialog.initialPriority = root.vm.selectedPriority;
+                    editDialog.initialRecurrenceSummary =
+                        root.vm.selectedRecurrence;
+                    editDialog.loadFromSelection();
+                    editDialog.open();
+                }
+            }
+            Button {
                 text: qsTr("Delete")
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Mark this task deleted (hides it from the active list)")
                 onClicked: confirmDelete.open()
             }
         }
+    }
+
+    TaskEditDialog {
+        id: editDialog
+        anchors.centerIn: parent
+        vm: root.vm
     }
 
     // Two-step confirm for delete. Cheap insurance until an undo

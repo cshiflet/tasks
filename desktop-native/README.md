@@ -103,10 +103,15 @@ Milestone 2 (writes):
       tasks get a `(from completion)` suffix. Complex rule parts
       (BYMONTHDAY, BYSETPOS, positional BYDAY) are dropped silently;
       full Android-parity RRULE rendering is a later pass.
+- [x] Task edit dialog (title / notes / due / priority / hide-until).
+      Edit… button in the detail pane opens a modal form; dates are
+      typed as `YYYY-MM-DD [HH:MM]` and parsed on the Rust side via
+      `tasks_core::datetime::parse_due_input`. Recurrence stays
+      read-only in this dialog — a proper RRULE picker is its own UI.
 - [ ] Recurring-task next-occurrence rescheduling on complete
       (needs RRULE parsing + timezone-aware dates)
-- [ ] Task edit dialog (title / notes / due / priority / hide-until /
-      recurrence)
+- [ ] Recurrence editor (FREQ / BYDAY picker, from-due vs from-
+      completion toggle)
 - [ ] Add-new-task, bulk complete, undo/redo
 - [ ] `QAbstractListModel` with per-row roles (scaffolding committed
       in `cxx/task_list_model_base.h`; bridge/QML wiring pending)

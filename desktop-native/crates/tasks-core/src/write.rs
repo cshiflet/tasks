@@ -82,3 +82,71 @@ pub fn set_task_deleted(path: &Path, task_id: i64, now_ms: i64) -> Result<bool> 
     )?;
     Ok(rows > 0)
 }
+
+/// Value bundle for [`update_task_fields`]. Fields match the
+/// Android `Task` entity columns the edit dialog exposes.
+#[derive(Debug, Clone)]
+pub struct TaskEdit<'a> {
+    pub title: &'a str,
+    pub notes: &'a str,
+    /// Milliseconds since the Unix epoch. `0` = no date.
+    pub due_ms: i64,
+    /// Milliseconds since the Unix epoch. `0` = not hidden.
+    pub hide_until_ms: i64,
+    /// Raw `Priority` value: HIGH=0 … NONE=3.
+    pub priority: i32,
+}
+
+/// Edit the core user-visible fields of a task in a single UPDATE.
+///
+/// `now_ms` is written into `tasks.modified` so any sort or sync
+/// observer picks the change up. Recurrence is intentionally not
+/// editable from this call — the dialog's "Repeats" row is read-only
+/// in M2 Phase B because a full RRULE picker belongs in its own UI.
+/// Advancing the recurrence on complete still happens automatically
+/// per `tasks.recurrence` when that feature lands.
+///
+/// Returns `Ok(true)` when a row was updated, `Ok(false)` when
+/// `task_id` matched nothing.
+pub fn update_task_fields(
+    path: &Path,
+    task_id: i64,
+    edit: &TaskEdit<'_>,
+    now_ms: i64,
+) -> Result<bool> {
+    let conn = open_rw(path)?;
+    // Empty notes / title should store as NULL (matching Android's
+    // `Task.notes: String?`): otherwise a cleared field persists as
+    // the empty string and a sync round-trip can flip-flop between
+    // NULL and "".
+    let notes_arg: Option<&str> = if edit.notes.is_empty() {
+        None
+    } else {
+        Some(edit.notes)
+    };
+    let title_arg: Option<&str> = if edit.title.is_empty() {
+        None
+    } else {
+        Some(edit.title)
+    };
+    let rows = conn.execute(
+        "UPDATE tasks SET \
+             title = ?1, \
+             notes = ?2, \
+             dueDate = ?3, \
+             hideUntil = ?4, \
+             importance = ?5, \
+             modified = ?6 \
+         WHERE _id = ?7",
+        params![
+            title_arg,
+            notes_arg,
+            edit.due_ms,
+            edit.hide_until_ms,
+            edit.priority,
+            now_ms,
+            task_id,
+        ],
+    )?;
+    Ok(rows > 0)
+}

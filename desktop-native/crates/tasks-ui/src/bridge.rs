@@ -55,12 +55,17 @@ pub mod qobject {
         #[qproperty(QString, selected_title)]
         #[qproperty(QString, selected_notes)]
         #[qproperty(QString, selected_due_label)]
+        // Hide-until as the same round-trippable "YYYY-MM-DD [HH:MM]"
+        // string the due field uses. Seeds the edit dialog; empty
+        // when `tasks.hideUntil == 0`.
+        #[qproperty(QString, selected_hide_until_label)]
         #[qproperty(i32, selected_priority)]
         #[qproperty(bool, selected_completed)]
-        // Raw RRULE from `tasks.recurrence` (e.g. "FREQ=DAILY;INTERVAL=1")
-        // or empty when the task doesn't repeat. Humanising this to
-        // prose ("Every day", "Every other Tuesday") is a later milestone;
-        // for now showing the literal rule is better than hiding it.
+        // Humanised RRULE ("Every week on Mon, Wed, Fri"). The raw
+        // form lives in `tasks.recurrence`; this property is the
+        // output of `tasks_core::recurrence::humanize_rrule` with
+        // the from-completion suffix pre-applied, so the detail
+        // pane can render it verbatim.
         #[qproperty(QString, selected_recurrence)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
@@ -97,6 +102,21 @@ pub mod qobject {
 
         #[qinvokable]
         fn delete_selected_task(self: Pin<&mut TaskListViewModel>);
+
+        /// Apply the edit-dialog's form state to the currently-
+        /// selected task. `due_text` / `hide_until_text` are parsed
+        /// via `tasks_core::datetime::parse_due_input`; an empty
+        /// string means "no date". A parse failure surfaces on the
+        /// status line and leaves the DB untouched.
+        #[qinvokable]
+        fn update_selected_task(
+            self: Pin<&mut TaskListViewModel>,
+            title: QString,
+            notes: QString,
+            due_text: QString,
+            hide_until_text: QString,
+            priority: i32,
+        );
     }
 
     // Opt the view model into cxx-qt's Threading surface so the
@@ -115,6 +135,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
 
+use tasks_core::datetime::{format_due_label, parse_due_input};
 use tasks_core::db::{default_db_path, Database};
 use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, RepeatFrom, Task};
 use tasks_core::query::{
@@ -137,6 +158,7 @@ pub struct TaskListViewModelRust {
     selected_title: QString,
     selected_notes: QString,
     selected_due_label: QString,
+    selected_hide_until_label: QString,
     selected_priority: i32,
     selected_completed: bool,
     selected_recurrence: QString,
@@ -176,6 +198,7 @@ impl Default for TaskListViewModelRust {
             selected_title: QString::default(),
             selected_notes: QString::default(),
             selected_due_label: QString::default(),
+            selected_hide_until_label: QString::default(),
             selected_priority: Priority::NONE,
             selected_completed: false,
             selected_recurrence: QString::default(),
@@ -336,13 +359,7 @@ impl qobject::TaskListViewModel {
         };
         match tasks_core::set_task_deleted(&path, id, now_ms()) {
             Ok(true) => {
-                self.as_mut().set_selected_id(0);
-                self.as_mut().set_selected_title(QString::default());
-                self.as_mut().set_selected_notes(QString::default());
-                self.as_mut().set_selected_due_label(QString::default());
-                self.as_mut().set_selected_priority(Priority::NONE);
-                self.as_mut().set_selected_completed(false);
-                self.as_mut().set_selected_recurrence(QString::default());
+                clear_detail_pane(self.as_mut());
                 self.as_mut().reload_active_filter();
             }
             Ok(false) => {
@@ -359,14 +376,7 @@ impl qobject::TaskListViewModel {
 
     pub fn select_task(mut self: Pin<&mut Self>, id: i64) {
         let Some(task) = self.task_cache.iter().find(|t| t.id == id).cloned() else {
-            // Unknown id — reset detail pane.
-            self.as_mut().set_selected_id(0);
-            self.as_mut().set_selected_title(QString::default());
-            self.as_mut().set_selected_notes(QString::default());
-            self.as_mut().set_selected_due_label(QString::default());
-            self.as_mut().set_selected_priority(Priority::NONE);
-            self.as_mut().set_selected_completed(false);
-            self.as_mut().set_selected_recurrence(QString::default());
+            clear_detail_pane(self.as_mut());
             return;
         };
 
@@ -377,6 +387,8 @@ impl qobject::TaskListViewModel {
             .set_selected_notes(QString::from(task.notes.as_deref().unwrap_or("")));
         self.as_mut()
             .set_selected_due_label(QString::from(&format_due_label(task.due_date)));
+        self.as_mut()
+            .set_selected_hide_until_label(QString::from(&format_due_label(task.hide_until)));
         self.as_mut().set_selected_priority(task.priority);
         self.as_mut().set_selected_completed(task.is_completed());
         // Humanise the RRULE (FREQ/INTERVAL/BYDAY/UNTIL/COUNT) and
@@ -389,6 +401,77 @@ impl qobject::TaskListViewModel {
         );
         self.as_mut()
             .set_selected_recurrence(QString::from(&humanized));
+    }
+
+    /// Apply edits from the task edit dialog and refresh the view.
+    ///
+    /// Parses the two date text fields via
+    /// `tasks_core::datetime::parse_due_input`; on error we leave
+    /// the DB untouched and surface the failure on the status line
+    /// so the user can correct the input without losing work.
+    pub fn update_selected_task(
+        mut self: Pin<&mut Self>,
+        title: QString,
+        notes: QString,
+        due_text: QString,
+        hide_until_text: QString,
+        priority: i32,
+    ) {
+        let id = self.selected_id;
+        if id <= 0 {
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't save edits."));
+            return;
+        };
+
+        let title_str = title.to_string();
+        let notes_str = notes.to_string();
+        let due_ms = match parse_due_input(&due_text.to_string()) {
+            Ok(ms) => ms,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Due: {msg}")));
+                return;
+            }
+        };
+        let hide_ms = match parse_due_input(&hide_until_text.to_string()) {
+            Ok(ms) => ms,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Hide-until: {msg}")));
+                return;
+            }
+        };
+
+        let edit = tasks_core::TaskEdit {
+            title: &title_str,
+            notes: &notes_str,
+            due_ms,
+            hide_until_ms: hide_ms,
+            priority,
+        };
+        match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
+            Ok(true) => {
+                self.as_mut().reload_active_filter();
+                // Refresh the detail pane from the cache that
+                // `reload_active_filter` just rebuilt, so the user
+                // sees their edits reflected without having to
+                // re-click the row.
+                self.as_mut().select_task(id);
+            }
+            Ok(false) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Task {id} not found")));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't save task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
     }
 
     /// Re-query the DB using `self.active_filter_id` and publish the
@@ -705,72 +788,18 @@ fn current_local_offset_secs() -> i32 {
     QDateTime::current_date_time().offset_from_utc()
 }
 
-/// Format a millisecond-epoch due date as a compact local-time string.
-/// Falls back to an empty label when `due_ms` is 0 (no date set).
-///
-/// The Android client encodes "date-only" vs "date + time" tasks by
-/// seeding timed tasks with a non-zero seconds component, so
-/// `due_ms / 1000 % 60 > 0` picks out timed tasks the same way
-/// `Task.hasDueTime` does in Kotlin.
-fn format_due_label(due_ms: i64) -> String {
-    if due_ms <= 0 {
-        return String::new();
-    }
-    let secs = due_ms / 1000;
-    let days_from_epoch = secs.div_euclid(86_400);
-    let (y, m, d) = days_to_ymd(days_from_epoch);
-    let has_time = secs % 60 > 0;
-    if has_time {
-        let secs_of_day = secs - days_from_epoch * 86_400;
-        let h = secs_of_day / 3600;
-        let min = (secs_of_day % 3600) / 60;
-        format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}")
-    } else {
-        format!("{y:04}-{m:02}-{d:02}")
-    }
-}
-
-/// Convert Unix-epoch day count to `(year, month, day)` in the proleptic
-/// Gregorian calendar. Implements Howard Hinnant's `civil_from_days`
-/// algorithm with era-offset = 719468 days (from 0000-03-01 to 1970-01-01).
-/// Accurate from -1 000 000 to 1 000 000 AD; sufficient for any task due
-/// date the Android client writes.
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{days_to_ymd, format_due_label};
-
-    #[test]
-    fn days_to_ymd_round_trip_known_values() {
-        // 1970-01-01 is day 0.
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
-        // 2000-01-01 is day 10957.
-        assert_eq!(days_to_ymd(10957), (2000, 1, 1));
-        // 2020-02-29 (leap day) is day 18321.
-        assert_eq!(days_to_ymd(18321), (2020, 2, 29));
-    }
-
-    #[test]
-    fn format_due_label_date_only_vs_datetime() {
-        // Midnight UTC on 2020-02-29 → date-only (seconds == 0).
-        assert_eq!(format_due_label(1_582_934_400_000), "2020-02-29");
-        // 2020-02-29 12:34:01 UTC → timed: Android convention stores a
-        // non-zero seconds component to flag "has time" on write.
-        assert_eq!(format_due_label(1_582_979_641_000), "2020-02-29 12:34");
-        // No date → empty.
-        assert_eq!(format_due_label(0), "");
-    }
+/// Reset every `selected_*` Q_PROPERTY to its empty/default value.
+/// Shared between the "unknown id" branch of `select_task` and the
+/// post-delete cleanup so a future new field only has to be added
+/// in one place.
+fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    vm.as_mut().set_selected_id(0);
+    vm.as_mut().set_selected_title(QString::default());
+    vm.as_mut().set_selected_notes(QString::default());
+    vm.as_mut().set_selected_due_label(QString::default());
+    vm.as_mut()
+        .set_selected_hide_until_label(QString::default());
+    vm.as_mut().set_selected_priority(Priority::NONE);
+    vm.as_mut().set_selected_completed(false);
+    vm.as_mut().set_selected_recurrence(QString::default());
 }

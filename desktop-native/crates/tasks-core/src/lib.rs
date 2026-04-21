@@ -5,6 +5,7 @@
 //! queries. No sync, no writes — see `desktop-native/README.md` for the
 //! broader roadmap.
 
+pub mod datetime;
 pub mod db;
 pub mod error;
 pub mod import;
@@ -19,6 +20,7 @@ pub use query::{
     QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
 };
 
+pub use datetime::{days_to_ymd, format_due_label, parse_due_input, ymd_to_days};
 pub use db::{default_db_path, Database};
 pub use error::{CoreError, Result};
 pub use import::{import_json_backup, ImportStats};
@@ -27,4 +29,4 @@ pub use models::{
     Filter, Geofence, Place, Priority, RepeatFrom, Tag, TagData, Task,
 };
 pub use recurrence::humanize_rrule;
-pub use write::{set_task_completion, set_task_deleted};
+pub use write::{set_task_completion, set_task_deleted, update_task_fields, TaskEdit};
