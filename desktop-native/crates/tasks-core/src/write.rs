@@ -59,10 +59,57 @@ pub fn set_task_completion(
     now_ms: i64,
 ) -> Result<bool> {
     let conn = open_rw(path)?;
-    let completed_at = if completed { now_ms } else { 0 };
+
+    // Uncomplete / unrecurring path: straight stamp.
+    if !completed {
+        let rows = conn.execute(
+            "UPDATE tasks SET completed = 0, modified = ?1 WHERE _id = ?2",
+            params![now_ms, task_id],
+        )?;
+        return Ok(rows > 0);
+    }
+
+    // Completing: if the task has an actionable recurrence,
+    // advance dueDate instead of stamping `completed`. Mirrors the
+    // Android client's repeat-on-complete behaviour (a daily task
+    // ticked once rolls to tomorrow; a weekly Mon/Wed/Fri task
+    // ticked on Wednesday rolls to Friday).
+    let recurrence_row: Option<(Option<String>, i64, i32)> = conn
+        .query_row(
+            "SELECT recurrence, dueDate, repeat_from FROM tasks WHERE _id = ?1",
+            params![task_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i32>(2)?,
+                ))
+            },
+        )
+        .ok();
+
+    if let Some((Some(rrule), due_ms, repeat_from)) = recurrence_row {
+        if !rrule.is_empty() && due_ms > 0 {
+            if let Some(next_due) = crate::recurrence::advance_recurrence(
+                &rrule,
+                due_ms,
+                now_ms,
+                repeat_from == 1, // RepeatFrom::COMPLETION_DATE
+            ) {
+                let rows = conn.execute(
+                    "UPDATE tasks SET dueDate = ?1, modified = ?2, completed = 0 \
+                     WHERE _id = ?3",
+                    params![next_due, now_ms, task_id],
+                )?;
+                return Ok(rows > 0);
+            }
+        }
+    }
+
+    // Fallback: stamp completed timestamp.
     let rows = conn.execute(
         "UPDATE tasks SET completed = ?1, modified = ?2 WHERE _id = ?3",
-        params![completed_at, now_ms, task_id],
+        params![now_ms, now_ms, task_id],
     )?;
     Ok(rows > 0)
 }

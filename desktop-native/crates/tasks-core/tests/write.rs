@@ -160,6 +160,78 @@ fn complete_then_uncomplete_updates_only_target_row() {
 }
 
 #[test]
+fn completing_recurring_task_advances_due_date() {
+    // A daily-recurring task ticked once should not stamp
+    // `completed`; it should slide dueDate forward and leave the
+    // task active.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let due = 1_705_276_800_000_i64; // 2024-01-15 UTC midnight
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
+             modified, completed, deleted, estimatedSeconds, elapsedSeconds, \
+             timerStart, notificationFlags, lastNotified, repeat_from, \
+             collapsed, parent, read_only, recurrence) \
+             VALUES ('Water plants', 3, ?1, 0, ?2, ?2, 0, 0, 0, 0, 0, 0, 0, \
+                     0, 0, 0, 0, 'FREQ=DAILY')",
+            params![due, NOW - 1000],
+        )
+        .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let id: i64 = conn
+        .query_row("SELECT MAX(_id) FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+
+    assert!(set_task_completion(&db_path, id, true, NOW).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let (due_read, completed_read): (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT dueDate, completed FROM tasks WHERE _id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        due_read,
+        due + 86_400_000,
+        "daily task's due should slide forward by one day"
+    );
+    assert_eq!(
+        completed_read, 0,
+        "recurring task must stay active, not stamp completed"
+    );
+}
+
+#[test]
+fn completing_non_recurring_task_stamps_completed() {
+    // Regression coverage for the non-recurring path after the
+    // advance-on-complete branch was added — make sure the classic
+    // behaviour still holds for plain tasks.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+    assert!(set_task_completion(&db_path, a, true, NOW).unwrap());
+    let completed: i64 = Database::open_read_only(&db_path)
+        .unwrap()
+        .connection()
+        .query_row(
+            "SELECT completed FROM tasks WHERE _id = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(completed, NOW);
+}
+
+#[test]
 fn delete_marks_only_target_row() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("tasks.db");
