@@ -95,6 +95,16 @@ pub struct TaskEdit<'a> {
     pub hide_until_ms: i64,
     /// Raw `Priority` value: HIGH=0 … NONE=3.
     pub priority: i32,
+    /// New CalDAV calendar UUID to assign, or `None` to leave the
+    /// current assignment alone. Applied by updating
+    /// `caldav_tasks.cd_calendar` for the row that already points at
+    /// this task; if the task has no caldav_tasks row (local-only
+    /// task), this field is a no-op. Reassigning to a *different*
+    /// calendar UUID on an existing row is supported; detaching
+    /// entirely (moving a CalDAV task back to local) is not in M2
+    /// Phase C1 — that's an explicit "delete from calendar" flow in
+    /// the Android app and will land alongside CalDAV sync.
+    pub caldav_calendar_uuid: Option<&'a str>,
 }
 
 /// Edit the core user-visible fields of a task in a single UPDATE.
@@ -114,7 +124,13 @@ pub fn update_task_fields(
     edit: &TaskEdit<'_>,
     now_ms: i64,
 ) -> Result<bool> {
-    let conn = open_rw(path)?;
+    let mut conn = open_rw(path)?;
+    // Wrap both the tasks UPDATE and the optional caldav_tasks
+    // UPDATE in one transaction so a mid-write interrupt leaves
+    // the pair consistent. For a one-row edit the overhead is
+    // negligible and the safety margin is worth it.
+    let tx = conn.transaction()?;
+
     // Empty notes / title should store as NULL (matching Android's
     // `Task.notes: String?`): otherwise a cleared field persists as
     // the empty string and a sync round-trip can flip-flop between
@@ -129,7 +145,7 @@ pub fn update_task_fields(
     } else {
         Some(edit.title)
     };
-    let rows = conn.execute(
+    let rows = tx.execute(
         "UPDATE tasks SET \
              title = ?1, \
              notes = ?2, \
@@ -148,5 +164,30 @@ pub fn update_task_fields(
             task_id,
         ],
     )?;
-    Ok(rows > 0)
+    if rows == 0 {
+        // Task not found — rolling back leaves the caldav_tasks row
+        // alone too, avoiding a stray reassignment.
+        tx.rollback()?;
+        return Ok(false);
+    }
+
+    if let Some(uuid) = edit.caldav_calendar_uuid {
+        // Only touch caldav_tasks when the caller passes a non-empty
+        // UUID; an empty string from the UI means "no calendar",
+        // which in M2 Phase C1 semantics is "don't change anything".
+        if !uuid.is_empty() {
+            // UPDATE the existing row if one exists. Tasks that have
+            // never been synced (local-only) have no caldav_tasks
+            // row; the zero-affected-rows case below is a no-op,
+            // matching the "this field is a no-op for local tasks"
+            // contract in the TaskEdit docs.
+            tx.execute(
+                "UPDATE caldav_tasks SET cd_calendar = ?1 WHERE cd_task = ?2",
+                params![uuid, task_id],
+            )?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(true)
 }

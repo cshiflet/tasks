@@ -12,6 +12,21 @@ use tasks_core::write::{set_task_completion, set_task_deleted, update_task_field
 
 const NOW: i64 = 1_700_000_000_000;
 
+/// Minimal TaskEdit for tests that only care about the scalar task
+/// columns. Individual tests override the fields they're asserting
+/// on. Keeps each test's literal small as the struct grows across
+/// M2 Phase C commits.
+fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
+    TaskEdit {
+        title,
+        notes,
+        due_ms: 0,
+        hide_until_ms: 0,
+        priority: 3,
+        caldav_calendar_uuid: None,
+    }
+}
+
 fn seed_two_tasks(db_path: &std::path::Path) -> (i64, i64) {
     // The importer does full row INSERTs; here we shortcut with the
     // minimum column set the completion/delete helpers care about.
@@ -126,14 +141,7 @@ fn unknown_id_returns_false_without_error() {
 
     assert!(!set_task_completion(&db_path, 9_999_999, true, NOW).unwrap());
     assert!(!set_task_deleted(&db_path, 9_999_999, NOW).unwrap());
-    let edit = TaskEdit {
-        title: "x",
-        notes: "y",
-        due_ms: 0,
-        hide_until_ms: 0,
-        priority: 3,
-    };
-    assert!(!update_task_fields(&db_path, 9_999_999, &edit, NOW).unwrap());
+    assert!(!update_task_fields(&db_path, 9_999_999, &edit_default("x", "y"), NOW).unwrap());
 }
 
 #[test]
@@ -151,6 +159,7 @@ fn update_task_fields_writes_every_column() {
         due_ms: due,
         hide_until_ms: hide,
         priority: 1, // MEDIUM
+        caldav_calendar_uuid: None,
     };
     let updated = update_task_fields(&db_path, a, &edit, NOW).unwrap();
     assert!(updated);
@@ -211,33 +220,9 @@ fn update_task_fields_clears_notes_to_null_when_empty() {
     let (a, _) = seed_two_tasks(&db_path);
 
     // Seed with non-empty notes so the clear is observable.
-    update_task_fields(
-        &db_path,
-        a,
-        &TaskEdit {
-            title: "A",
-            notes: "some notes",
-            due_ms: 0,
-            hide_until_ms: 0,
-            priority: 3,
-        },
-        NOW,
-    )
-    .unwrap();
+    update_task_fields(&db_path, a, &edit_default("A", "some notes"), NOW).unwrap();
     // Now clear.
-    update_task_fields(
-        &db_path,
-        a,
-        &TaskEdit {
-            title: "A",
-            notes: "",
-            due_ms: 0,
-            hide_until_ms: 0,
-            priority: 3,
-        },
-        NOW + 1,
-    )
-    .unwrap();
+    update_task_fields(&db_path, a, &edit_default("A", ""), NOW + 1).unwrap();
 
     let db = Database::open_read_only(&db_path).unwrap();
     let notes_is_null: bool = db
@@ -249,4 +234,102 @@ fn update_task_fields_clears_notes_to_null_when_empty() {
         )
         .unwrap();
     assert!(notes_is_null, "empty notes must round-trip as NULL");
+}
+
+#[test]
+fn update_task_fields_reassigns_caldav_calendar() {
+    // Seed a task plus a caldav_tasks row pointing at calendar "one".
+    // An update carrying caldav_calendar_uuid = "two" should
+    // reassign. A task without a caldav_tasks row should be a no-op
+    // (local task stays local).
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (caldav_task, local_task) = seed_two_tasks(&db_path);
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'one', 'uid-1', 0, 0, 0, 0)",
+            params![caldav_task],
+        )
+        .unwrap();
+    }
+
+    let edit = TaskEdit {
+        title: "A",
+        notes: "",
+        due_ms: 0,
+        hide_until_ms: 0,
+        priority: 3,
+        caldav_calendar_uuid: Some("two"),
+    };
+    assert!(update_task_fields(&db_path, caldav_task, &edit, NOW).unwrap());
+    assert!(update_task_fields(&db_path, local_task, &edit, NOW).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let calendar: String = db
+        .connection()
+        .query_row(
+            "SELECT cd_calendar FROM caldav_tasks WHERE cd_task = ?1",
+            params![caldav_task],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(calendar, "two", "caldav-backed task should move");
+
+    let local_rows: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM caldav_tasks WHERE cd_task = ?1",
+            params![local_task],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(local_rows, 0, "local task must not sprout a caldav row");
+}
+
+#[test]
+fn update_task_fields_empty_caldav_uuid_is_noop() {
+    // UI passes empty string to mean "no change"; we must not
+    // accidentally clear the existing cd_calendar.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'original', 'uid-a', 0, 0, 0, 0)",
+            params![a],
+        )
+        .unwrap();
+    }
+
+    let edit = TaskEdit {
+        title: "A",
+        notes: "",
+        due_ms: 0,
+        hide_until_ms: 0,
+        priority: 3,
+        caldav_calendar_uuid: Some(""),
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let calendar: String = db
+        .connection()
+        .query_row(
+            "SELECT cd_calendar FROM caldav_tasks WHERE cd_task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(calendar, "original", "empty uuid must not overwrite");
 }

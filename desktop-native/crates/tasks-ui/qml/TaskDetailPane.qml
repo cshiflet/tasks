@@ -100,6 +100,8 @@ Pane {
                     editDialog.initialPriority = root.vm.selectedPriority;
                     editDialog.initialRecurrenceSummary =
                         root.vm.selectedRecurrence;
+                    editDialog.initialCaldavUuid =
+                        root.vm.selectedCaldavCalendarUuid;
                     editDialog.loadFromSelection();
                     editDialog.open();
                 }

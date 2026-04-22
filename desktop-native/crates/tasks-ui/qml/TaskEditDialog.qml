@@ -40,6 +40,7 @@ Dialog {
     property string initialHideUntilText: ""
     property int initialPriority: 3 // Priority.NONE
     property string initialRecurrenceSummary: ""
+    property string initialCaldavUuid: ""
 
     // Called by TaskDetailPane right before `open()`. Resets the
     // form controls to the incoming values and clears any stale
@@ -51,6 +52,16 @@ Dialog {
         hideField.text = initialHideUntilText;
         // Priority maps 0=HIGH … 3=NONE, matching ComboBox's index.
         priorityBox.currentIndex = initialPriority;
+        // List picker: find the current UUID's index in the parallel
+        // arrays. -1 (not found) becomes 0; if the task has no
+        // caldav row we fall back to "(no CalDAV list)" at index 0.
+        if (vm) {
+            const idx = vm.caldavCalendarUuids.indexOf(initialCaldavUuid);
+            // +1 for the "(no CalDAV list)" prepended at index 0.
+            calendarBox.currentIndex = idx >= 0 ? idx + 1 : 0;
+        } else {
+            calendarBox.currentIndex = 0;
+        }
         validation.text = "";
     }
 
@@ -124,6 +135,30 @@ Dialog {
             }
 
             Label {
+                text: qsTr("List")
+                opacity: 0.7
+            }
+            ComboBox {
+                id: calendarBox
+                Layout.fillWidth: true
+                // Index 0 is the synthetic "(no CalDAV list)" entry
+                // (represents both "local task" and "don't change").
+                // Indices 1..N map to vm.caldavCalendarUuids[i-1].
+                model: {
+                    const labels = dialog.vm ? dialog.vm.caldavCalendarLabels : [];
+                    const out = [qsTr("(no CalDAV list)")];
+                    for (let i = 0; i < labels.length; i++) {
+                        out.push(labels[i]);
+                    }
+                    return out;
+                }
+                // If the DB has no CalDAV calendars, the picker is
+                // still functional (single "(no list)" entry) but
+                // offers no real choice — hide it to reduce clutter.
+                enabled: dialog.vm && dialog.vm.caldavCalendarLabels.length > 0
+            }
+
+            Label {
                 text: qsTr("Repeats")
                 opacity: 0.7
             }
@@ -158,12 +193,21 @@ Dialog {
         // status line surfaces the error. (Inline validation would
         // require duplicating the parser in QML, which is not worth
         // the rot risk for a one-shot dialog.)
+        // Map the ComboBox selection back to a UUID. Index 0 is the
+        // "(no CalDAV list)" synthetic entry — passing an empty
+        // string tells the bridge not to touch caldav_tasks, which
+        // matches "local task, leave it that way" semantics.
+        let uuid = "";
+        if (calendarBox.currentIndex > 0) {
+            uuid = vm.caldavCalendarUuids[calendarBox.currentIndex - 1];
+        }
         vm.updateSelectedTask(
             titleField.text,
             notesField.text,
             dueField.text.trim(),
             hideField.text.trim(),
-            priorityBox.currentIndex
+            priorityBox.currentIndex,
+            uuid
         );
     }
 }

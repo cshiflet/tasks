@@ -67,6 +67,15 @@ pub mod qobject {
         // the from-completion suffix pre-applied, so the detail
         // pane can render it verbatim.
         #[qproperty(QString, selected_recurrence)]
+        // CalDAV calendars available in the database, for the edit
+        // dialog's "list" picker. Built from the same query the
+        // sidebar uses; both lists stay in sync because they're
+        // populated in `open_at_path`.
+        #[qproperty(QStringList, caldav_calendar_labels)]
+        #[qproperty(QStringList, caldav_calendar_uuids)]
+        // UUID of the selected task's current CalDAV list, or empty
+        // when the task has no caldav_tasks row (local-only).
+        #[qproperty(QString, selected_caldav_calendar_uuid)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -106,8 +115,11 @@ pub mod qobject {
         /// Apply the edit-dialog's form state to the currently-
         /// selected task. `due_text` / `hide_until_text` are parsed
         /// via `tasks_core::datetime::parse_due_input`; an empty
-        /// string means "no date". A parse failure surfaces on the
-        /// status line and leaves the DB untouched.
+        /// string means "no date". `caldav_uuid` reassigns the
+        /// task's CalDAV calendar when non-empty (no-op for local
+        /// tasks that don't have a caldav_tasks row). A parse
+        /// failure surfaces on the status line and leaves the DB
+        /// untouched.
         #[qinvokable]
         fn update_selected_task(
             self: Pin<&mut TaskListViewModel>,
@@ -116,6 +128,7 @@ pub mod qobject {
             due_text: QString,
             hide_until_text: QString,
             priority: i32,
+            caldav_uuid: QString,
         );
     }
 
@@ -162,6 +175,9 @@ pub struct TaskListViewModelRust {
     selected_priority: i32,
     selected_completed: bool,
     selected_recurrence: QString,
+    caldav_calendar_labels: QStringList,
+    caldav_calendar_uuids: QStringList,
+    selected_caldav_calendar_uuid: QString,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -202,6 +218,9 @@ impl Default for TaskListViewModelRust {
             selected_priority: Priority::NONE,
             selected_completed: false,
             selected_recurrence: QString::default(),
+            caldav_calendar_labels: QStringList::default(),
+            caldav_calendar_uuids: QStringList::default(),
+            selected_caldav_calendar_uuid: QString::default(),
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -401,6 +420,14 @@ impl qobject::TaskListViewModel {
         );
         self.as_mut()
             .set_selected_recurrence(QString::from(&humanized));
+
+        // Current CalDAV list assignment (empty for local tasks).
+        let uuid = match &self.db {
+            Some(db) => current_caldav_uuid_for(db, task.id),
+            None => String::new(),
+        };
+        self.as_mut()
+            .set_selected_caldav_calendar_uuid(QString::from(&uuid));
     }
 
     /// Apply edits from the task edit dialog and refresh the view.
@@ -416,6 +443,7 @@ impl qobject::TaskListViewModel {
         due_text: QString,
         hide_until_text: QString,
         priority: i32,
+        caldav_uuid: QString,
     ) {
         let id = self.selected_id;
         if id <= 0 {
@@ -429,6 +457,7 @@ impl qobject::TaskListViewModel {
 
         let title_str = title.to_string();
         let notes_str = notes.to_string();
+        let caldav_str = caldav_uuid.to_string();
         let due_ms = match parse_due_input(&due_text.to_string()) {
             Ok(ms) => ms,
             Err(msg) => {
@@ -452,6 +481,15 @@ impl qobject::TaskListViewModel {
             due_ms,
             hide_until_ms: hide_ms,
             priority,
+            // Empty string = "don't touch caldav_tasks" (QML passes
+            // the ComboBox's current UUID, which equals the task's
+            // existing assignment when unchanged — the helper's
+            // UPDATE is idempotent in that case).
+            caldav_calendar_uuid: if caldav_str.is_empty() {
+                None
+            } else {
+                Some(caldav_str.as_str())
+            },
         };
         match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
             Ok(true) => {
@@ -620,6 +658,17 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
             vm.as_mut()
                 .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
+            // Edit dialog's CalDAV list picker uses the calendars
+            // directly (no built-in filters prepended, no
+            // "caldav:" prefix on the UUID).
+            let (cal_labels, cal_uuids) = list_caldav_calendars(&db);
+            vm.as_mut()
+                .set_caldav_calendar_labels(string_list_from_iter(
+                    cal_labels.iter().map(String::as_str),
+                ));
+            vm.as_mut().set_caldav_calendar_uuids(string_list_from_iter(
+                cal_uuids.iter().map(String::as_str),
+            ));
             vm.as_mut().set_status(QString::from(&format!(
                 "Opened {path_display} ({} sidebar entries)",
                 labels.len()
@@ -645,6 +694,44 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             inner.db = None;
         }
     }
+}
+
+/// Return parallel `(labels, uuids)` for every CalDAV calendar. Used
+/// by the edit dialog's list picker; `build_sidebar` has a richer
+/// shape because its output also includes the built-in filter IDs.
+fn list_caldav_calendars(db: &Database) -> (Vec<String>, Vec<String>) {
+    let mut labels = Vec::new();
+    let mut uuids = Vec::new();
+    let Ok(mut stmt) = db
+        .connection()
+        .prepare("SELECT * FROM caldav_lists ORDER BY cdl_order, cdl_name")
+    else {
+        return (labels, uuids);
+    };
+    let Ok(rows) = stmt.query_map([], CaldavCalendar::from_row) else {
+        return (labels, uuids);
+    };
+    for row in rows.flatten() {
+        if let (Some(name), Some(uuid)) = (row.name, row.uuid) {
+            labels.push(name);
+            uuids.push(uuid);
+        }
+    }
+    (labels, uuids)
+}
+
+/// Look up the CalDAV calendar UUID assigned to `task_id`. Returns
+/// empty when the task has no `caldav_tasks` row (local-only).
+fn current_caldav_uuid_for(db: &Database, task_id: i64) -> String {
+    db.connection()
+        .query_row(
+            "SELECT cd_calendar FROM caldav_tasks WHERE cd_task = ?1 LIMIT 1",
+            [task_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
@@ -802,4 +889,6 @@ fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     vm.as_mut().set_selected_priority(Priority::NONE);
     vm.as_mut().set_selected_completed(false);
     vm.as_mut().set_selected_recurrence(QString::default());
+    vm.as_mut()
+        .set_selected_caldav_calendar_uuid(QString::default());
 }
