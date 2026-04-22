@@ -119,6 +119,15 @@ pub mod qobject {
         // these are the edit-dialog round-trip values.
         #[qproperty(QString, selected_recurrence_raw)]
         #[qproperty(i32, selected_repeat_from)]
+        // Live values of the query preferences. Seeded from the
+        // view model's `preferences` field; the preferences
+        // dialog reads these to pre-fill its controls and calls
+        // `updatePreferences` on save.
+        #[qproperty(i32, pref_sort_mode)]
+        #[qproperty(bool, pref_sort_ascending)]
+        #[qproperty(bool, pref_show_completed)]
+        #[qproperty(bool, pref_show_hidden)]
+        #[qproperty(bool, pref_completed_at_bottom)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -154,6 +163,19 @@ pub mod qobject {
         /// assigned to that list automatically.
         #[qinvokable]
         fn add_new_task(self: Pin<&mut TaskListViewModel>, title: QString);
+
+        /// Apply new query preferences and reload the active
+        /// filter. Session-local only for now; QSettings
+        /// persistence is a follow-up.
+        #[qinvokable]
+        fn update_preferences(
+            self: Pin<&mut TaskListViewModel>,
+            sort_mode: i32,
+            sort_ascending: bool,
+            show_completed: bool,
+            show_hidden: bool,
+            completed_at_bottom: bool,
+        );
 
         #[qinvokable]
         fn toggle_task_completion(self: Pin<&mut TaskListViewModel>, id: i64, completed: bool);
@@ -258,6 +280,11 @@ pub struct TaskListViewModelRust {
     selected_elapsed_text: QString,
     selected_recurrence_raw: QString,
     selected_repeat_from: i32,
+    pref_sort_mode: i32,
+    pref_sort_ascending: bool,
+    pref_show_completed: bool,
+    pref_show_hidden: bool,
+    pref_completed_at_bottom: bool,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -319,6 +346,17 @@ impl Default for TaskListViewModelRust {
             selected_elapsed_text: QString::default(),
             selected_recurrence_raw: QString::default(),
             selected_repeat_from: 0,
+            // Seed from Android defaults — sort_auto, ascending,
+            // completed+hidden hidden. The Default impl of
+            // QueryPreferences carries the same values; we keep
+            // them in sync here so the Q_PROPERTYs read correctly
+            // on first open before the preferences dialog is ever
+            // invoked.
+            pref_sort_mode: 0, // SORT_AUTO
+            pref_sort_ascending: true,
+            pref_show_completed: false,
+            pref_show_hidden: false,
+            pref_completed_at_bottom: false,
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -422,6 +460,32 @@ impl qobject::TaskListViewModel {
 
     pub fn select_filter(mut self: Pin<&mut Self>, id: QString) {
         self.as_mut().set_active_filter_id(id);
+        self.as_mut().reload_active_filter();
+    }
+
+    /// Apply new query preferences and reload. Session-local.
+    pub fn update_preferences(
+        mut self: Pin<&mut Self>,
+        sort_mode: i32,
+        sort_ascending: bool,
+        show_completed: bool,
+        show_hidden: bool,
+        completed_at_bottom: bool,
+    ) {
+        {
+            let mut inner = self.as_mut().rust_mut();
+            inner.preferences.sort_mode = sort_mode;
+            inner.preferences.sort_ascending = sort_ascending;
+            inner.preferences.show_completed = show_completed;
+            inner.preferences.show_hidden = show_hidden;
+            inner.preferences.completed_tasks_at_bottom = completed_at_bottom;
+        }
+        self.as_mut().set_pref_sort_mode(sort_mode);
+        self.as_mut().set_pref_sort_ascending(sort_ascending);
+        self.as_mut().set_pref_show_completed(show_completed);
+        self.as_mut().set_pref_show_hidden(show_hidden);
+        self.as_mut()
+            .set_pref_completed_at_bottom(completed_at_bottom);
         self.as_mut().reload_active_filter();
     }
 

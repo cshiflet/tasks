@@ -23,6 +23,7 @@ fn main() {
                 "qml/TaskListPane.qml",
                 "qml/TaskDetailPane.qml",
                 "qml/TaskEditDialog.qml",
+                "qml/PreferencesDialog.qml",
                 "qml/PriorityDot.qml",
             ],
             ..Default::default()

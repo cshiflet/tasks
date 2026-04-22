@@ -128,10 +128,25 @@ ApplicationWindow {
                 onClicked: importDialog.open()
             }
             Button {
+                text: qsTr("Preferences…")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Adjust sort and visibility")
+                onClicked: {
+                    prefsDialog.loadFromVm();
+                    prefsDialog.open();
+                }
+            }
+            Button {
                 text: qsTr("Reset to default")
                 onClicked: viewModel.openDefaultDatabase()
             }
         }
+    }
+
+    PreferencesDialog {
+        id: prefsDialog
+        anchors.centerIn: parent
+        vm: viewModel
     }
 
     footer: ToolBar {
