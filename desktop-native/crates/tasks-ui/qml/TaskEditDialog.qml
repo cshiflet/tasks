@@ -57,6 +57,8 @@ Dialog {
     property bool initialPlaceArrival: false
     property bool initialPlaceDeparture: false
     property var initialParentId: 0
+    property string initialEstimatedText: ""
+    property string initialElapsedText: ""
 
     // Called by TaskDetailPane right before `open()`. Resets the
     // form controls to the incoming values and clears any stale
@@ -124,6 +126,9 @@ Dialog {
         } else {
             parentBox.currentIndex = 0;
         }
+
+        estimateField.text = initialEstimatedText;
+        elapsedField.text = initialElapsedText;
 
         validation.text = "";
     }
@@ -230,6 +235,26 @@ Dialog {
                 // Index → tasks_core::models::Priority integer:
                 //   0 = HIGH, 1 = MEDIUM, 2 = LOW, 3 = NONE
                 model: [qsTr("High"), qsTr("Medium"), qsTr("Low"), qsTr("None")]
+            }
+
+            Label {
+                text: qsTr("Estimate")
+                opacity: 0.7
+            }
+            TextField {
+                id: estimateField
+                Layout.fillWidth: true
+                placeholderText: qsTr("H:MM (e.g. 0:30, 1:15)")
+            }
+
+            Label {
+                text: qsTr("Elapsed")
+                opacity: 0.7
+            }
+            TextField {
+                id: elapsedField
+                Layout.fillWidth: true
+                placeholderText: qsTr("H:MM")
             }
 
             Label {
@@ -482,7 +507,9 @@ Dialog {
             placeUid,
             arrivalBox.checked,
             departureBox.checked,
-            parentId
+            parentId,
+            estimateField.text.trim(),
+            elapsedField.text.trim()
         );
     }
 }

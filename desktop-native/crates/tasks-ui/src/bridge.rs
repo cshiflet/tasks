@@ -109,6 +109,10 @@ pub mod qobject {
         #[qproperty(QList_i64, parent_candidate_ids)]
         // Current parent task id for the selected row (0 = top-level).
         #[qproperty(i64, selected_parent_id)]
+        // Timer fields rendered as H:MM strings for the edit
+        // dialog. Empty string means zero.
+        #[qproperty(QString, selected_estimated_text)]
+        #[qproperty(QString, selected_elapsed_text)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -169,6 +173,8 @@ pub mod qobject {
             place_arrival: bool,
             place_departure: bool,
             parent_id: i64,
+            estimate_text: QString,
+            elapsed_text: QString,
         );
     }
 
@@ -188,7 +194,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
 
-use tasks_core::datetime::{describe_alarm, format_due_label, parse_due_input};
+use tasks_core::datetime::{
+    describe_alarm, format_due_label, format_duration_hhmm, parse_due_input, parse_duration_input,
+};
 use tasks_core::db::{default_db_path, Database};
 use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, RepeatFrom, Task};
 use tasks_core::query::{
@@ -232,6 +240,8 @@ pub struct TaskListViewModelRust {
     parent_candidate_labels: QStringList,
     parent_candidate_ids: QList<i64>,
     selected_parent_id: i64,
+    selected_estimated_text: QString,
+    selected_elapsed_text: QString,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -289,6 +299,8 @@ impl Default for TaskListViewModelRust {
             parent_candidate_labels: QStringList::default(),
             parent_candidate_ids: QList::default(),
             selected_parent_id: 0,
+            selected_estimated_text: QString::default(),
+            selected_elapsed_text: QString::default(),
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -551,6 +563,14 @@ impl qobject::TaskListViewModel {
         }
         self.as_mut().set_parent_candidate_ids(ql_parent_ids);
         self.as_mut().set_selected_parent_id(task.parent);
+
+        // Timer columns → H:MM text for the edit dialog.
+        self.as_mut()
+            .set_selected_estimated_text(QString::from(&format_duration_hhmm(
+                task.estimated_seconds,
+            )));
+        self.as_mut()
+            .set_selected_elapsed_text(QString::from(&format_duration_hhmm(task.elapsed_seconds)));
     }
 
     /// Apply edits from the task edit dialog and refresh the view.
@@ -574,6 +594,8 @@ impl qobject::TaskListViewModel {
         place_arrival: bool,
         place_departure: bool,
         parent_id: i64,
+        estimate_text: QString,
+        elapsed_text: QString,
     ) {
         let id = self.selected_id;
         if id <= 0 {
@@ -606,6 +628,23 @@ impl qobject::TaskListViewModel {
             .map(|(t, ty)| (*t, *ty))
             .collect();
         let place_uid_str = place_uid.to_string();
+
+        let estimated = match parse_duration_input(&estimate_text.to_string()) {
+            Ok(s) => s,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Estimate: {msg}")));
+                return;
+            }
+        };
+        let elapsed = match parse_duration_input(&elapsed_text.to_string()) {
+            Ok(s) => s,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Elapsed: {msg}")));
+                return;
+            }
+        };
         let due_ms = match parse_due_input(&due_text.to_string()) {
             Ok(ms) => ms,
             Err(msg) => {
@@ -646,6 +685,8 @@ impl qobject::TaskListViewModel {
                 departure: place_departure,
             }),
             parent_id: Some(parent_id),
+            estimated_seconds: estimated,
+            elapsed_seconds: elapsed,
         };
         match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
             Ok(true) => {
@@ -1205,4 +1246,6 @@ fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
         .set_parent_candidate_labels(QStringList::default());
     vm.as_mut().set_parent_candidate_ids(QList::default());
     vm.as_mut().set_selected_parent_id(0);
+    vm.as_mut().set_selected_estimated_text(QString::default());
+    vm.as_mut().set_selected_elapsed_text(QString::default());
 }

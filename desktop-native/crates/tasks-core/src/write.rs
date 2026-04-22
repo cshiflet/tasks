@@ -133,6 +133,13 @@ pub struct TaskEdit<'a> {
     /// picker. A cycle won't corrupt the DB, but the recursive
     /// tasklist query will render it oddly.
     pub parent_id: Option<i64>,
+    /// Seconds of estimated work. `0` clears the estimate.
+    /// Always written (no `Option`) because the edit dialog always
+    /// has a value to persist.
+    pub estimated_seconds: i32,
+    /// Seconds of elapsed work. `0` clears the counter. Same
+    /// always-written shape as `estimated_seconds`.
+    pub elapsed_seconds: i32,
 }
 
 /// Bundle carrying the three geofence-edit fields together so
@@ -260,14 +267,18 @@ pub fn update_task_fields(
              dueDate = ?3, \
              hideUntil = ?4, \
              importance = ?5, \
-             modified = ?6 \
-         WHERE _id = ?7",
+             estimatedSeconds = ?6, \
+             elapsedSeconds = ?7, \
+             modified = ?8 \
+         WHERE _id = ?9",
         params![
             title_arg,
             notes_arg,
             edit.due_ms,
             edit.hide_until_ms,
             edit.priority,
+            edit.estimated_seconds,
+            edit.elapsed_seconds,
             now_ms,
             task_id,
         ],

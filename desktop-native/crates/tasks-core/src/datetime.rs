@@ -108,6 +108,52 @@ fn parse_ymd(s: &str) -> Result<(i32, u32, u32), String> {
     Ok((y, m, d))
 }
 
+/// Format a duration in seconds as `H:MM` (hours:minutes). Zero
+/// renders as the empty string so the edit dialog's placeholder
+/// ("0:00") shows through instead of a literal "0:00" on unset
+/// timer fields.
+pub fn format_duration_hhmm(seconds: i32) -> String {
+    if seconds <= 0 {
+        return String::new();
+    }
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    format!("{h}:{m:02}")
+}
+
+/// Parse a user-typed duration as whole minutes.
+/// Accepted: `""` (→ 0), `"MM"`, `"H:MM"`. Returns an error string
+/// on any other shape.
+pub fn parse_duration_input(s: &str) -> Result<i32, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(0);
+    }
+    if let Some((h, m)) = s.split_once(':') {
+        let hours: i32 = h
+            .parse()
+            .map_err(|_| format!("hours not a number: \"{h}\""))?;
+        let minutes: i32 = m
+            .parse()
+            .map_err(|_| format!("minutes not a number: \"{m}\""))?;
+        if !(0..60).contains(&minutes) {
+            return Err(format!("minutes out of range: {minutes}"));
+        }
+        if hours < 0 {
+            return Err(format!("hours must be non-negative: {hours}"));
+        }
+        return Ok(hours * 3600 + minutes * 60);
+    }
+    // Plain number: interpret as minutes.
+    let mins: i32 = s
+        .parse()
+        .map_err(|_| format!("expected H:MM or minute count, got \"{s}\""))?;
+    if mins < 0 {
+        return Err(format!("minutes must be non-negative: {mins}"));
+    }
+    Ok(mins * 60)
+}
+
 /// Humanise an alarm row for the UI. `alarm_time` is the raw
 /// `alarms.time` value; what it means depends on `alarm_type`:
 ///
@@ -239,7 +285,29 @@ pub fn ymd_to_days(y: i32, m: u32, d: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{days_to_ymd, describe_alarm, format_due_label, parse_due_input, ymd_to_days};
+    use super::{
+        days_to_ymd, describe_alarm, format_due_label, format_duration_hhmm, parse_due_input,
+        parse_duration_input, ymd_to_days,
+    };
+
+    #[test]
+    fn duration_round_trips() {
+        assert_eq!(format_duration_hhmm(0), "");
+        assert_eq!(format_duration_hhmm(90 * 60), "1:30");
+        assert_eq!(format_duration_hhmm(45 * 60), "0:45");
+        assert_eq!(format_duration_hhmm(3600), "1:00");
+
+        assert_eq!(parse_duration_input(""), Ok(0));
+        assert_eq!(parse_duration_input("0:00"), Ok(0));
+        assert_eq!(parse_duration_input("0:45"), Ok(45 * 60));
+        assert_eq!(parse_duration_input("1:30"), Ok(90 * 60));
+        // Plain minute count.
+        assert_eq!(parse_duration_input("90"), Ok(90 * 60));
+        // Rejects malformed.
+        assert!(parse_duration_input("1:70").is_err());
+        assert!(parse_duration_input("-1:00").is_err());
+        assert!(parse_duration_input("abc").is_err());
+    }
 
     #[test]
     fn describe_alarm_humanises_common_types() {

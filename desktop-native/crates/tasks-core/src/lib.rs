@@ -20,7 +20,10 @@ pub use query::{
     QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
 };
 
-pub use datetime::{days_to_ymd, format_due_label, parse_due_input, ymd_to_days};
+pub use datetime::{
+    days_to_ymd, describe_alarm, format_due_label, format_duration_hhmm, parse_due_input,
+    parse_duration_input, ymd_to_days,
+};
 pub use db::{default_db_path, Database};
 pub use error::{CoreError, Result};
 pub use import::{import_json_backup, ImportStats};

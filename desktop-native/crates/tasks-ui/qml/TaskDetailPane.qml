@@ -110,6 +110,10 @@ Pane {
                         root.vm.selectedPlaceDeparture;
                     editDialog.initialParentId =
                         root.vm.selectedParentId;
+                    editDialog.initialEstimatedText =
+                        root.vm.selectedEstimatedText;
+                    editDialog.initialElapsedText =
+                        root.vm.selectedElapsedText;
                     editDialog.loadFromSelection();
                     editDialog.open();
                 }

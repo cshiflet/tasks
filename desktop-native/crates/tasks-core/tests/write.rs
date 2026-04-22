@@ -30,6 +30,8 @@ fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
         alarms: None,
         geofence: None,
         parent_id: None,
+        estimated_seconds: 0,
+        elapsed_seconds: 0,
     }
 }
 
@@ -170,6 +172,8 @@ fn update_task_fields_writes_every_column() {
         alarms: None,
         geofence: None,
         parent_id: None,
+        estimated_seconds: 0,
+        elapsed_seconds: 0,
     };
     let updated = update_task_fields(&db_path, a, &edit, NOW).unwrap();
     assert!(updated);
@@ -270,16 +274,8 @@ fn update_task_fields_reassigns_caldav_calendar() {
     }
 
     let edit = TaskEdit {
-        title: "A",
-        notes: "",
-        due_ms: 0,
-        hide_until_ms: 0,
-        priority: 3,
         caldav_calendar_uuid: Some("two"),
-        tag_uids: None,
-        alarms: None,
-        geofence: None,
-        parent_id: None,
+        ..edit_default("A", "")
     };
     assert!(update_task_fields(&db_path, caldav_task, &edit, NOW).unwrap());
     assert!(update_task_fields(&db_path, local_task, &edit, NOW).unwrap());
@@ -327,16 +323,8 @@ fn update_task_fields_empty_caldav_uuid_is_noop() {
     }
 
     let edit = TaskEdit {
-        title: "A",
-        notes: "",
-        due_ms: 0,
-        hide_until_ms: 0,
-        priority: 3,
         caldav_calendar_uuid: Some(""),
-        tag_uids: None,
-        alarms: None,
-        geofence: None,
-        parent_id: None,
+        ..edit_default("A", "")
     };
     assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
 
@@ -554,6 +542,32 @@ fn update_task_fields_reassigns_parent() {
         })
         .unwrap();
     assert_eq!(parent, 0, "self-parent must not persist");
+}
+
+#[test]
+fn update_task_fields_writes_timer_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+
+    let edit = TaskEdit {
+        estimated_seconds: 90 * 60, // 1:30
+        elapsed_seconds: 45 * 60,   // 0:45
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let (est, elapsed): (i32, i32) = db
+        .connection()
+        .query_row(
+            "SELECT estimatedSeconds, elapsedSeconds FROM tasks WHERE _id = ?1",
+            params![a],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(est, 90 * 60);
+    assert_eq!(elapsed, 45 * 60);
 }
 
 #[test]
