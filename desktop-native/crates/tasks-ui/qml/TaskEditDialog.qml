@@ -41,6 +41,11 @@ Dialog {
     property int initialPriority: 3 // Priority.NONE
     property string initialRecurrenceSummary: ""
     property string initialCaldavUuid: ""
+    // Tag UIDs attached to the selected task at dialog-open time.
+    // The tag CheckBoxes bind their checked state to membership in
+    // this array (pre-check); the array is mutated as the user
+    // toggles so the selection can be read back on save.
+    property var selectedTagUids: []
 
     // Called by TaskDetailPane right before `open()`. Resets the
     // form controls to the incoming values and clears any stale
@@ -62,7 +67,22 @@ Dialog {
         } else {
             calendarBox.currentIndex = 0;
         }
+        // Seed the mutable selection from the VM's current tag set.
+        // Copy (rather than alias) so toggling inside the dialog
+        // doesn't mutate the VM's QStringList.
+        selectedTagUids = vm ? Array.from(vm.selectedTagUids) : [];
         validation.text = "";
+    }
+
+    function toggleTag(uid, nowChecked) {
+        const i = selectedTagUids.indexOf(uid);
+        if (nowChecked && i < 0) {
+            selectedTagUids = selectedTagUids.concat([uid]);
+        } else if (!nowChecked && i >= 0) {
+            const next = selectedTagUids.slice();
+            next.splice(i, 1);
+            selectedTagUids = next;
+        }
     }
 
     ColumnLayout {
@@ -159,6 +179,38 @@ Dialog {
             }
 
             Label {
+                text: qsTr("Tags")
+                opacity: 0.7
+                Layout.alignment: Qt.AlignTop
+            }
+            // Scrollable flow of per-tag CheckBoxes. Each CheckBox's
+            // checked state mirrors membership in selectedTagUids;
+            // toggling mutates the array via toggleTag() so save
+            // reads the final set straight out.
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 90
+                clip: true
+
+                Flow {
+                    width: parent.width
+                    spacing: 8
+
+                    Repeater {
+                        model: dialog.vm ? dialog.vm.tagUids.length : 0
+                        CheckBox {
+                            required property int index
+                            text: dialog.vm ? dialog.vm.tagLabels[index] : ""
+                            checked: dialog.selectedTagUids.indexOf(
+                                dialog.vm.tagUids[index]) >= 0
+                            onToggled: dialog.toggleTag(
+                                dialog.vm.tagUids[index], checked)
+                        }
+                    }
+                }
+            }
+
+            Label {
                 text: qsTr("Repeats")
                 opacity: 0.7
             }
@@ -207,7 +259,8 @@ Dialog {
             dueField.text.trim(),
             hideField.text.trim(),
             priorityBox.currentIndex,
-            uuid
+            uuid,
+            selectedTagUids
         );
     }
 }

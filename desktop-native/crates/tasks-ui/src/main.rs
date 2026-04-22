@@ -4,6 +4,14 @@
 //! <path-to-tasks.db>` the binary instead dumps the Active filter to stdout
 //! — useful for smoke-testing the data layer without a display.
 
+// cxx-qt's bridge macro generates support code whose arity mirrors the
+// Q_INVOKABLE signatures we declare. `update_selected_task` is wide on
+// purpose (every editable task field is passed in one call so the UPDATE
+// stays atomic); bundling into a Rust struct would force a C++ shim to
+// cross the FFI boundary. Since cxx_qt::bridge rejects inner `#![allow]`s
+// inside the generated module, we opt out of the lint at the crate root.
+#![allow(clippy::too_many_arguments)]
+
 use std::env;
 use std::process::ExitCode;
 

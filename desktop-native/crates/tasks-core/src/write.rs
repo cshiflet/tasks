@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 
 use crate::error::Result;
 
@@ -105,6 +105,12 @@ pub struct TaskEdit<'a> {
     /// Phase C1 — that's an explicit "delete from calendar" flow in
     /// the Android app and will land alongside CalDAV sync.
     pub caldav_calendar_uuid: Option<&'a str>,
+    /// Replace the task's tag join rows (`tags` table) with exactly
+    /// this set of `tagdata.remoteId` values. `None` leaves tags
+    /// untouched; `Some(&[])` clears every tag. The write helper
+    /// DELETEs the existing rows then re-INSERTs with looked-up
+    /// tagdata names + the task's remoteId.
+    pub tag_uids: Option<&'a [String]>,
 }
 
 /// Edit the core user-visible fields of a task in a single UPDATE.
@@ -118,6 +124,41 @@ pub struct TaskEdit<'a> {
 ///
 /// Returns `Ok(true)` when a row was updated, `Ok(false)` when
 /// `task_id` matched nothing.
+/// Replace the tag-join rows (`tags` table) for `task_id` with the
+/// passed tagdata UIDs. DELETE all existing rows, INSERT one per UID
+/// carrying the looked-up `tagdata.name` and the task's `remoteId`.
+/// Missing tagdata rows (stale UID) are silently skipped at debug.
+fn replace_task_tags(tx: &Transaction<'_>, task_id: i64, tag_uids: &[String]) -> Result<()> {
+    let task_remote_id: Option<String> = tx
+        .query_row(
+            "SELECT remoteId FROM tasks WHERE _id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+
+    tx.execute("DELETE FROM tags WHERE task = ?1", params![task_id])?;
+
+    if tag_uids.is_empty() {
+        return Ok(());
+    }
+
+    let mut name_stmt = tx.prepare("SELECT name FROM tagdata WHERE remoteId = ?1 LIMIT 1")?;
+    let mut insert_stmt =
+        tx.prepare("INSERT INTO tags (task, name, tag_uid, task_uid) VALUES (?1, ?2, ?3, ?4)")?;
+    for uid in tag_uids {
+        let name: Option<String> = name_stmt
+            .query_row(params![uid], |r| r.get(0))
+            .unwrap_or(None);
+        let Some(name) = name else {
+            tracing::debug!("skipping tag uid {uid:?}: no tagdata row");
+            continue;
+        };
+        insert_stmt.execute(params![task_id, name, uid, task_remote_id])?;
+    }
+    Ok(())
+}
+
 pub fn update_task_fields(
     path: &Path,
     task_id: i64,
@@ -169,6 +210,10 @@ pub fn update_task_fields(
         // alone too, avoiding a stray reassignment.
         tx.rollback()?;
         return Ok(false);
+    }
+
+    if let Some(tag_uids) = edit.tag_uids {
+        replace_task_tags(&tx, task_id, tag_uids)?;
     }
 
     if let Some(uuid) = edit.caldav_calendar_uuid {

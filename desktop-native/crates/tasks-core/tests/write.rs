@@ -24,6 +24,7 @@ fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
         hide_until_ms: 0,
         priority: 3,
         caldav_calendar_uuid: None,
+        tag_uids: None,
     }
 }
 
@@ -160,6 +161,7 @@ fn update_task_fields_writes_every_column() {
         hide_until_ms: hide,
         priority: 1, // MEDIUM
         caldav_calendar_uuid: None,
+        tag_uids: None,
     };
     let updated = update_task_fields(&db_path, a, &edit, NOW).unwrap();
     assert!(updated);
@@ -266,6 +268,7 @@ fn update_task_fields_reassigns_caldav_calendar() {
         hide_until_ms: 0,
         priority: 3,
         caldav_calendar_uuid: Some("two"),
+        tag_uids: None,
     };
     assert!(update_task_fields(&db_path, caldav_task, &edit, NOW).unwrap());
     assert!(update_task_fields(&db_path, local_task, &edit, NOW).unwrap());
@@ -319,6 +322,7 @@ fn update_task_fields_empty_caldav_uuid_is_noop() {
         hide_until_ms: 0,
         priority: 3,
         caldav_calendar_uuid: Some(""),
+        tag_uids: None,
     };
     assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
 
@@ -332,4 +336,98 @@ fn update_task_fields_empty_caldav_uuid_is_noop() {
         )
         .unwrap();
     assert_eq!(calendar, "original", "empty uuid must not overwrite");
+}
+
+#[test]
+fn update_task_fields_replaces_tag_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+
+    // Seed tagdata for two tags + a stale tag row pointing at task a.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET remoteId = 'task-a-uid' WHERE _id = ?1",
+            params![a],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tagdata (remoteId, name, color, td_order) \
+             VALUES ('tag-one', 'Work', 0, 0), ('tag-two', 'Home', 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (task, name, tag_uid, task_uid) \
+             VALUES (?1, 'Stale', 'tag-stale', 'task-a-uid')",
+            params![a],
+        )
+        .unwrap();
+    }
+
+    // Set tags to exactly ['tag-one', 'tag-two']. Stale row should be
+    // gone, and the two new rows should carry the looked-up names.
+    let wanted = vec!["tag-one".to_string(), "tag-two".to_string()];
+    let edit = TaskEdit {
+        title: "A",
+        notes: "",
+        due_ms: 0,
+        hide_until_ms: 0,
+        priority: 3,
+        caldav_calendar_uuid: None,
+        tag_uids: Some(&wanted),
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT name, tag_uid, task_uid FROM tags WHERE task = ?1 ORDER BY tag_uid")
+        .unwrap();
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map(params![a], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "Work".to_string(),
+                "tag-one".to_string(),
+                "task-a-uid".to_string()
+            ),
+            (
+                "Home".to_string(),
+                "tag-two".to_string(),
+                "task-a-uid".to_string()
+            ),
+        ]
+    );
+
+    // Empty slice clears all tags.
+    let empty: Vec<String> = Vec::new();
+    let edit = TaskEdit {
+        tag_uids: Some(&empty),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW + 1).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
 }
