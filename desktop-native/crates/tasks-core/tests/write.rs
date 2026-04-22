@@ -32,6 +32,8 @@ fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
         parent_id: None,
         estimated_seconds: 0,
         elapsed_seconds: 0,
+        recurrence: "",
+        repeat_from: 0,
     }
 }
 
@@ -162,18 +164,10 @@ fn update_task_fields_writes_every_column() {
     let due = 1_700_000_000_000;
     let hide = 1_699_000_000_000;
     let edit = TaskEdit {
-        title: "New title",
-        notes: "New notes",
         due_ms: due,
         hide_until_ms: hide,
         priority: 1, // MEDIUM
-        caldav_calendar_uuid: None,
-        tag_uids: None,
-        alarms: None,
-        geofence: None,
-        parent_id: None,
-        estimated_seconds: 0,
-        elapsed_seconds: 0,
+        ..edit_default("New title", "New notes")
     };
     let updated = update_task_fields(&db_path, a, &edit, NOW).unwrap();
     assert!(updated);
@@ -568,6 +562,48 @@ fn update_task_fields_writes_timer_columns() {
         .unwrap();
     assert_eq!(est, 90 * 60);
     assert_eq!(elapsed, 45 * 60);
+}
+
+#[test]
+fn update_task_fields_writes_recurrence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+
+    // Set recurrence + repeat_from.
+    let edit = TaskEdit {
+        recurrence: "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE",
+        repeat_from: 1,
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let (rec, rf): (Option<String>, i32) = db
+        .connection()
+        .query_row(
+            "SELECT recurrence, repeat_from FROM tasks WHERE _id = ?1",
+            params![a],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rec, Some("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE".to_string()));
+    assert_eq!(rf, 1);
+    drop(db);
+
+    // Clear (empty string → NULL).
+    let edit = edit_default("A", "");
+    assert!(update_task_fields(&db_path, a, &edit, NOW + 1).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let rec_null: bool = db
+        .connection()
+        .query_row(
+            "SELECT recurrence IS NULL FROM tasks WHERE _id = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(rec_null, "empty recurrence should persist as NULL");
 }
 
 #[test]

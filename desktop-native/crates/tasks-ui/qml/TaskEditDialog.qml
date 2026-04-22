@@ -59,6 +59,12 @@ Dialog {
     property var initialParentId: 0
     property string initialEstimatedText: ""
     property string initialElapsedText: ""
+    // Raw RRULE string (not humanised) that the recurrence editor
+    // round-trips. Empty = no recurrence. The editor's controls
+    // are seeded from this in loadFromSelection() and the save
+    // path rebuilds an RRULE from them.
+    property string initialRecurrenceRaw: ""
+    property int initialRepeatFrom: 0
 
     // Called by TaskDetailPane right before `open()`. Resets the
     // form controls to the incoming values and clears any stale
@@ -130,7 +136,75 @@ Dialog {
         estimateField.text = initialEstimatedText;
         elapsedField.text = initialElapsedText;
 
+        loadRecurrenceFromRaw(initialRecurrenceRaw);
+        fromCompletionBox.currentIndex = initialRepeatFrom === 1 ? 1 : 0;
+
         validation.text = "";
+    }
+
+    // Parse the raw RRULE into the editor's controls. Mirrors the
+    // (simpler) subset that buildRecurrenceRule() writes back:
+    // FREQ, INTERVAL, BYDAY. UNTIL / COUNT / BYMONTHDAY etc. are
+    // parsed-but-dropped because the editor doesn't offer them;
+    // saving an untouched recurrence would silently strip them.
+    // That's documented in the dialog footer label.
+    function loadRecurrenceFromRaw(rule) {
+        freqBox.currentIndex = 0; // None
+        intervalField.text = "1";
+        for (let i = 0; i < 7; i++) {
+            byDayBoxes.itemAt(i).checked = false;
+        }
+        if (!rule || rule.length === 0) {
+            return;
+        }
+        const body = rule.startsWith("RRULE:") ? rule.slice(6) : rule;
+        const parts = body.split(";");
+        for (const part of parts) {
+            const eq = part.indexOf("=");
+            if (eq < 0) { continue; }
+            const key = part.slice(0, eq).trim();
+            const val = part.slice(eq + 1).trim();
+            if (key === "FREQ") {
+                const map = {
+                    "DAILY": 1, "WEEKLY": 2, "MONTHLY": 3, "YEARLY": 4
+                };
+                freqBox.currentIndex = map[val] ?? 0;
+            } else if (key === "INTERVAL") {
+                intervalField.text = val;
+            } else if (key === "BYDAY") {
+                const days = val.split(",");
+                const idx = { "MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6 };
+                for (const d of days) {
+                    // Strip leading sign/digit (positional prefix).
+                    const code = d.replace(/^[-+]?\d+/, "");
+                    if (idx[code] !== undefined) {
+                        byDayBoxes.itemAt(idx[code]).checked = true;
+                    }
+                }
+            }
+        }
+    }
+
+    function buildRecurrenceRule() {
+        const freqNames = ["", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
+        const freq = freqNames[freqBox.currentIndex] || "";
+        if (freq === "") { return ""; }
+        let rule = "FREQ=" + freq;
+        const interval = parseInt(intervalField.text, 10);
+        if (Number.isFinite(interval) && interval > 1) {
+            rule += ";INTERVAL=" + interval;
+        }
+        if (freq === "WEEKLY") {
+            const codes = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+            const picked = [];
+            for (let i = 0; i < 7; i++) {
+                if (byDayBoxes.itemAt(i).checked) { picked.push(codes[i]); }
+            }
+            if (picked.length > 0) {
+                rule += ";BYDAY=" + picked.join(",");
+            }
+        }
+        return rule;
     }
 
     function removeAlarmAt(index) {
@@ -430,14 +504,79 @@ Dialog {
             Label {
                 text: qsTr("Repeats")
                 opacity: 0.7
+                Layout.alignment: Qt.AlignTop
             }
-            Label {
+            ColumnLayout {
                 Layout.fillWidth: true
-                text: dialog.initialRecurrenceSummary.length > 0
-                      ? dialog.initialRecurrenceSummary
-                      : qsTr("(none — edit via Android for now)")
-                opacity: 0.55
-                elide: Text.ElideRight
+                spacing: 4
+
+                RowLayout {
+                    spacing: 8
+                    ComboBox {
+                        id: freqBox
+                        Layout.fillWidth: true
+                        model: [
+                            qsTr("Never"),
+                            qsTr("Daily"),
+                            qsTr("Weekly"),
+                            qsTr("Monthly"),
+                            qsTr("Yearly"),
+                        ]
+                    }
+                    Label {
+                        text: qsTr("every")
+                        opacity: 0.6
+                        visible: freqBox.currentIndex > 0
+                    }
+                    TextField {
+                        id: intervalField
+                        visible: freqBox.currentIndex > 0
+                        implicitWidth: 60
+                        text: "1"
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        horizontalAlignment: TextInput.AlignRight
+                    }
+                }
+
+                // Weekly-only weekday picker.
+                RowLayout {
+                    spacing: 4
+                    visible: freqBox.currentIndex === 2 // WEEKLY
+                    Repeater {
+                        id: byDayBoxes
+                        model: 7
+                        CheckBox {
+                            required property int index
+                            // Standard English weekday abbrev; the
+                            // RRULE always emits MO,TU,WE,... so the
+                            // mapping is stable even if the label is
+                            // translated.
+                            text: [qsTr("M"), qsTr("T"), qsTr("W"),
+                                   qsTr("T"), qsTr("F"), qsTr("S"),
+                                   qsTr("S")][index]
+                        }
+                    }
+                }
+
+                RowLayout {
+                    visible: freqBox.currentIndex > 0
+                    spacing: 8
+                    Label {
+                        text: qsTr("from")
+                        opacity: 0.6
+                    }
+                    ComboBox {
+                        id: fromCompletionBox
+                        model: [qsTr("Due date"), qsTr("Completion")]
+                    }
+                }
+
+                Label {
+                    visible: freqBox.currentIndex > 0
+                    text: qsTr("(COUNT/UNTIL rules from Android are dropped on save)")
+                    opacity: 0.5
+                    font.pointSize: Qt.application.font.pointSize - 1
+                }
             }
         }
 
@@ -494,6 +633,10 @@ Dialog {
         if (parentBox.currentIndex > 0 && vm) {
             parentId = vm.parentCandidateIds[parentBox.currentIndex - 1];
         }
+        const rule = buildRecurrenceRule();
+        // 0 = from due date, 1 = from completion — matches the
+        // tasks.repeat_from column values.
+        const repeatFrom = fromCompletionBox.currentIndex === 1 ? 1 : 0;
         vm.updateSelectedTask(
             titleField.text,
             notesField.text,
@@ -509,7 +652,9 @@ Dialog {
             departureBox.checked,
             parentId,
             estimateField.text.trim(),
-            elapsedField.text.trim()
+            elapsedField.text.trim(),
+            rule,
+            repeatFrom
         );
     }
 }

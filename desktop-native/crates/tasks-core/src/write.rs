@@ -140,6 +140,17 @@ pub struct TaskEdit<'a> {
     /// Seconds of elapsed work. `0` clears the counter. Same
     /// always-written shape as `estimated_seconds`.
     pub elapsed_seconds: i32,
+    /// New value for `tasks.recurrence` — an RFC 5545 RRULE string
+    /// like "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE,FR" or empty for
+    /// no recurrence. Always written, since the edit dialog always
+    /// has state for it. COUNT/UNTIL bits that were in the rule
+    /// before the edit are dropped unless the UI chooses to
+    /// reconstruct them; the desktop dialog does not edit those in
+    /// M2 Phase C8.
+    pub recurrence: &'a str,
+    /// New value for `tasks.repeat_from` (0 = from due date,
+    /// 1 = from completion). Always written.
+    pub repeat_from: i32,
 }
 
 /// Bundle carrying the three geofence-edit fields together so
@@ -260,6 +271,13 @@ pub fn update_task_fields(
     } else {
         Some(edit.title)
     };
+    // Empty recurrence string → NULL in the DB to match Android's
+    // convention (Task.recurrence: String?).
+    let recurrence_arg: Option<&str> = if edit.recurrence.is_empty() {
+        None
+    } else {
+        Some(edit.recurrence)
+    };
     let rows = tx.execute(
         "UPDATE tasks SET \
              title = ?1, \
@@ -269,8 +287,10 @@ pub fn update_task_fields(
              importance = ?5, \
              estimatedSeconds = ?6, \
              elapsedSeconds = ?7, \
-             modified = ?8 \
-         WHERE _id = ?9",
+             recurrence = ?8, \
+             repeat_from = ?9, \
+             modified = ?10 \
+         WHERE _id = ?11",
         params![
             title_arg,
             notes_arg,
@@ -279,6 +299,8 @@ pub fn update_task_fields(
             edit.priority,
             edit.estimated_seconds,
             edit.elapsed_seconds,
+            recurrence_arg,
+            edit.repeat_from,
             now_ms,
             task_id,
         ],

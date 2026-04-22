@@ -113,6 +113,12 @@ pub mod qobject {
         // dialog. Empty string means zero.
         #[qproperty(QString, selected_estimated_text)]
         #[qproperty(QString, selected_elapsed_text)]
+        // Raw `tasks.recurrence` (RRULE) + `tasks.repeat_from` for
+        // the inline recurrence editor. Humanised summary is in
+        // `selected_recurrence` for the detail pane's display;
+        // these are the edit-dialog round-trip values.
+        #[qproperty(QString, selected_recurrence_raw)]
+        #[qproperty(i32, selected_repeat_from)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -175,6 +181,8 @@ pub mod qobject {
             parent_id: i64,
             estimate_text: QString,
             elapsed_text: QString,
+            recurrence: QString,
+            repeat_from: i32,
         );
     }
 
@@ -242,6 +250,8 @@ pub struct TaskListViewModelRust {
     selected_parent_id: i64,
     selected_estimated_text: QString,
     selected_elapsed_text: QString,
+    selected_recurrence_raw: QString,
+    selected_repeat_from: i32,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -301,6 +311,8 @@ impl Default for TaskListViewModelRust {
             selected_parent_id: 0,
             selected_estimated_text: QString::default(),
             selected_elapsed_text: QString::default(),
+            selected_recurrence_raw: QString::default(),
+            selected_repeat_from: 0,
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -571,6 +583,11 @@ impl qobject::TaskListViewModel {
             )));
         self.as_mut()
             .set_selected_elapsed_text(QString::from(&format_duration_hhmm(task.elapsed_seconds)));
+
+        // Recurrence raw + repeat_from for the inline RRULE editor.
+        self.as_mut()
+            .set_selected_recurrence_raw(QString::from(task.recurrence.as_deref().unwrap_or("")));
+        self.as_mut().set_selected_repeat_from(task.repeat_from);
     }
 
     /// Apply edits from the task edit dialog and refresh the view.
@@ -596,6 +613,8 @@ impl qobject::TaskListViewModel {
         parent_id: i64,
         estimate_text: QString,
         elapsed_text: QString,
+        recurrence: QString,
+        repeat_from: i32,
     ) {
         let id = self.selected_id;
         if id <= 0 {
@@ -637,6 +656,7 @@ impl qobject::TaskListViewModel {
                 return;
             }
         };
+        let recurrence_str = recurrence.to_string();
         let elapsed = match parse_duration_input(&elapsed_text.to_string()) {
             Ok(s) => s,
             Err(msg) => {
@@ -687,6 +707,8 @@ impl qobject::TaskListViewModel {
             parent_id: Some(parent_id),
             estimated_seconds: estimated,
             elapsed_seconds: elapsed,
+            recurrence: &recurrence_str,
+            repeat_from,
         };
         match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
             Ok(true) => {
@@ -1248,4 +1270,6 @@ fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     vm.as_mut().set_selected_parent_id(0);
     vm.as_mut().set_selected_estimated_text(QString::default());
     vm.as_mut().set_selected_elapsed_text(QString::default());
+    vm.as_mut().set_selected_recurrence_raw(QString::default());
+    vm.as_mut().set_selected_repeat_from(0);
 }

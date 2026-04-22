@@ -114,6 +114,10 @@ Pane {
                         root.vm.selectedEstimatedText;
                     editDialog.initialElapsedText =
                         root.vm.selectedElapsedText;
+                    editDialog.initialRecurrenceRaw =
+                        root.vm.selectedRecurrenceRaw;
+                    editDialog.initialRepeatFrom =
+                        root.vm.selectedRepeatFrom;
                     editDialog.loadFromSelection();
                     editDialog.open();
                 }
