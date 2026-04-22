@@ -53,6 +53,9 @@ Dialog {
     // delete buttons. Kept as an array of plain JS objects so QML
     // Repeater sees a stable model.
     property var workingAlarms: []
+    property string initialPlaceUid: ""
+    property bool initialPlaceArrival: false
+    property bool initialPlaceDeparture: false
 
     // Called by TaskDetailPane right before `open()`. Resets the
     // form controls to the incoming values and clears any stale
@@ -98,6 +101,18 @@ Dialog {
         workingAlarms = alarms;
 
         addReminderField.text = "";
+
+        // Location: map current place UID to its index in the
+        // parallel arrays; 0 = "(none)".
+        if (vm) {
+            const pi = vm.placeUids.indexOf(initialPlaceUid);
+            placeBox.currentIndex = pi >= 0 ? pi + 1 : 0;
+        } else {
+            placeBox.currentIndex = 0;
+        }
+        arrivalBox.checked = initialPlaceArrival;
+        departureBox.checked = initialPlaceDeparture;
+
         validation.text = "";
     }
 
@@ -262,6 +277,40 @@ Dialog {
             }
 
             Label {
+                text: qsTr("Location")
+                opacity: 0.7
+                Layout.alignment: Qt.AlignTop
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                ComboBox {
+                    id: placeBox
+                    Layout.fillWidth: true
+                    model: {
+                        const labels = dialog.vm ? dialog.vm.placeLabels : [];
+                        const out = [qsTr("(no location)")];
+                        for (let i = 0; i < labels.length; i++) {
+                            out.push(labels[i]);
+                        }
+                        return out;
+                    }
+                }
+                RowLayout {
+                    enabled: placeBox.currentIndex > 0
+                    spacing: 16
+                    CheckBox {
+                        id: arrivalBox
+                        text: qsTr("Arrival")
+                    }
+                    CheckBox {
+                        id: departureBox
+                        text: qsTr("Departure")
+                    }
+                }
+            }
+
+            Label {
                 text: qsTr("Reminders")
                 opacity: 0.7
                 Layout.alignment: Qt.AlignTop
@@ -375,6 +424,13 @@ Dialog {
             alarmTimes.push(a.time);
             alarmTypes.push(a.type);
         }
+        // Map the location picker back to a place UID.  Index 0 =
+        // "(no location)" → empty string, which the bridge treats
+        // as "clear this task's geofence".
+        let placeUid = "";
+        if (placeBox.currentIndex > 0 && vm) {
+            placeUid = vm.placeUids[placeBox.currentIndex - 1];
+        }
         vm.updateSelectedTask(
             titleField.text,
             notesField.text,
@@ -384,7 +440,10 @@ Dialog {
             uuid,
             selectedTagUids,
             alarmTimes,
-            alarmTypes
+            alarmTypes,
+            placeUid,
+            arrivalBox.checked,
+            departureBox.checked
         );
     }
 }

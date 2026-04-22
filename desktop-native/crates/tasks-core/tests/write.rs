@@ -8,7 +8,9 @@
 
 use rusqlite::params;
 use tasks_core::db::Database;
-use tasks_core::write::{set_task_completion, set_task_deleted, update_task_fields, TaskEdit};
+use tasks_core::write::{
+    set_task_completion, set_task_deleted, update_task_fields, GeofenceEdit, TaskEdit,
+};
 
 const NOW: i64 = 1_700_000_000_000;
 
@@ -26,6 +28,7 @@ fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
         caldav_calendar_uuid: None,
         tag_uids: None,
         alarms: None,
+        geofence: None,
     }
 }
 
@@ -164,6 +167,7 @@ fn update_task_fields_writes_every_column() {
         caldav_calendar_uuid: None,
         tag_uids: None,
         alarms: None,
+        geofence: None,
     };
     let updated = update_task_fields(&db_path, a, &edit, NOW).unwrap();
     assert!(updated);
@@ -272,6 +276,7 @@ fn update_task_fields_reassigns_caldav_calendar() {
         caldav_calendar_uuid: Some("two"),
         tag_uids: None,
         alarms: None,
+        geofence: None,
     };
     assert!(update_task_fields(&db_path, caldav_task, &edit, NOW).unwrap());
     assert!(update_task_fields(&db_path, local_task, &edit, NOW).unwrap());
@@ -327,6 +332,7 @@ fn update_task_fields_empty_caldav_uuid_is_noop() {
         caldav_calendar_uuid: Some(""),
         tag_uids: None,
         alarms: None,
+        geofence: None,
     };
     assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
 
@@ -491,4 +497,69 @@ fn update_task_fields_replaces_alarms() {
         )
         .unwrap();
     assert_eq!(n, 0);
+}
+
+#[test]
+fn update_task_fields_writes_and_clears_geofence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+
+    // Seed a place so the INSERT has somewhere to point.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO places \
+             (uid, name, latitude, longitude, place_color, place_order, radius) \
+             VALUES ('home', 'Home', 37.77, -122.42, 0, 0, 250)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let edit = TaskEdit {
+        geofence: Some(GeofenceEdit {
+            place_uid: "home",
+            arrival: true,
+            departure: false,
+        }),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let (place, arrival, departure): (String, i32, i32) = db
+        .connection()
+        .query_row(
+            "SELECT place, arrival, departure FROM geofences WHERE task = ?1",
+            params![a],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(place, "home");
+    assert_eq!(arrival, 1);
+    assert_eq!(departure, 0);
+
+    // Empty place_uid clears the geofence.
+    let edit = TaskEdit {
+        geofence: Some(GeofenceEdit {
+            place_uid: "",
+            arrival: false,
+            departure: false,
+        }),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW + 1).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM geofences WHERE task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
 }

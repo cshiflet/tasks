@@ -118,6 +118,22 @@ pub struct TaskEdit<'a> {
     /// zero — reminders richer than type + time (random intervals,
     /// nag-till-done) aren't editable from the dialog yet.
     pub alarms: Option<&'a [(i64, i32)]>,
+    /// Replace the task's geofence rows. `None` = leave alone.
+    /// `Some(GeofenceEdit { place_uid: "" , .. })` clears the
+    /// existing geofences; non-empty `place_uid` writes exactly one
+    /// row with the given arrival/departure flags. Tasks.org's UI
+    /// is effectively 1:1 task-to-geofence even though the schema
+    /// allows multiple.
+    pub geofence: Option<GeofenceEdit<'a>>,
+}
+
+/// Bundle carrying the three geofence-edit fields together so
+/// `TaskEdit` stays readable even as more optional writes land.
+#[derive(Debug, Clone, Copy)]
+pub struct GeofenceEdit<'a> {
+    pub place_uid: &'a str,
+    pub arrival: bool,
+    pub departure: bool,
 }
 
 /// Edit the core user-visible fields of a task in a single UPDATE.
@@ -184,6 +200,24 @@ fn replace_task_alarms(tx: &Transaction<'_>, task_id: i64, alarms: &[(i64, i32)]
     Ok(())
 }
 
+fn replace_task_geofence(tx: &Transaction<'_>, task_id: i64, edit: GeofenceEdit<'_>) -> Result<()> {
+    tx.execute("DELETE FROM geofences WHERE task = ?1", params![task_id])?;
+    if edit.place_uid.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO geofences (task, place, arrival, departure) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            task_id,
+            edit.place_uid,
+            edit.arrival as i32,
+            edit.departure as i32,
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn update_task_fields(
     path: &Path,
     task_id: i64,
@@ -243,6 +277,10 @@ pub fn update_task_fields(
 
     if let Some(alarms) = edit.alarms {
         replace_task_alarms(&tx, task_id, alarms)?;
+    }
+
+    if let Some(geofence) = edit.geofence {
+        replace_task_geofence(&tx, task_id, geofence)?;
     }
 
     if let Some(uuid) = edit.caldav_calendar_uuid {

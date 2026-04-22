@@ -102,6 +102,12 @@ Pane {
                         root.vm.selectedRecurrence;
                     editDialog.initialCaldavUuid =
                         root.vm.selectedCaldavCalendarUuid;
+                    editDialog.initialPlaceUid =
+                        root.vm.selectedPlaceUid;
+                    editDialog.initialPlaceArrival =
+                        root.vm.selectedPlaceArrival;
+                    editDialog.initialPlaceDeparture =
+                        root.vm.selectedPlaceDeparture;
                     editDialog.loadFromSelection();
                     editDialog.open();
                 }

@@ -29,4 +29,6 @@ pub use models::{
     Filter, Geofence, Place, Priority, RepeatFrom, Tag, TagData, Task,
 };
 pub use recurrence::humanize_rrule;
-pub use write::{set_task_completion, set_task_deleted, update_task_fields, TaskEdit};
+pub use write::{
+    set_task_completion, set_task_deleted, update_task_fields, GeofenceEdit, TaskEdit,
+};

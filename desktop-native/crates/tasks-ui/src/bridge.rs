@@ -92,6 +92,15 @@ pub mod qobject {
         #[qproperty(QStringList, selected_alarm_labels)]
         #[qproperty(QList_i64, selected_alarm_times)]
         #[qproperty(QList_i32, selected_alarm_types)]
+        // Places known to the DB, parallel arrays for the edit
+        // dialog's location picker.
+        #[qproperty(QStringList, place_labels)]
+        #[qproperty(QStringList, place_uids)]
+        // Geofence currently attached to the selected task; empty
+        // `selected_place_uid` means no geofence.
+        #[qproperty(QString, selected_place_uid)]
+        #[qproperty(bool, selected_place_arrival)]
+        #[qproperty(bool, selected_place_departure)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -148,6 +157,9 @@ pub mod qobject {
             tag_uids_list: QStringList,
             alarm_times: QList_i64,
             alarm_types: QList_i32,
+            place_uid: QString,
+            place_arrival: bool,
+            place_departure: bool,
         );
     }
 
@@ -203,6 +215,11 @@ pub struct TaskListViewModelRust {
     selected_alarm_labels: QStringList,
     selected_alarm_times: QList<i64>,
     selected_alarm_types: QList<i32>,
+    place_labels: QStringList,
+    place_uids: QStringList,
+    selected_place_uid: QString,
+    selected_place_arrival: bool,
+    selected_place_departure: bool,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -252,6 +269,11 @@ impl Default for TaskListViewModelRust {
             selected_alarm_labels: QStringList::default(),
             selected_alarm_times: QList::default(),
             selected_alarm_types: QList::default(),
+            place_labels: QStringList::default(),
+            place_uids: QStringList::default(),
+            selected_place_uid: QString::default(),
+            selected_place_arrival: false,
+            selected_place_departure: false,
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -488,6 +510,16 @@ impl qobject::TaskListViewModel {
             ql_types.append(*t);
         }
         self.as_mut().set_selected_alarm_types(ql_types);
+
+        // Current geofence.
+        let (place_uid, arrival, departure) = match &self.db {
+            Some(db) => current_geofence_for(db, task.id),
+            None => (String::new(), false, false),
+        };
+        self.as_mut()
+            .set_selected_place_uid(QString::from(&place_uid));
+        self.as_mut().set_selected_place_arrival(arrival);
+        self.as_mut().set_selected_place_departure(departure);
     }
 
     /// Apply edits from the task edit dialog and refresh the view.
@@ -507,6 +539,9 @@ impl qobject::TaskListViewModel {
         tag_uids_list: QStringList,
         alarm_times: QList<i64>,
         alarm_types: QList<i32>,
+        place_uid: QString,
+        place_arrival: bool,
+        place_departure: bool,
     ) {
         let id = self.selected_id;
         if id <= 0 {
@@ -538,6 +573,7 @@ impl qobject::TaskListViewModel {
             .zip(alarm_types.iter())
             .map(|(t, ty)| (*t, *ty))
             .collect();
+        let place_uid_str = place_uid.to_string();
         let due_ms = match parse_due_input(&due_text.to_string()) {
             Ok(ms) => ms,
             Err(msg) => {
@@ -572,6 +608,11 @@ impl qobject::TaskListViewModel {
             },
             tag_uids: Some(&tag_uids_owned),
             alarms: Some(&alarm_pairs),
+            geofence: Some(tasks_core::GeofenceEdit {
+                place_uid: &place_uid_str,
+                arrival: place_arrival,
+                departure: place_departure,
+            }),
         };
         match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
             Ok(true) => {
@@ -757,6 +798,12 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             vm.as_mut().set_tag_uids(string_list_from_iter(
                 tag_uid_list.iter().map(String::as_str),
             ));
+            let (place_names, place_uids) = list_all_places(&db);
+            vm.as_mut().set_place_labels(string_list_from_iter(
+                place_names.iter().map(String::as_str),
+            ));
+            vm.as_mut()
+                .set_place_uids(string_list_from_iter(place_uids.iter().map(String::as_str)));
             vm.as_mut().set_status(QString::from(&format!(
                 "Opened {path_display} ({} sidebar entries)",
                 labels.len()
@@ -804,6 +851,48 @@ fn list_all_tags(db: &Database) -> (Vec<String>, Vec<String>) {
         }
     }
     (labels, uids)
+}
+
+/// Return parallel `(labels, uids)` for every row in `places`.
+fn list_all_places(db: &Database) -> (Vec<String>, Vec<String>) {
+    let mut labels = Vec::new();
+    let mut uids = Vec::new();
+    let Ok(mut stmt) = db.connection().prepare(
+        "SELECT uid, name FROM places \
+         WHERE uid IS NOT NULL AND name IS NOT NULL \
+         ORDER BY place_order, name",
+    ) else {
+        return (labels, uids);
+    };
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+    if let Ok(rows) = rows {
+        for (uid, name) in rows.flatten() {
+            uids.push(uid);
+            labels.push(name);
+        }
+    }
+    (labels, uids)
+}
+
+/// Fetch the geofence row for `task_id`, returning
+/// `(place_uid, arrival, departure)`. Empty `place_uid` = no row.
+/// If a task has multiple geofences (rare; schema allows it) we
+/// pick the first by rowid.
+fn current_geofence_for(db: &Database, task_id: i64) -> (String, bool, bool) {
+    db.connection()
+        .query_row(
+            "SELECT place, arrival, departure FROM geofences \
+             WHERE task = ?1 ORDER BY geofence_id LIMIT 1",
+            [task_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, i32>(1)? != 0,
+                    r.get::<_, i32>(2)? != 0,
+                ))
+            },
+        )
+        .unwrap_or_default()
 }
 
 /// Read the alarms attached to `task_id`. Returns three parallel
@@ -1048,4 +1137,7 @@ fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
         .set_selected_alarm_labels(QStringList::default());
     vm.as_mut().set_selected_alarm_times(QList::default());
     vm.as_mut().set_selected_alarm_types(QList::default());
+    vm.as_mut().set_selected_place_uid(QString::default());
+    vm.as_mut().set_selected_place_arrival(false);
+    vm.as_mut().set_selected_place_departure(false);
 }
