@@ -565,6 +565,130 @@ fn update_task_fields_writes_timer_columns() {
 }
 
 #[test]
+fn edit_with_none_relations_preserves_existing_rows() {
+    // TaskEdit's Option fields (tag_uids, alarms, geofence,
+    // caldav_calendar_uuid, parent_id) all mean "leave untouched"
+    // when None. A save that only twiddles the scalar fields
+    // (title/notes/priority) must not DELETE the task's tags,
+    // alarms, or geofence.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tags (task, name, tag_uid, task_uid) \
+             VALUES (?1, 'Work', 'tag-w', 'task-a-uid')",
+            params![a],
+        )
+        .unwrap();
+        // Seed an alarm type that the dialog can't construct (RANDOM),
+        // to double-check it survives an unrelated save.
+        conn.execute(
+            "INSERT INTO alarms (task, time, type, repeat, interval) \
+             VALUES (?1, 3600000, 3, 0, 0)",
+            params![a],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO places \
+             (uid, name, latitude, longitude, place_color, place_order, radius) \
+             VALUES ('home', 'Home', 0.0, 0.0, 0, 0, 250)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO geofences (task, place, arrival, departure) \
+             VALUES (?1, 'home', 1, 0)",
+            params![a],
+        )
+        .unwrap();
+    }
+
+    let edit = edit_default("A (edited)", "notes");
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let tag_count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tag_count, 1, "tags should survive an unrelated edit");
+    let alarm_type: i32 = db
+        .connection()
+        .query_row("SELECT type FROM alarms WHERE task = ?1", params![a], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(alarm_type, 3, "RANDOM alarm should survive unchanged");
+    let geofence_count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM geofences WHERE task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(geofence_count, 1, "geofence should survive");
+}
+
+#[test]
+fn delete_cascades_to_dependent_rows() {
+    // Room's schema declares ON DELETE CASCADE on alarms, tags,
+    // geofences, and caldav_tasks. A hard delete of the parent task
+    // should wipe the children. (Our app uses soft-delete by
+    // default, but sync cleanup and the eventual trash-empty flow
+    // rely on the cascade.)
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tags (task, name, tag_uid, task_uid) \
+             VALUES (?1, 'x', 'u-x', NULL)",
+            params![a],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO alarms (task, time, type, repeat, interval) \
+             VALUES (?1, 0, 0, 0, 0)",
+            params![a],
+        )
+        .unwrap();
+        // rusqlite defaults to `PRAGMA foreign_keys = OFF`; enable so
+        // the cascade fires.
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        conn.execute("DELETE FROM tasks WHERE _id = ?1", params![a])
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let orphan_tags: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let orphan_alarms: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM alarms WHERE task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphan_tags, 0);
+    assert_eq!(orphan_alarms, 0);
+}
+
+#[test]
 fn update_task_fields_writes_recurrence() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("tasks.db");

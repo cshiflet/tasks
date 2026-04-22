@@ -920,6 +920,22 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             vm.as_mut().set_status(QString::from(&msg));
             vm.as_mut().set_db_path_display(QString::default());
             vm.as_mut().clear_list();
+            // Also blank every per-task detail field + the edit
+            // dialog's catalog arrays (tags/places/caldav lists).
+            // Otherwise a failed open after an earlier successful
+            // open leaves stale values visible in the UI.
+            clear_detail_pane(vm.as_mut());
+            vm.as_mut().set_tag_labels(QStringList::default());
+            vm.as_mut().set_tag_uids(QStringList::default());
+            vm.as_mut().set_place_labels(QStringList::default());
+            vm.as_mut().set_place_uids(QStringList::default());
+            vm.as_mut()
+                .set_caldav_calendar_labels(QStringList::default());
+            vm.as_mut()
+                .set_caldav_calendar_uuids(QStringList::default());
+            vm.as_mut()
+                .set_parent_candidate_labels(QStringList::default());
+            vm.as_mut().set_parent_candidate_ids(QList::default());
             let mut inner = vm.as_mut().rust_mut();
             inner.db_path = None;
             inner.db = None;

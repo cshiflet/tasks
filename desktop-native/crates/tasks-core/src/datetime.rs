@@ -102,10 +102,35 @@ fn parse_ymd(s: &str) -> Result<(i32, u32, u32), String> {
     if !(1..=12).contains(&m) {
         return Err(format!("month out of range: {m}"));
     }
-    if !(1..=31).contains(&d) {
-        return Err(format!("day out of range: {d}"));
+    // Reject impossible days (Feb 30, Apr 31, …) so a typo can't
+    // silently advance the user's due date by a day or two. The
+    // proleptic Gregorian code further down is happy to compute
+    // *something* for any integer input, so we validate here.
+    let max_day = days_in_month(y, m);
+    if d < 1 || d > max_day {
+        return Err(format!(
+            "day {d} out of range for {y:04}-{m:02} (max {max_day})"
+        ));
     }
     Ok((y, m, d))
+}
+
+/// Number of days in the given Gregorian month. Handles leap years
+/// (divisible by 4, except centuries that aren't divisible by 400).
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// Format a duration in seconds as `H:MM` (hours:minutes). Zero
@@ -404,5 +429,21 @@ mod tests {
         assert!(parse_due_input("2020-02-29 25:00").is_err());
         assert!(parse_due_input("2020-02-29 12:70").is_err());
         assert!(parse_due_input("2020/02/29").is_err());
+    }
+
+    #[test]
+    fn parse_due_input_respects_days_in_month() {
+        // Leap-year Feb 29 is valid in 2020 but not in 2021.
+        assert!(parse_due_input("2020-02-29").is_ok());
+        assert!(parse_due_input("2021-02-29").is_err());
+        // April has 30 days.
+        assert!(parse_due_input("2024-04-30").is_ok());
+        assert!(parse_due_input("2024-04-31").is_err());
+        // September has 30 days.
+        assert!(parse_due_input("2024-09-31").is_err());
+        // Century non-leap year.
+        assert!(parse_due_input("1900-02-29").is_err());
+        // Every-400-years leap year.
+        assert!(parse_due_input("2000-02-29").is_ok());
     }
 }

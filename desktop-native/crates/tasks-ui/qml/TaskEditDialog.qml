@@ -605,9 +605,15 @@ Dialog {
         // "(no CalDAV list)" synthetic entry — passing an empty
         // string tells the bridge not to touch caldav_tasks, which
         // matches "local task, leave it that way" semantics.
+        // Defensive array bounds: even with the `currentIndex > 0`
+        // guard, a stale ComboBox selection from before the model
+        // changed could point past the end. `?? ""` papers over
+        // undefined rather than relying on the bridge to surface
+        // the bug as a cryptic status-line error.
         let uuid = "";
-        if (calendarBox.currentIndex > 0) {
-            uuid = vm.caldavCalendarUuids[calendarBox.currentIndex - 1];
+        const calIdx = calendarBox.currentIndex - 1;
+        if (calIdx >= 0 && calIdx < vm.caldavCalendarUuids.length) {
+            uuid = vm.caldavCalendarUuids[calIdx] ?? "";
         }
         // Unpack workingAlarms into parallel time/type arrays; the
         // bridge's Q_INVOKABLE can't take a JS object array across
@@ -623,15 +629,17 @@ Dialog {
         // "(no location)" → empty string, which the bridge treats
         // as "clear this task's geofence".
         let placeUid = "";
-        if (placeBox.currentIndex > 0 && vm) {
-            placeUid = vm.placeUids[placeBox.currentIndex - 1];
+        const placeIdx = placeBox.currentIndex - 1;
+        if (placeIdx >= 0 && placeIdx < vm.placeUids.length) {
+            placeUid = vm.placeUids[placeIdx] ?? "";
         }
         // Map the parent picker back to a task id. Index 0 = top-
         // level (id 0). The vm.parentCandidateIds array drops the
         // self-task, so any non-zero index is a valid other task.
         let parentId = 0;
-        if (parentBox.currentIndex > 0 && vm) {
-            parentId = vm.parentCandidateIds[parentBox.currentIndex - 1];
+        const parIdx = parentBox.currentIndex - 1;
+        if (parIdx >= 0 && parIdx < vm.parentCandidateIds.length) {
+            parentId = vm.parentCandidateIds[parIdx] ?? 0;
         }
         const rule = buildRecurrenceRule();
         // 0 = from due date, 1 = from completion — matches the

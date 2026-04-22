@@ -178,13 +178,21 @@ pub struct GeofenceEdit<'a> {
 /// carrying the looked-up `tagdata.name` and the task's `remoteId`.
 /// Missing tagdata rows (stale UID) are silently skipped at debug.
 fn replace_task_tags(tx: &Transaction<'_>, task_id: i64, tag_uids: &[String]) -> Result<()> {
-    let task_remote_id: Option<String> = tx
-        .query_row(
-            "SELECT remoteId FROM tasks WHERE _id = ?1",
-            params![task_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(None);
+    // Look up the task's remoteId for the join rows' `task_uid`
+    // column. A local-only task correctly has no remoteId
+    // (`Option::None` passes through to a NULL column); we only
+    // swallow the `NoRows` case here because the caller has
+    // already verified the task exists. Any other failure (I/O,
+    // corruption) surfaces to the transaction rollback.
+    let task_remote_id: Option<String> = match tx.query_row(
+        "SELECT remoteId FROM tasks WHERE _id = ?1",
+        params![task_id],
+        |r| r.get::<_, Option<String>>(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
 
     tx.execute("DELETE FROM tags WHERE task = ?1", params![task_id])?;
 
