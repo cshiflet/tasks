@@ -85,6 +85,13 @@ pub mod qobject {
         // Tag UIDs currently attached to the selected task. Used
         // to pre-check the dialog's checkboxes on open.
         #[qproperty(QStringList, selected_tag_uids)]
+        // Alarms attached to the selected task. Parallel arrays —
+        // labels is the humanised description for display, times
+        // and types are the raw columns the edit dialog passes
+        // back into `updateSelectedTask`.
+        #[qproperty(QStringList, selected_alarm_labels)]
+        #[qproperty(QList_i64, selected_alarm_times)]
+        #[qproperty(QList_i32, selected_alarm_types)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -139,6 +146,8 @@ pub mod qobject {
             priority: i32,
             caldav_uuid: QString,
             tag_uids_list: QStringList,
+            alarm_times: QList_i64,
+            alarm_types: QList_i32,
         );
     }
 
@@ -158,7 +167,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
 
-use tasks_core::datetime::{format_due_label, parse_due_input};
+use tasks_core::datetime::{describe_alarm, format_due_label, parse_due_input};
 use tasks_core::db::{default_db_path, Database};
 use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, RepeatFrom, Task};
 use tasks_core::query::{
@@ -191,6 +200,9 @@ pub struct TaskListViewModelRust {
     tag_labels: QStringList,
     tag_uids: QStringList,
     selected_tag_uids: QStringList,
+    selected_alarm_labels: QStringList,
+    selected_alarm_times: QList<i64>,
+    selected_alarm_types: QList<i32>,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -237,6 +249,9 @@ impl Default for TaskListViewModelRust {
             tag_labels: QStringList::default(),
             tag_uids: QStringList::default(),
             selected_tag_uids: QStringList::default(),
+            selected_alarm_labels: QStringList::default(),
+            selected_alarm_times: QList::default(),
+            selected_alarm_types: QList::default(),
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -453,6 +468,26 @@ impl qobject::TaskListViewModel {
         self.as_mut().set_selected_tag_uids(string_list_from_iter(
             task_tag_uids.iter().map(String::as_str),
         ));
+
+        // Current alarms (parallel labels/times/types).
+        let (alarm_labels, alarm_times, alarm_types) = match &self.db {
+            Some(db) => current_alarms_for(db, task.id),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        self.as_mut()
+            .set_selected_alarm_labels(string_list_from_iter(
+                alarm_labels.iter().map(String::as_str),
+            ));
+        let mut ql_times: QList<i64> = QList::default();
+        for t in &alarm_times {
+            ql_times.append(*t);
+        }
+        self.as_mut().set_selected_alarm_times(ql_times);
+        let mut ql_types: QList<i32> = QList::default();
+        for t in &alarm_types {
+            ql_types.append(*t);
+        }
+        self.as_mut().set_selected_alarm_types(ql_types);
     }
 
     /// Apply edits from the task edit dialog and refresh the view.
@@ -470,6 +505,8 @@ impl qobject::TaskListViewModel {
         priority: i32,
         caldav_uuid: QString,
         tag_uids_list: QStringList,
+        alarm_times: QList<i64>,
+        alarm_types: QList<i32>,
     ) {
         let id = self.selected_id;
         if id <= 0 {
@@ -491,6 +528,16 @@ impl qobject::TaskListViewModel {
             let list: QList<QString> = QList::from(&tag_uids_list);
             list.iter().map(|s| s.to_string()).collect()
         };
+
+        // Zip parallel time/type QLists into Vec<(time, type)> for
+        // the write helper. If the two arrays disagree in length we
+        // trim to the shorter, matching the QML side's guarantee
+        // that both are built from the same source.
+        let alarm_pairs: Vec<(i64, i32)> = alarm_times
+            .iter()
+            .zip(alarm_types.iter())
+            .map(|(t, ty)| (*t, *ty))
+            .collect();
         let due_ms = match parse_due_input(&due_text.to_string()) {
             Ok(ms) => ms,
             Err(msg) => {
@@ -524,6 +571,7 @@ impl qobject::TaskListViewModel {
                 Some(caldav_str.as_str())
             },
             tag_uids: Some(&tag_uids_owned),
+            alarms: Some(&alarm_pairs),
         };
         match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
             Ok(true) => {
@@ -758,6 +806,31 @@ fn list_all_tags(db: &Database) -> (Vec<String>, Vec<String>) {
     (labels, uids)
 }
 
+/// Read the alarms attached to `task_id`. Returns three parallel
+/// vectors suitable for the bridge's QStringList/QList Q_PROPERTYs.
+fn current_alarms_for(db: &Database, task_id: i64) -> (Vec<String>, Vec<i64>, Vec<i32>) {
+    let mut labels = Vec::new();
+    let mut times = Vec::new();
+    let mut types = Vec::new();
+    let Ok(mut stmt) = db
+        .connection()
+        .prepare("SELECT time, type FROM alarms WHERE task = ?1 ORDER BY time")
+    else {
+        return (labels, times, types);
+    };
+    let rows = stmt.query_map([task_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?))
+    });
+    if let Ok(rows) = rows {
+        for (time, alarm_type) in rows.flatten() {
+            labels.push(describe_alarm(alarm_type, time));
+            times.push(time);
+            types.push(alarm_type);
+        }
+    }
+    (labels, times, types)
+}
+
 /// Fetch the tag UIDs attached to `task_id` via the `tags` join.
 fn current_tag_uids_for(db: &Database, task_id: i64) -> Vec<String> {
     let mut out = Vec::new();
@@ -971,4 +1044,8 @@ fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     vm.as_mut()
         .set_selected_caldav_calendar_uuid(QString::default());
     vm.as_mut().set_selected_tag_uids(QStringList::default());
+    vm.as_mut()
+        .set_selected_alarm_labels(QStringList::default());
+    vm.as_mut().set_selected_alarm_times(QList::default());
+    vm.as_mut().set_selected_alarm_types(QList::default());
 }

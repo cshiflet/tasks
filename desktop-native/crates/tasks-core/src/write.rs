@@ -111,6 +111,13 @@ pub struct TaskEdit<'a> {
     /// DELETEs the existing rows then re-INSERTs with looked-up
     /// tagdata names + the task's remoteId.
     pub tag_uids: Option<&'a [String]>,
+    /// Replace the task's alarm rows with exactly this set, keyed
+    /// by `(time, alarm_type)`. `None` leaves alarms untouched;
+    /// `Some(&[])` clears every alarm. The write helper DELETEs
+    /// then INSERTs fresh rows with `repeat` / `interval` both
+    /// zero — reminders richer than type + time (random intervals,
+    /// nag-till-done) aren't editable from the dialog yet.
+    pub alarms: Option<&'a [(i64, i32)]>,
 }
 
 /// Edit the core user-visible fields of a task in a single UPDATE.
@@ -155,6 +162,24 @@ fn replace_task_tags(tx: &Transaction<'_>, task_id: i64, tag_uids: &[String]) ->
             continue;
         };
         insert_stmt.execute(params![task_id, name, uid, task_remote_id])?;
+    }
+    Ok(())
+}
+
+/// Replace the alarm rows for `task_id` with the given `(time, type)`
+/// pairs. `repeat` and `interval` are zeroed since the edit dialog
+/// doesn't offer them yet.
+fn replace_task_alarms(tx: &Transaction<'_>, task_id: i64, alarms: &[(i64, i32)]) -> Result<()> {
+    tx.execute("DELETE FROM alarms WHERE task = ?1", params![task_id])?;
+    if alarms.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "INSERT INTO alarms (task, time, type, repeat, interval) \
+         VALUES (?1, ?2, ?3, 0, 0)",
+    )?;
+    for (time, alarm_type) in alarms {
+        stmt.execute(params![task_id, time, alarm_type])?;
     }
     Ok(())
 }
@@ -214,6 +239,10 @@ pub fn update_task_fields(
 
     if let Some(tag_uids) = edit.tag_uids {
         replace_task_tags(&tx, task_id, tag_uids)?;
+    }
+
+    if let Some(alarms) = edit.alarms {
+        replace_task_alarms(&tx, task_id, alarms)?;
     }
 
     if let Some(uuid) = edit.caldav_calendar_uuid {

@@ -25,6 +25,7 @@ fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
         priority: 3,
         caldav_calendar_uuid: None,
         tag_uids: None,
+        alarms: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn update_task_fields_writes_every_column() {
         priority: 1, // MEDIUM
         caldav_calendar_uuid: None,
         tag_uids: None,
+        alarms: None,
     };
     let updated = update_task_fields(&db_path, a, &edit, NOW).unwrap();
     assert!(updated);
@@ -269,6 +271,7 @@ fn update_task_fields_reassigns_caldav_calendar() {
         priority: 3,
         caldav_calendar_uuid: Some("two"),
         tag_uids: None,
+        alarms: None,
     };
     assert!(update_task_fields(&db_path, caldav_task, &edit, NOW).unwrap());
     assert!(update_task_fields(&db_path, local_task, &edit, NOW).unwrap());
@@ -323,6 +326,7 @@ fn update_task_fields_empty_caldav_uuid_is_noop() {
         priority: 3,
         caldav_calendar_uuid: Some(""),
         tag_uids: None,
+        alarms: None,
     };
     assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
 
@@ -371,13 +375,8 @@ fn update_task_fields_replaces_tag_rows() {
     // gone, and the two new rows should carry the looked-up names.
     let wanted = vec!["tag-one".to_string(), "tag-two".to_string()];
     let edit = TaskEdit {
-        title: "A",
-        notes: "",
-        due_ms: 0,
-        hide_until_ms: 0,
-        priority: 3,
-        caldav_calendar_uuid: None,
         tag_uids: Some(&wanted),
+        ..edit_default("A", "")
     };
     assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
 
@@ -430,4 +429,66 @@ fn update_task_fields_replaces_tag_rows() {
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn update_task_fields_replaces_alarms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _) = seed_two_tasks(&db_path);
+
+    // Seed a stale alarm pointing at task a.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO alarms (task, time, type, repeat, interval) \
+             VALUES (?1, 0, 3, 0, 60000)",
+            params![a],
+        )
+        .unwrap();
+    }
+
+    let wanted = vec![
+        (-30 * 60 * 1000_i64, 2_i32),   // 30 min before due (REL_END)
+        (1_700_000_000_000_i64, 0_i32), // absolute DATE_TIME
+    ];
+    let edit = TaskEdit {
+        alarms: Some(&wanted),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT time, type FROM alarms WHERE task = ?1 ORDER BY time")
+        .unwrap();
+    let rows: Vec<(i64, i32)> = stmt
+        .query_map(params![a], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    // Sorted ASC by time → (-30m) first, absolute epoch second.
+    assert_eq!(rows[0], (-30 * 60 * 1000, 2));
+    assert_eq!(rows[1], (1_700_000_000_000, 0));
+
+    // Clear.
+    let empty: Vec<(i64, i32)> = Vec::new();
+    let edit = TaskEdit {
+        alarms: Some(&empty),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW + 1).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let n: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM alarms WHERE task = ?1",
+            params![a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
 }

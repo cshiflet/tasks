@@ -46,6 +46,13 @@ Dialog {
     // this array (pre-check); the array is mutated as the user
     // toggles so the selection can be read back on save.
     property var selectedTagUids: []
+    // Working copy of the task's alarm list. Each entry is
+    // `{time: Number, type: Number, label: String}`. `label` is
+    // rendered in the UI; `time`+`type` are sent to the bridge on
+    // save. Mutated by the [+ Add before due] row and the per-row
+    // delete buttons. Kept as an array of plain JS objects so QML
+    // Repeater sees a stable model.
+    property var workingAlarms: []
 
     // Called by TaskDetailPane right before `open()`. Resets the
     // form controls to the incoming values and clears any stale
@@ -71,7 +78,51 @@ Dialog {
         // Copy (rather than alias) so toggling inside the dialog
         // doesn't mutate the VM's QStringList.
         selectedTagUids = vm ? Array.from(vm.selectedTagUids) : [];
+
+        // Snapshot alarms. Pair labels with (time, type) by index;
+        // the bridge populates all three arrays in lockstep.
+        const alarms = [];
+        if (vm) {
+            const n = Math.min(
+                vm.selectedAlarmLabels.length,
+                vm.selectedAlarmTimes.length,
+                vm.selectedAlarmTypes.length);
+            for (let i = 0; i < n; i++) {
+                alarms.push({
+                    time: vm.selectedAlarmTimes[i],
+                    type: vm.selectedAlarmTypes[i],
+                    label: vm.selectedAlarmLabels[i],
+                });
+            }
+        }
+        workingAlarms = alarms;
+
+        addReminderField.text = "";
         validation.text = "";
+    }
+
+    function removeAlarmAt(index) {
+        const next = workingAlarms.slice();
+        next.splice(index, 1);
+        workingAlarms = next;
+    }
+
+    function addBeforeDueMinutes(minutesText) {
+        const m = parseInt(minutesText, 10);
+        if (!Number.isFinite(m) || m < 0) {
+            validation.text = qsTr("Minutes must be a non-negative number");
+            return false;
+        }
+        // REL_END = 2; negative time = before.
+        const timeMs = -m * 60 * 1000;
+        const label = (m === 0)
+            ? qsTr("At due")
+            : qsTr("%1 minutes before due").arg(m);
+        workingAlarms = workingAlarms.concat([{
+            time: timeMs, type: 2, label: label
+        }]);
+        validation.text = "";
+        return true;
     }
 
     function toggleTag(uid, nowChecked) {
@@ -211,6 +262,67 @@ Dialog {
             }
 
             Label {
+                text: qsTr("Reminders")
+                opacity: 0.7
+                Layout.alignment: Qt.AlignTop
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 4
+
+                Repeater {
+                    model: dialog.workingAlarms.length
+                    RowLayout {
+                        required property int index
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Label {
+                            Layout.fillWidth: true
+                            text: dialog.workingAlarms[index].label
+                            elide: Text.ElideRight
+                        }
+                        Button {
+                            text: qsTr("Remove")
+                            flat: true
+                            onClicked: dialog.removeAlarmAt(index)
+                        }
+                    }
+                }
+
+                // Quick-add row. Tasks.org's full picker covers every
+                // alarm type (relative/absolute/random/snooze) — the
+                // desktop dialog starts with the most common case
+                // (minutes before due) and grows from there.
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label {
+                        text: qsTr("Add:")
+                        opacity: 0.6
+                    }
+                    TextField {
+                        id: addReminderField
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("minutes before due")
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        onAccepted: {
+                            if (dialog.addBeforeDueMinutes(text)) {
+                                text = "";
+                            }
+                        }
+                    }
+                    Button {
+                        text: qsTr("Add")
+                        onClicked: {
+                            if (dialog.addBeforeDueMinutes(addReminderField.text)) {
+                                addReminderField.text = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            Label {
                 text: qsTr("Repeats")
                 opacity: 0.7
             }
@@ -253,6 +365,16 @@ Dialog {
         if (calendarBox.currentIndex > 0) {
             uuid = vm.caldavCalendarUuids[calendarBox.currentIndex - 1];
         }
+        // Unpack workingAlarms into parallel time/type arrays; the
+        // bridge's Q_INVOKABLE can't take a JS object array across
+        // FFI, so the two arrays travel separately and get zipped
+        // back together on the Rust side.
+        const alarmTimes = [];
+        const alarmTypes = [];
+        for (const a of workingAlarms) {
+            alarmTimes.push(a.time);
+            alarmTypes.push(a.type);
+        }
         vm.updateSelectedTask(
             titleField.text,
             notesField.text,
@@ -260,7 +382,9 @@ Dialog {
             hideField.text.trim(),
             priorityBox.currentIndex,
             uuid,
-            selectedTagUids
+            selectedTagUids,
+            alarmTimes,
+            alarmTypes
         );
     }
 }

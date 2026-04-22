@@ -108,6 +108,80 @@ fn parse_ymd(s: &str) -> Result<(i32, u32, u32), String> {
     Ok((y, m, d))
 }
 
+/// Humanise an alarm row for the UI. `alarm_time` is the raw
+/// `alarms.time` value; what it means depends on `alarm_type`:
+///
+/// * DATE_TIME (0) — absolute epoch ms → "At YYYY-MM-DD HH:MM".
+/// * REL_START (1) / REL_END (2) — offset ms from start/end;
+///   negative means "before", positive "after".
+/// * RANDOM (3) — interval ms → "Random every …".
+/// * SNOOZE (4) — absolute ms → "Snoozed until …".
+/// * GEO_ENTER (5) / GEO_EXIT (6) — time unused.
+///
+/// Unknown type codes pass through as a "?" summary rather than
+/// failing noisily.
+pub fn describe_alarm(alarm_type: i32, alarm_time: i64) -> String {
+    match alarm_type {
+        // DATE_TIME
+        0 => format!("At {}", format_due_label(alarm_time)),
+        // REL_START
+        1 => format!("{} start", describe_offset_ms(alarm_time)),
+        // REL_END
+        2 => format!("{} due", describe_offset_ms(alarm_time)),
+        // RANDOM
+        3 => format!("Random every {}", describe_duration_ms(alarm_time)),
+        // SNOOZE
+        4 => format!("Snoozed until {}", format_due_label(alarm_time)),
+        5 => "On arrival at location".to_string(),
+        6 => "On leaving location".to_string(),
+        _ => format!("Reminder (type {alarm_type})"),
+    }
+}
+
+/// Render a signed offset ms as "N minutes before / after …".
+/// Caller appends the "start" / "due" anchor noun.
+fn describe_offset_ms(offset_ms: i64) -> String {
+    if offset_ms == 0 {
+        return "At".to_string();
+    }
+    let (direction, absolute) = if offset_ms < 0 {
+        ("before", (-offset_ms) as u64)
+    } else {
+        ("after", offset_ms as u64)
+    };
+    format!("{} {}", describe_duration_ms(absolute as i64), direction)
+}
+
+/// Render a non-negative duration in ms as the coarsest whole unit
+/// that fits cleanly (days, then hours, then minutes, then seconds).
+fn describe_duration_ms(ms: i64) -> String {
+    let ms = ms.unsigned_abs();
+    let seconds = ms / 1000;
+    if seconds == 0 {
+        return "<1 sec".to_string();
+    }
+    let units: &[(u64, &str)] = &[
+        (86_400, "day"),
+        (3600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ];
+    for (factor, name) in units {
+        if seconds >= *factor && seconds % factor == 0 {
+            let n = seconds / factor;
+            return format!("{n} {name}{}", if n == 1 { "" } else { "s" });
+        }
+    }
+    // Fallback: pick the largest non-zero unit and round down.
+    for (factor, name) in units {
+        if seconds >= *factor {
+            let n = seconds / factor;
+            return format!("~{n} {name}{}", if n == 1 { "" } else { "s" });
+        }
+    }
+    format!("{seconds} seconds")
+}
+
 fn parse_hm(s: &str) -> Result<(u32, u32), String> {
     // Accept "HH:MM" or "HH:MM:SS" (we drop the seconds — the
     // "has time" flag is added unconditionally by the caller).
@@ -165,7 +239,28 @@ pub fn ymd_to_days(y: i32, m: u32, d: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{days_to_ymd, format_due_label, parse_due_input, ymd_to_days};
+    use super::{days_to_ymd, describe_alarm, format_due_label, parse_due_input, ymd_to_days};
+
+    #[test]
+    fn describe_alarm_humanises_common_types() {
+        // REL_END, 30 minutes before due.
+        assert_eq!(describe_alarm(2, -30 * 60 * 1000), "30 minutes before due");
+        // REL_END, 1 hour after due.
+        assert_eq!(describe_alarm(2, 60 * 60 * 1000), "1 hour after due");
+        // REL_END, exactly 2 days before.
+        assert_eq!(describe_alarm(2, -2 * 86_400 * 1000), "2 days before due");
+        // DATE_TIME → uses format_due_label.
+        assert_eq!(describe_alarm(0, 1_582_934_400_000), "At 2020-02-29");
+        // SNOOZE
+        assert_eq!(
+            describe_alarm(4, 1_582_934_400_000),
+            "Snoozed until 2020-02-29"
+        );
+        // RANDOM — interval.
+        assert_eq!(describe_alarm(3, 60 * 60 * 1000), "Random every 1 hour");
+        // Unknown type.
+        assert_eq!(describe_alarm(99, 0), "Reminder (type 99)");
+    }
 
     #[test]
     fn days_to_ymd_round_trip_known_values() {
