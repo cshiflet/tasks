@@ -29,6 +29,7 @@ fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
         tag_uids: None,
         alarms: None,
         geofence: None,
+        parent_id: None,
     }
 }
 
@@ -168,6 +169,7 @@ fn update_task_fields_writes_every_column() {
         tag_uids: None,
         alarms: None,
         geofence: None,
+        parent_id: None,
     };
     let updated = update_task_fields(&db_path, a, &edit, NOW).unwrap();
     assert!(updated);
@@ -277,6 +279,7 @@ fn update_task_fields_reassigns_caldav_calendar() {
         tag_uids: None,
         alarms: None,
         geofence: None,
+        parent_id: None,
     };
     assert!(update_task_fields(&db_path, caldav_task, &edit, NOW).unwrap());
     assert!(update_task_fields(&db_path, local_task, &edit, NOW).unwrap());
@@ -333,6 +336,7 @@ fn update_task_fields_empty_caldav_uuid_is_noop() {
         tag_uids: None,
         alarms: None,
         geofence: None,
+        parent_id: None,
     };
     assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
 
@@ -497,6 +501,59 @@ fn update_task_fields_replaces_alarms() {
         )
         .unwrap();
     assert_eq!(n, 0);
+}
+
+#[test]
+fn update_task_fields_reassigns_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, b) = seed_two_tasks(&db_path);
+
+    let edit = TaskEdit {
+        parent_id: Some(b),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let parent: i64 = db
+        .connection()
+        .query_row("SELECT parent FROM tasks WHERE _id = ?1", params![a], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(parent, b);
+    drop(db);
+
+    // Promote back to top-level.
+    let edit = TaskEdit {
+        parent_id: Some(0),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW + 1).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let parent: i64 = db
+        .connection()
+        .query_row("SELECT parent FROM tasks WHERE _id = ?1", params![a], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(parent, 0);
+
+    // Self-parent coerces to 0.
+    let edit = TaskEdit {
+        parent_id: Some(a),
+        ..edit_default("A", "")
+    };
+    assert!(update_task_fields(&db_path, a, &edit, NOW + 2).unwrap());
+    let db = Database::open_read_only(&db_path).unwrap();
+    let parent: i64 = db
+        .connection()
+        .query_row("SELECT parent FROM tasks WHERE _id = ?1", params![a], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(parent, 0, "self-parent must not persist");
 }
 
 #[test]

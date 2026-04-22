@@ -56,6 +56,7 @@ Dialog {
     property string initialPlaceUid: ""
     property bool initialPlaceArrival: false
     property bool initialPlaceDeparture: false
+    property var initialParentId: 0
 
     // Called by TaskDetailPane right before `open()`. Resets the
     // form controls to the incoming values and clears any stale
@@ -112,6 +113,17 @@ Dialog {
         }
         arrivalBox.checked = initialPlaceArrival;
         departureBox.checked = initialPlaceDeparture;
+
+        // Parent picker: index 0 = "(none)", 1..N map onto
+        // vm.parentCandidateIds[i-1].
+        if (vm) {
+            // parentCandidateIds is a QList<i64>; QML's indexOf
+            // works on it because it quacks like an Array.
+            const pi = vm.parentCandidateIds.indexOf(initialParentId);
+            parentBox.currentIndex = pi >= 0 ? pi + 1 : 0;
+        } else {
+            parentBox.currentIndex = 0;
+        }
 
         validation.text = "";
     }
@@ -218,6 +230,25 @@ Dialog {
                 // Index → tasks_core::models::Priority integer:
                 //   0 = HIGH, 1 = MEDIUM, 2 = LOW, 3 = NONE
                 model: [qsTr("High"), qsTr("Medium"), qsTr("Low"), qsTr("None")]
+            }
+
+            Label {
+                text: qsTr("Parent task")
+                opacity: 0.7
+            }
+            ComboBox {
+                id: parentBox
+                Layout.fillWidth: true
+                // Index 0 = top-level (no parent); 1..N map onto
+                // parentCandidateIds.
+                model: {
+                    const labels = dialog.vm ? dialog.vm.parentCandidateLabels : [];
+                    const out = [qsTr("(none — top-level)")];
+                    for (let i = 0; i < labels.length; i++) {
+                        out.push(labels[i] || qsTr("(untitled task)"));
+                    }
+                    return out;
+                }
             }
 
             Label {
@@ -431,6 +462,13 @@ Dialog {
         if (placeBox.currentIndex > 0 && vm) {
             placeUid = vm.placeUids[placeBox.currentIndex - 1];
         }
+        // Map the parent picker back to a task id. Index 0 = top-
+        // level (id 0). The vm.parentCandidateIds array drops the
+        // self-task, so any non-zero index is a valid other task.
+        let parentId = 0;
+        if (parentBox.currentIndex > 0 && vm) {
+            parentId = vm.parentCandidateIds[parentBox.currentIndex - 1];
+        }
         vm.updateSelectedTask(
             titleField.text,
             notesField.text,
@@ -443,7 +481,8 @@ Dialog {
             alarmTypes,
             placeUid,
             arrivalBox.checked,
-            departureBox.checked
+            departureBox.checked,
+            parentId
         );
     }
 }

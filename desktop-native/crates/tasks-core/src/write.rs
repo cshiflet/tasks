@@ -125,6 +125,14 @@ pub struct TaskEdit<'a> {
     /// is effectively 1:1 task-to-geofence even though the schema
     /// allows multiple.
     pub geofence: Option<GeofenceEdit<'a>>,
+    /// New value for `tasks.parent`. `None` leaves it alone;
+    /// `Some(0)` promotes the task to top-level; `Some(id)`
+    /// re-parents it under another task. Cycle prevention (e.g.
+    /// picking a descendant as parent) is *not* enforced here —
+    /// caller is expected to exclude invalid candidates from the
+    /// picker. A cycle won't corrupt the DB, but the recursive
+    /// tasklist query will render it oddly.
+    pub parent_id: Option<i64>,
 }
 
 /// Bundle carrying the three geofence-edit fields together so
@@ -281,6 +289,17 @@ pub fn update_task_fields(
 
     if let Some(geofence) = edit.geofence {
         replace_task_geofence(&tx, task_id, geofence)?;
+    }
+
+    if let Some(parent_id) = edit.parent_id {
+        // Guard against an obvious cycle: a task can't be its own
+        // parent. Other cycles (A → B → A) are the caller's
+        // problem; see the TaskEdit docs.
+        let sanitized = if parent_id == task_id { 0 } else { parent_id };
+        tx.execute(
+            "UPDATE tasks SET parent = ?1 WHERE _id = ?2",
+            params![sanitized, task_id],
+        )?;
     }
 
     if let Some(uuid) = edit.caldav_calendar_uuid {

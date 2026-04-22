@@ -108,6 +108,8 @@ Pane {
                         root.vm.selectedPlaceArrival;
                     editDialog.initialPlaceDeparture =
                         root.vm.selectedPlaceDeparture;
+                    editDialog.initialParentId =
+                        root.vm.selectedParentId;
                     editDialog.loadFromSelection();
                     editDialog.open();
                 }

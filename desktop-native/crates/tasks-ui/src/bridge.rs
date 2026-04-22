@@ -101,6 +101,14 @@ pub mod qobject {
         #[qproperty(QString, selected_place_uid)]
         #[qproperty(bool, selected_place_arrival)]
         #[qproperty(bool, selected_place_departure)]
+        // Candidate parents for the subtask picker. Labels are
+        // task titles, IDs are tasks._id. Populated on open and
+        // refreshed on every select_task so newly-added tasks
+        // show up in the dropdown.
+        #[qproperty(QStringList, parent_candidate_labels)]
+        #[qproperty(QList_i64, parent_candidate_ids)]
+        // Current parent task id for the selected row (0 = top-level).
+        #[qproperty(i64, selected_parent_id)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -160,6 +168,7 @@ pub mod qobject {
             place_uid: QString,
             place_arrival: bool,
             place_departure: bool,
+            parent_id: i64,
         );
     }
 
@@ -220,6 +229,9 @@ pub struct TaskListViewModelRust {
     selected_place_uid: QString,
     selected_place_arrival: bool,
     selected_place_departure: bool,
+    parent_candidate_labels: QStringList,
+    parent_candidate_ids: QList<i64>,
+    selected_parent_id: i64,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -274,6 +286,9 @@ impl Default for TaskListViewModelRust {
             selected_place_uid: QString::default(),
             selected_place_arrival: false,
             selected_place_departure: false,
+            parent_candidate_labels: QStringList::default(),
+            parent_candidate_ids: QList::default(),
+            selected_parent_id: 0,
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
@@ -520,6 +535,22 @@ impl qobject::TaskListViewModel {
             .set_selected_place_uid(QString::from(&place_uid));
         self.as_mut().set_selected_place_arrival(arrival);
         self.as_mut().set_selected_place_departure(departure);
+
+        // Parent picker candidates + current parent.
+        let (parent_labels, parent_ids) = match &self.db {
+            Some(db) => list_parent_candidates(db, task.id),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.as_mut()
+            .set_parent_candidate_labels(string_list_from_iter(
+                parent_labels.iter().map(String::as_str),
+            ));
+        let mut ql_parent_ids: QList<i64> = QList::default();
+        for pid in &parent_ids {
+            ql_parent_ids.append(*pid);
+        }
+        self.as_mut().set_parent_candidate_ids(ql_parent_ids);
+        self.as_mut().set_selected_parent_id(task.parent);
     }
 
     /// Apply edits from the task edit dialog and refresh the view.
@@ -542,6 +573,7 @@ impl qobject::TaskListViewModel {
         place_uid: QString,
         place_arrival: bool,
         place_departure: bool,
+        parent_id: i64,
     ) {
         let id = self.selected_id;
         if id <= 0 {
@@ -613,6 +645,7 @@ impl qobject::TaskListViewModel {
                 arrival: place_arrival,
                 departure: place_departure,
             }),
+            parent_id: Some(parent_id),
         };
         match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
             Ok(true) => {
@@ -851,6 +884,34 @@ fn list_all_tags(db: &Database) -> (Vec<String>, Vec<String>) {
         }
     }
     (labels, uids)
+}
+
+/// Return parallel `(labels, ids)` for every non-deleted task,
+/// excluding `exclude_id` (the task currently being edited, so the
+/// picker never offers the task itself as its own parent). Sorted
+/// by title for a predictable dropdown.
+fn list_parent_candidates(db: &Database, exclude_id: i64) -> (Vec<String>, Vec<i64>) {
+    let mut labels = Vec::new();
+    let mut ids = Vec::new();
+    let Ok(mut stmt) = db.connection().prepare(
+        "SELECT _id, title FROM tasks \
+         WHERE deleted = 0 AND _id != ?1 \
+         ORDER BY COALESCE(UPPER(title), ''), _id",
+    ) else {
+        return (labels, ids);
+    };
+    let rows = stmt.query_map([exclude_id], |r| {
+        let id: i64 = r.get(0)?;
+        let title: Option<String> = r.get(1)?;
+        Ok((id, title.unwrap_or_default()))
+    });
+    if let Ok(rows) = rows {
+        for (id, title) in rows.flatten() {
+            ids.push(id);
+            labels.push(title);
+        }
+    }
+    (labels, ids)
 }
 
 /// Return parallel `(labels, uids)` for every row in `places`.
@@ -1140,4 +1201,8 @@ fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     vm.as_mut().set_selected_place_uid(QString::default());
     vm.as_mut().set_selected_place_arrival(false);
     vm.as_mut().set_selected_place_departure(false);
+    vm.as_mut()
+        .set_parent_candidate_labels(QStringList::default());
+    vm.as_mut().set_parent_candidate_ids(QList::default());
+    vm.as_mut().set_selected_parent_id(0);
 }
