@@ -571,11 +571,20 @@ Dialog {
                     }
                 }
 
+                // Only show when the incoming rule actually carries
+                // a COUNT or UNTIL that this editor would silently
+                // strip on save. Generic handwave caption is worse
+                // than no caption at all when there's nothing to
+                // lose.
                 Label {
                     visible: freqBox.currentIndex > 0
-                    text: qsTr("(COUNT/UNTIL rules from Android are dropped on save)")
-                    opacity: 0.5
+                             && /(^|;)(COUNT|UNTIL)=/.test(
+                                 dialog.initialRecurrenceRaw)
+                    text: qsTr("Note: saving will drop the COUNT / UNTIL on the existing rule.")
+                    color: Qt.darker("red", 0.8)
+                    opacity: 0.8
                     font.pointSize: Qt.application.font.pointSize - 1
+                    wrapMode: Text.Wrap
                 }
             }
         }

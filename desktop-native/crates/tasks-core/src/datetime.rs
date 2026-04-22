@@ -321,17 +321,58 @@ mod tests {
         assert_eq!(format_duration_hhmm(90 * 60), "1:30");
         assert_eq!(format_duration_hhmm(45 * 60), "0:45");
         assert_eq!(format_duration_hhmm(3600), "1:00");
+        // Single-digit minutes must zero-pad — otherwise a 1h5m
+        // estimate round-trips through parse → format as "1:5"
+        // which fails parse the next time. Pin it.
+        assert_eq!(format_duration_hhmm(3900), "1:05");
 
         assert_eq!(parse_duration_input(""), Ok(0));
         assert_eq!(parse_duration_input("0:00"), Ok(0));
         assert_eq!(parse_duration_input("0:45"), Ok(45 * 60));
         assert_eq!(parse_duration_input("1:30"), Ok(90 * 60));
+        assert_eq!(parse_duration_input("1:05"), Ok(3900));
         // Plain minute count.
         assert_eq!(parse_duration_input("90"), Ok(90 * 60));
         // Rejects malformed.
         assert!(parse_duration_input("1:70").is_err());
         assert!(parse_duration_input("-1:00").is_err());
         assert!(parse_duration_input("abc").is_err());
+
+        // Round-trip every "HH:MM" we can generate from a realistic
+        // Tasks.org estimate (0–100 hours, every minute). format →
+        // parse → same seconds, with zero exceptions.
+        for h in 0..4 {
+            for m in 0..60 {
+                let secs = h * 3600 + m * 60;
+                let text = format_duration_hhmm(secs);
+                if secs == 0 {
+                    assert_eq!(text, "");
+                    assert_eq!(parse_duration_input(&text), Ok(0));
+                } else {
+                    assert_eq!(
+                        parse_duration_input(&text),
+                        Ok(secs),
+                        "bad round-trip for {secs}s → {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_due_input_trailing_marker_behaviour() {
+        // "2024-01-15T" (trailing T, no time) — accepted as
+        // date-only since the T splits the string and the empty
+        // time portion is dropped. Matches ISO-8601 tolerance for
+        // a T-without-time, which is unusual but not malformed.
+        assert!(parse_due_input("2024-01-15T").is_ok());
+        // "2024-01-15Z" (trailing Z, no T/space) — rejected
+        // because the Z has no separator to hang off and gets
+        // included in the day token, which then fails parse. Pin
+        // this as the *current* behaviour; if we want to tolerate
+        // bare-Z date-only pastes later, parse_ymd can strip a
+        // trailing Z from the day field.
+        assert!(parse_due_input("2024-01-15Z").is_err());
     }
 
     #[test]

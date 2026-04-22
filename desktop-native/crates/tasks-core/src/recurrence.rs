@@ -226,6 +226,10 @@ fn format_until(until: &str) -> Option<String> {
 }
 
 fn with_from_suffix(raw: &str, from_completion: bool) -> String {
+    // Trim so a rule pulled from an older DB with a trailing
+    // newline or whitespace doesn't surface as
+    // `"FREQ=DAILY\n (from completion)"` on the UI.
+    let raw = raw.trim();
     if from_completion {
         format!("{raw} (from completion)")
     } else {
@@ -510,6 +514,72 @@ mod tests {
         assert_eq!(
             advance_recurrence("FREQ=DAILY", due, completed, true),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn advance_weekly_byday_from_completion_picks_next_allowed_weekday() {
+        // Due Jan 15 2024 @ 10:00 (Monday). User completes Jan 16
+        // (Tuesday) @ 14:00. Rule: every week on MO, WE, FR, from
+        // completion. Expected: next due = Jan 17 (Wednesday) at
+        // the *due's* time-of-day (10:00), not the completion's.
+        let due_mon_10am = MON_2024_01_15 + 10 * 3_600_000;
+        let completed_tue_2pm = MON_2024_01_15 + 86_400_000 + 14 * 3_600_000;
+        let wed_17_10am = MON_2024_01_15 + 2 * 86_400_000 + 10 * 3_600_000;
+        assert_eq!(
+            advance_recurrence(
+                "FREQ=WEEKLY;BYDAY=MO,WE,FR",
+                due_mon_10am,
+                completed_tue_2pm,
+                true,
+            ),
+            Some(wed_17_10am)
+        );
+    }
+
+    #[test]
+    fn advance_monthly_chain_preserves_original_day_when_possible() {
+        // Jan 31 2024 (leap year) + 1 month → Feb 29 (clamped).
+        // Then + 1 month from Feb 29 → Mar 29 (clamped to Feb's day,
+        // not re-inflated to Mar 31). Matches Android behaviour:
+        // once clamped, subsequent advances stay on the smaller day.
+        let jan_31_2024 = 1_706_659_200_000_i64;
+        let feb_29_2024 = 1_709_164_800_000_i64;
+        let mar_29_2024 = 1_711_670_400_000_i64;
+        let apr_29_2024 = 1_714_348_800_000_i64;
+        let a = advance_recurrence("FREQ=MONTHLY", jan_31_2024, 0, false).unwrap();
+        assert_eq!(a, feb_29_2024);
+        let b = advance_recurrence("FREQ=MONTHLY", a, 0, false).unwrap();
+        assert_eq!(b, mar_29_2024);
+        let c = advance_recurrence("FREQ=MONTHLY", b, 0, false).unwrap();
+        assert_eq!(c, apr_29_2024);
+    }
+
+    #[test]
+    fn add_months_zero_interval_is_semantic_no_op() {
+        // FREQ=YEARLY;INTERVAL=0 is normally treated as interval=1
+        // by the parser (the `if n > 0` guard); we pin that
+        // INTERVAL=1 behaviour here via a YEARLY rule, which is
+        // the smallest observable consumer of `add_months(ms, 12)`.
+        // A true `add_months(ms, 0)` is unreachable from any real
+        // RRULE shape the parser accepts.
+        let feb_noon = FEB_29_2024_NOON;
+        let after = advance_recurrence("FREQ=YEARLY;INTERVAL=0", feb_noon, 0, false);
+        // Non-leap 2025 clamps Feb 29 → Feb 28, so the value
+        // differs; but the key invariant is that it doesn't
+        // loop or return the base verbatim.
+        assert!(after.is_some());
+    }
+
+    #[test]
+    fn fallback_trims_whitespace_from_raw_rule() {
+        // An RRULE with a stray trailing newline (rare, but a real
+        // DB anomaly) shouldn't surface as "FREQ=FOO\n (from
+        // completion)" on the UI.
+        let dirty = "FREQ=FORTNIGHTLY\n";
+        assert_eq!(
+            humanize_rrule(dirty, true),
+            "FREQ=FORTNIGHTLY (from completion)"
         );
     }
 

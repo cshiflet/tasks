@@ -38,9 +38,13 @@ fn edit_default<'a>(title: &'a str, notes: &'a str) -> TaskEdit<'a> {
 }
 
 fn seed_two_tasks(db_path: &std::path::Path) -> (i64, i64) {
-    // The importer does full row INSERTs; here we shortcut with the
-    // minimum column set the completion/delete helpers care about.
-    // The Room schema has NOT NULL defaults on everything else.
+    // Insert the full set of NOT NULL columns explicitly. The Room
+    // schema only supplies `DEFAULT 0` for `repeat_from` and
+    // `read_only`; every other NOT NULL column (importance, dueDate,
+    // hideUntil, created, modified, completed, deleted, the timer
+    // trio, notification flags, lastNotified, collapsed, parent)
+    // has to be provided by the caller or SQLite will reject the
+    // INSERT.
     let conn = rusqlite::Connection::open(db_path).unwrap();
     conn.execute(
         "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
@@ -822,6 +826,180 @@ fn delete_cascades_to_dependent_rows() {
         .unwrap();
     assert_eq!(orphan_tags, 0);
     assert_eq!(orphan_alarms, 0);
+}
+
+#[test]
+fn full_edit_round_trip_persists_every_field() {
+    // Integration test: start from a fresh create_task, mutate
+    // every TaskEdit field we expose in the dialog, save, then
+    // re-read and verify each field round-tripped. This is the
+    // single biggest "did I wire the column through end-to-end"
+    // test — catches a Q_PROPERTY that's populated on select_task
+    // but not written in update_task_fields, and vice versa.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+
+    // Seed a calendar + a place + two tagdata rows + two pre-existing
+    // tasks so parent and CalDAV assignments have real targets.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO caldav_lists \
+             (cdl_account, cdl_uuid, cdl_name, cdl_color, cdl_order, \
+              cdl_access, cdl_last_sync) \
+             VALUES ('acc', 'cal-1', 'Work', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO places (uid, name, latitude, longitude, \
+              place_color, place_order, radius) \
+             VALUES ('place-home', 'Home', 0.0, 0.0, 0, 0, 250)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tagdata (remoteId, name, color, td_order) \
+             VALUES ('tag-a', 'Alpha', 0, 0), ('tag-b', 'Beta', 0, 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let parent_id = create_task(&db_path, "Parent", NOW, None).unwrap();
+    let target_id = create_task(&db_path, "Target", NOW, Some("cal-1")).unwrap();
+
+    let wanted_tags = vec!["tag-a".to_string(), "tag-b".to_string()];
+    let wanted_alarms: Vec<(i64, i32)> = vec![
+        (-30 * 60 * 1000, 2),   // 30 min before due, REL_END
+        (1_700_000_000_000, 0), // absolute DATE_TIME
+    ];
+    let edit = TaskEdit {
+        title: "Edited title",
+        notes: "Edited notes",
+        due_ms: 1_705_276_800_000,
+        hide_until_ms: 1_705_190_400_000,
+        priority: 1,
+        caldav_calendar_uuid: Some("cal-1"),
+        tag_uids: Some(&wanted_tags),
+        alarms: Some(&wanted_alarms),
+        geofence: Some(GeofenceEdit {
+            place_uid: "place-home",
+            arrival: true,
+            departure: true,
+        }),
+        parent_id: Some(parent_id),
+        estimated_seconds: 3600,
+        elapsed_seconds: 1800,
+        recurrence: "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE,FR",
+        repeat_from: 1,
+    };
+    assert!(update_task_fields(&db_path, target_id, &edit, NOW + 1000).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let conn = db.connection();
+
+    // Scalar columns.
+    let (
+        title,
+        notes,
+        due,
+        hide,
+        priority,
+        estimated,
+        elapsed,
+        recurrence,
+        repeat_from,
+        parent,
+        modified,
+    ): (
+        String,
+        String,
+        i64,
+        i64,
+        i32,
+        i32,
+        i32,
+        String,
+        i32,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT title, notes, dueDate, hideUntil, importance, \
+              estimatedSeconds, elapsedSeconds, recurrence, \
+              repeat_from, parent, modified \
+             FROM tasks WHERE _id = ?1",
+            params![target_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(title, "Edited title");
+    assert_eq!(notes, "Edited notes");
+    assert_eq!(due, 1_705_276_800_000);
+    assert_eq!(hide, 1_705_190_400_000);
+    assert_eq!(priority, 1);
+    assert_eq!(estimated, 3600);
+    assert_eq!(elapsed, 1800);
+    assert_eq!(recurrence, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE,FR");
+    assert_eq!(repeat_from, 1);
+    assert_eq!(parent, parent_id);
+    assert_eq!(modified, NOW + 1000);
+
+    // Relation tables.
+    let cal: String = conn
+        .query_row(
+            "SELECT cd_calendar FROM caldav_tasks WHERE cd_task = ?1",
+            params![target_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cal, "cal-1");
+
+    let mut stmt = conn
+        .prepare("SELECT tag_uid FROM tags WHERE task = ?1 ORDER BY tag_uid")
+        .unwrap();
+    let tag_uids: Vec<String> = stmt
+        .query_map(params![target_id], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(tag_uids, vec!["tag-a".to_string(), "tag-b".to_string()]);
+
+    let mut stmt = conn
+        .prepare("SELECT time, type FROM alarms WHERE task = ?1 ORDER BY time")
+        .unwrap();
+    let alarms: Vec<(i64, i32)> = stmt
+        .query_map(params![target_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(alarms, wanted_alarms);
+
+    let (place, arrival, departure): (String, i32, i32) = conn
+        .query_row(
+            "SELECT place, arrival, departure FROM geofences WHERE task = ?1",
+            params![target_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(place, "place-home");
+    assert_eq!(arrival, 1);
+    assert_eq!(departure, 1);
 }
 
 #[test]
