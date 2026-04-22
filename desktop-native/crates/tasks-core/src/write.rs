@@ -83,6 +83,61 @@ pub fn set_task_deleted(path: &Path, task_id: i64, now_ms: i64) -> Result<bool> 
     Ok(rows > 0)
 }
 
+/// Create a new task with the given title.
+///
+/// `caldav_calendar_uuid` optionally assigns the new task to a
+/// CalDAV list; when non-empty, a fresh `caldav_tasks` row is
+/// minted with a new UUID as `cd_remote_id` so the task is
+/// syncable from first save.
+///
+/// Returns the new `tasks._id`. Caller can immediately select the
+/// row in the UI for editing.
+pub fn create_task(
+    path: &Path,
+    title: &str,
+    now_ms: i64,
+    caldav_calendar_uuid: Option<&str>,
+) -> Result<i64> {
+    let mut conn = open_rw(path)?;
+    let tx = conn.transaction()?;
+
+    let task_remote_id = uuid::Uuid::new_v4().to_string();
+    let title_arg: Option<&str> = if title.is_empty() { None } else { Some(title) };
+
+    // Minimum-viable row: same defaults the JSON importer sets for
+    // a brand-new task with no metadata. Priority = 3 (NONE),
+    // everything else zero, collapsed/read_only false.
+    tx.execute(
+        "INSERT INTO tasks \
+         (title, importance, dueDate, hideUntil, created, modified, \
+          completed, deleted, estimatedSeconds, elapsedSeconds, \
+          timerStart, notificationFlags, lastNotified, repeat_from, \
+          collapsed, parent, read_only, remoteId) \
+         VALUES (?1, 3, 0, 0, ?2, ?2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?3)",
+        params![title_arg, now_ms, task_remote_id],
+    )?;
+    let task_id = tx.last_insert_rowid();
+
+    if let Some(uuid) = caldav_calendar_uuid {
+        if !uuid.is_empty() {
+            // Mint a fresh cd_remote_id so downstream CalDAV sync
+            // has a stable object URL. Tasks.org's Android flow
+            // does the same — see CaldavTaskUpdater.
+            let object_uid = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO caldav_tasks \
+                 (cd_task, cd_calendar, cd_remote_id, cd_last_sync, \
+                  cd_deleted, gt_moved, gt_remote_order) \
+                 VALUES (?1, ?2, ?3, 0, 0, 0, 0)",
+                params![task_id, uuid, object_uid],
+            )?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(task_id)
+}
+
 /// Value bundle for [`update_task_fields`]. Fields match the
 /// Android `Task` entity columns the edit dialog exposes.
 #[derive(Debug, Clone)]

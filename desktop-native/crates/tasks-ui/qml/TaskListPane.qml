@@ -25,6 +25,39 @@ Pane {
             opacity: 0.7
         }
 
+        // Quick-add row. Enter-to-submit creates a new task under
+        // the currently-active filter (CalDAV list if selected,
+        // otherwise local).
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.leftMargin: 8
+            Layout.rightMargin: 8
+            Layout.bottomMargin: 4
+            spacing: 8
+
+            TextField {
+                id: quickAdd
+                Layout.fillWidth: true
+                placeholderText: qsTr("Add a task… (press Enter to create)")
+                onAccepted: {
+                    if (root.vm && text.trim().length > 0) {
+                        root.vm.addNewTask(text);
+                        text = "";
+                    }
+                }
+            }
+            Button {
+                text: qsTr("Add")
+                enabled: quickAdd.text.trim().length > 0
+                onClicked: {
+                    if (root.vm) {
+                        root.vm.addNewTask(quickAdd.text);
+                        quickAdd.text = "";
+                    }
+                }
+            }
+        }
+
         ListView {
             id: list
             Layout.fillWidth: true

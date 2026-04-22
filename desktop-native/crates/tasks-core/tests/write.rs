@@ -9,7 +9,7 @@
 use rusqlite::params;
 use tasks_core::db::Database;
 use tasks_core::write::{
-    set_task_completion, set_task_deleted, update_task_fields, GeofenceEdit, TaskEdit,
+    create_task, set_task_completion, set_task_deleted, update_task_fields, GeofenceEdit, TaskEdit,
 };
 
 const NOW: i64 = 1_700_000_000_000;
@@ -63,6 +63,54 @@ fn seed_two_tasks(db_path: &std::path::Path) -> (i64, i64) {
     .unwrap();
     let b = conn.last_insert_rowid();
     (a, b)
+}
+
+#[test]
+fn create_task_mints_remote_id_and_optional_caldav_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+
+    // Local-only task: no caldav_tasks row, but tasks.remoteId is
+    // stamped with a fresh UUID.
+    let local_id = create_task(&db_path, "Buy milk", NOW, None).unwrap();
+    assert!(local_id > 0);
+    let db = Database::open_read_only(&db_path).unwrap();
+    let (title, remote_id): (String, String) = db
+        .connection()
+        .query_row(
+            "SELECT title, remoteId FROM tasks WHERE _id = ?1",
+            params![local_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "Buy milk");
+    assert_eq!(remote_id.len(), 36, "UUID v4 is 36 chars with hyphens");
+    let caldav_count: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM caldav_tasks WHERE cd_task = ?1",
+            params![local_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(caldav_count, 0, "no caldav_tasks row for a local task");
+    drop(db);
+
+    // With a CalDAV UUID, a caldav_tasks row is minted too.
+    let synced_id = create_task(&db_path, "Ship Q2", NOW + 1, Some("cal-work")).unwrap();
+    let db = Database::open_read_only(&db_path).unwrap();
+    let (cal, cd_remote_id): (String, String) = db
+        .connection()
+        .query_row(
+            "SELECT cd_calendar, cd_remote_id FROM caldav_tasks \
+             WHERE cd_task = ?1",
+            params![synced_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(cal, "cal-work");
+    assert_eq!(cd_remote_id.len(), 36);
 }
 
 #[test]

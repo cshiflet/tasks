@@ -149,6 +149,12 @@ pub mod qobject {
         #[qinvokable]
         fn select_task(self: Pin<&mut TaskListViewModel>, id: i64);
 
+        /// Create a brand-new task with the given title. If the
+        /// active filter is a CalDAV list, the new task is
+        /// assigned to that list automatically.
+        #[qinvokable]
+        fn add_new_task(self: Pin<&mut TaskListViewModel>, title: QString);
+
         #[qinvokable]
         fn toggle_task_completion(self: Pin<&mut TaskListViewModel>, id: i64, completed: bool);
 
@@ -417,6 +423,43 @@ impl qobject::TaskListViewModel {
     pub fn select_filter(mut self: Pin<&mut Self>, id: QString) {
         self.as_mut().set_active_filter_id(id);
         self.as_mut().reload_active_filter();
+    }
+
+    /// Create a new task in the open DB with `title`. If the user
+    /// is currently viewing a CalDAV-scoped filter
+    /// (`caldav:<uuid>`), the new task is stamped into that list;
+    /// otherwise it lands as a local task. After creation we
+    /// reload the active filter and select the new row so the
+    /// user sees it land and can immediately flesh it out via
+    /// Edit….
+    pub fn add_new_task(mut self: Pin<&mut Self>, title: QString) {
+        let title_str = title.to_string();
+        let title_trim = title_str.trim();
+        if title_trim.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Empty task title — nothing created."));
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't create."));
+            return;
+        };
+        let active = self.active_filter_id.to_string();
+        let caldav_uuid = active.strip_prefix("caldav:");
+        match tasks_core::create_task(&path, title_trim, now_ms(), caldav_uuid) {
+            Ok(new_id) => {
+                self.as_mut().reload_active_filter();
+                self.as_mut().select_task(new_id);
+                self.as_mut()
+                    .set_status(QString::from(&format!("Created \"{title_trim}\"")));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't create task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
     }
 
     /// Mark task `id` as completed (or restore it to active when

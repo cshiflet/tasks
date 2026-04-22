@@ -22,6 +22,10 @@ tracing = { workspace = true }
 #  ~/Library/Application Support/tasks-desktop/ on macOS,
 #  %APPDATA%\tasks-desktop\ on Windows).
 dirs = "5"
+# New-task creation + any path that mints CalDAV UIDs locally needs
+# stable UUID v4 generation. Matches the shape Android's Task.remoteId
+# / caldav_tasks.cd_remote_id carry.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 # Used by build.rs to parse data/schemas/.../<v>.json and emit the

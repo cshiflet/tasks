@@ -33,5 +33,5 @@ pub use models::{
 };
 pub use recurrence::humanize_rrule;
 pub use write::{
-    set_task_completion, set_task_deleted, update_task_fields, GeofenceEdit, TaskEdit,
+    create_task, set_task_completion, set_task_deleted, update_task_fields, GeofenceEdit, TaskEdit,
 };
