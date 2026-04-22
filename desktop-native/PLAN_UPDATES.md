@@ -458,3 +458,74 @@ Five material updates to the plan itself:
    second review caught the UTC-midnight Today-window bug; the fix
    is on the branch. Any future filter that derives a time window
    from "now" must take a local-offset parameter from the caller.
+
+## 8. Milestone 2 shipped (writes, full edit dialog, add/edit/delete,
+     preferences, advance-on-complete, humaniser polish)
+
+Every line item under the Milestone-2-writes bullet list is either
+landed or explicitly deferred with rationale. Shipped across Phases
+A–C plus the post-review polish:
+
+- **Phase A** — click-to-complete + soft-delete. `tasks_core::write`
+  opens a short-lived read-write SQLite connection per write so the
+  GUI's read-only handle stays intact.
+- **Phase B** — task edit dialog (title / notes / due / priority /
+  hide-until). `tasks_core::datetime` centralised the
+  `YYYY-MM-DD [HH:MM]` ↔ epoch-ms round-trip with leap-aware day
+  validation.
+- **Phase C1–C8** — CalDAV list picker, tags multi-select,
+  reminders (REL_END add + list + remove), location / geofence,
+  parent task ComboBox, timer (estimate + elapsed) fields, and an
+  inline recurrence editor (FREQ / INTERVAL / BYDAY / from-due-vs-
+  completion). Per-task colour confirmed as not-in-schema; Android
+  inherits it from the CalDAV list or tags.
+- **Post-review round** — four parallel audits surfaced a handful
+  of MAJORs (silenced tag-lookup errors, missing
+  day-in-month rejection, stale catalog arrays after DB-open
+  failure, QML array-bounds hygiene) — all fixed on branch.
+  Three high-priority test-coverage gaps closed (cascade delete,
+  unchanged-alarm preservation, parent cycle self-coercion).
+- **Add-new-task + preferences** — `create_task` mints a task with
+  a fresh UUID v4 as `tasks.remoteId` and, when the active filter
+  is a CalDAV list, creates a `caldav_tasks` row with its own
+  distinct UID. Preferences dialog binds to the existing
+  `QueryPreferences` struct and reloads the filter on save.
+- **Advance-on-complete** — completing a recurring task now slides
+  `dueDate` forward by the rule's interval (FREQ / INTERVAL /
+  BYDAY for WEEKLY; month-length clamping for MONTHLY / YEARLY)
+  instead of stamping `completed`. Matches Android parity for the
+  rule subset the desktop editor can construct.
+- **RRULE humaniser polish** — positional BYDAY now reads as
+  "last Friday", "first Monday"; BYMONTHDAY renders as
+  "the 1st, 15th, last day" with teen-aware ordinal suffixes.
+
+Deferred to later milestones (explicit):
+
+- **Bulk-complete / undo-redo** — not in Phase C1–C8. A proper
+  undo stack pairs naturally with the QAbstractListModel
+  migration (Milestone 6, per roadmap).
+- **QSettings persistence for preferences** — session-local for
+  now. The Q_PROPERTY shape is ready for a persistence pass; just
+  needs the on-save hook and an init at startup.
+- **COUNT / UNTIL editing in the recurrence picker** — parsed
+  but not editable; documented in the dialog footer.
+
+## 9. Sync scaffolding (Milestones 3/4/5)
+
+The `tasks-sync` crate skeleton lands on this branch with a
+`Provider` trait, the shared value types (`AccountCredentials`,
+`RemoteCalendar`, `RemoteTask`, `SyncError`), and stub provider
+implementations for CalDAV, Google Tasks, Microsoft To Do, and
+EteSync. Every network method returns
+`SyncError::NotYetImplemented` so the UI can start speaking the
+trait today while the individual providers fill in one at a time.
+
+This is a deliberate architectural seam: the UI talks
+`Box<dyn Provider>`, never provider-specific types, so the four
+backends can land in any order and co-exist on one desktop
+install without UI churn.
+
+Per-provider dependency sets stay out of the crate's `Cargo.toml`
+for now (no `reqwest`, `oauth2`, `quick-xml`, or `libetebase-rs`
+yet). Those arrive with the first actual network commit per
+provider so the skeleton build stays fast.
