@@ -113,6 +113,10 @@ Milestone 2 (writes):
 - [ ] Recurrence editor (FREQ / BYDAY picker, from-due vs from-
       completion toggle)
 - [ ] Add-new-task, bulk complete, undo/redo
+- *Per-task color — **not applicable**: the Room schema at v92 has
+  no `tasks.color` column. Android renders row color from the
+  owning CalDAV list (`cdl_color`) or tags (`tagdata.color`), both
+  of which are edited in their own flows.*
 - [ ] `QAbstractListModel` with per-row roles (scaffolding committed
       in `cxx/task_list_model_base.h`; bridge/QML wiring pending)
 - [ ] User-editable preferences panel (sort mode / grouping /
