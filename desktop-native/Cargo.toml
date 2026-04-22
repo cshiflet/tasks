@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/tasks-core",
+    "crates/tasks-sync",
     "crates/tasks-ui",
 ]
 

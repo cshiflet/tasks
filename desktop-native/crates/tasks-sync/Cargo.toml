@@ -1,0 +1,26 @@
+[package]
+name = "tasks-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sync providers (CalDAV, Google Tasks, Microsoft To Do, EteSync) for the Tasks.org native desktop client."
+
+[dependencies]
+# Async runtime + trait — every provider's I/O is async (HTTP,
+# Etebase's own blocking-but-wrapped API).
+async-trait = "0.1"
+# Error plumbing shared with tasks-core.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Shared data shapes (Task, CaldavCalendar, …). The sync crate
+# translates remote payloads into these.
+tasks-core = { path = "../tasks-core" }
+
+# Additional per-provider deps (reqwest, tokio, quick-xml, oauth2,
+# libetebase-rs, …) will land when the individual provider
+# skeletons gain actual network code. Keeping the skeleton dep
+# set minimal so the crate compiles cleanly today.
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
