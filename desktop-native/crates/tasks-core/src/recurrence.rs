@@ -39,6 +39,7 @@ pub fn humanize_rrule(rrule: &str, repeat_from_completion: bool) -> String {
     let mut freq: Option<&str> = None;
     let mut interval: u32 = 1;
     let mut by_day: Option<&str> = None;
+    let mut by_month_day: Option<&str> = None;
     let mut until: Option<&str> = None;
     let mut count: Option<u32> = None;
 
@@ -61,9 +62,10 @@ pub fn humanize_rrule(rrule: &str, repeat_from_completion: bool) -> String {
                 }
             }
             "BYDAY" => by_day = Some(value.trim()),
+            "BYMONTHDAY" => by_month_day = Some(value.trim()),
             "UNTIL" => until = Some(value.trim()),
             "COUNT" => count = value.trim().parse::<u32>().ok(),
-            _ => {} // Ignore BYMONTHDAY / BYSETPOS / WKST / etc.
+            _ => {} // Ignore BYSETPOS / WKST / BYYEARDAY / etc.
         }
     }
 
@@ -96,6 +98,14 @@ pub fn humanize_rrule(rrule: &str, repeat_from_completion: bool) -> String {
         }
     }
 
+    if let Some(days) = by_month_day {
+        let rendered = format_by_month_day(days);
+        if !rendered.is_empty() {
+            out.push_str(" on the ");
+            out.push_str(&rendered);
+        }
+    }
+
     if let Some(n) = count {
         out.push_str(&format!(", {n} times"));
     } else if let Some(u) = until {
@@ -111,18 +121,23 @@ pub fn humanize_rrule(rrule: &str, repeat_from_completion: bool) -> String {
     out
 }
 
-/// Format BYDAY's comma-separated day codes. Positional prefixes
-/// ("-1FR" = last Friday, "1MO" = first Monday) are dropped along
-/// with any unrecognised codes — the nuance belongs in the full
-/// Android-parity port, not here.
+/// Format BYDAY's comma-separated day codes, now with positional
+/// prefix support. "MO,WE,FR" → "Mon, Wed, Fri"; "-1FR" → "last
+/// Friday"; "1MO" → "first Monday". Mixing positional and plain
+/// items works — "-1FR,MO" → "last Friday, Mon" — though Android
+/// itself rarely produces that combination.
 fn format_by_day(by_day: &str) -> String {
-    let mut names = Vec::new();
+    let mut items: Vec<String> = Vec::new();
     for raw in by_day.split(',') {
-        // Strip leading sign and digits: "-1FR" → "FR", "1MO" → "MO".
-        let trimmed = raw
-            .trim()
-            .trim_start_matches(|c: char| c == '-' || c == '+' || c.is_ascii_digit());
-        let name = match trimmed {
+        let raw = raw.trim();
+        // Split into numeric prefix (with optional sign) + two-letter
+        // weekday code.
+        let prefix_len = raw
+            .find(|c: char| c.is_ascii_alphabetic())
+            .unwrap_or(raw.len());
+        let prefix = &raw[..prefix_len];
+        let code = &raw[prefix_len..];
+        let day_name = match code {
             "MO" => "Mon",
             "TU" => "Tue",
             "WE" => "Wed",
@@ -132,9 +147,64 @@ fn format_by_day(by_day: &str) -> String {
             "SU" => "Sun",
             _ => continue,
         };
-        names.push(name);
+        if prefix.is_empty() {
+            items.push(day_name.to_string());
+        } else if let Ok(pos) = prefix.parse::<i32>() {
+            items.push(format!("{} {day_name}", ordinal_prefix(pos)));
+        } else {
+            // Unparseable prefix; fall back to the plain weekday.
+            items.push(day_name.to_string());
+        }
     }
-    names.join(", ")
+    items.join(", ")
+}
+
+/// Format BYMONTHDAY: one or more comma-separated day-of-month
+/// values (1..31, or -1 = last, -2 = second-to-last, etc.).
+fn format_by_month_day(by_month_day: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for raw in by_month_day.split(',') {
+        let raw = raw.trim();
+        if let Ok(n) = raw.parse::<i32>() {
+            if n > 0 {
+                parts.push(ordinal_day(n as u32));
+            } else if n == -1 {
+                parts.push("last day".to_string());
+            } else if n < 0 {
+                parts.push(format!("{}-to-last day", ordinal_prefix(-n - 1)));
+            }
+        }
+    }
+    parts.join(", ")
+}
+
+/// Render a positional index from RRULE (1 = first, -1 = last,
+/// 2 = second, -2 = second-to-last, …) as an English phrase.
+fn ordinal_prefix(n: i32) -> String {
+    match n {
+        1 => "first".to_string(),
+        2 => "second".to_string(),
+        3 => "third".to_string(),
+        4 => "fourth".to_string(),
+        5 => "fifth".to_string(),
+        -1 => "last".to_string(),
+        -2 => "second-to-last".to_string(),
+        -3 => "third-to-last".to_string(),
+        other if other > 0 => format!("{other}th"),
+        other => format!("{}-to-last", -other - 1),
+    }
+}
+
+/// Render a 1-based day-of-month as "1st", "2nd", "3rd", "4th", …
+fn ordinal_day(n: u32) -> String {
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 /// RRULE UNTIL is either `YYYYMMDD` (date) or `YYYYMMDDTHHMMSSZ`
@@ -498,17 +568,52 @@ mod tests {
     }
 
     #[test]
-    fn by_day_strips_positional_prefixes() {
-        // Android writes "last Friday of the month" as BYDAY=-1FR;
-        // we can't render the "last of" nuance cheaply but should at
-        // least not choke on the prefix.
+    fn by_day_renders_positional_prefixes() {
+        // "-1FR" → "last Friday", "1MO" → "first Monday".
         assert_eq!(
             humanize_rrule("FREQ=MONTHLY;BYDAY=-1FR", false),
-            "Every month on Fri"
+            "Every month on last Fri"
         );
         assert_eq!(
             humanize_rrule("FREQ=MONTHLY;BYDAY=1MO", false),
-            "Every month on Mon"
+            "Every month on first Mon"
+        );
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYDAY=2TU", false),
+            "Every month on second Tue"
+        );
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYDAY=-2SU", false),
+            "Every month on second-to-last Sun"
+        );
+    }
+
+    #[test]
+    fn by_month_day_renders_as_ordinal() {
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYMONTHDAY=1", false),
+            "Every month on the 1st"
+        );
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYMONTHDAY=15", false),
+            "Every month on the 15th"
+        );
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYMONTHDAY=1,15", false),
+            "Every month on the 1st, 15th"
+        );
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYMONTHDAY=-1", false),
+            "Every month on the last day"
+        );
+        // The teens all take "th" (11th, 12th, 13th) not "st/nd/rd".
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYMONTHDAY=11,12,13", false),
+            "Every month on the 11th, 12th, 13th"
+        );
+        assert_eq!(
+            humanize_rrule("FREQ=MONTHLY;BYMONTHDAY=21,22,23", false),
+            "Every month on the 21st, 22nd, 23rd"
         );
     }
 
