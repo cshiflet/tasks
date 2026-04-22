@@ -111,6 +111,22 @@ fn create_task_mints_remote_id_and_optional_caldav_row() {
         .unwrap();
     assert_eq!(cal, "cal-work");
     assert_eq!(cd_remote_id.len(), 36);
+
+    // The two UUIDs must be independent draws — the Tasks.org task
+    // UID and the CalDAV object UID are different identities even
+    // though they're both fresh v4 UUIDs.
+    let task_remote_id: String = db
+        .connection()
+        .query_row(
+            "SELECT remoteId FROM tasks WHERE _id = ?1",
+            params![synced_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(
+        task_remote_id, cd_remote_id,
+        "tasks.remoteId and caldav_tasks.cd_remote_id must be distinct UUIDs"
+    );
 }
 
 #[test]

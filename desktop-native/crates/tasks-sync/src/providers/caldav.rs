@@ -52,46 +52,35 @@ impl Provider for CalDavProvider {
             "CalDavProvider::connect stub for {:?}",
             self.credentials.server_url
         );
-        Err(SyncError::NotYetImplemented {
-            provider: "CalDAV",
-            method: "connect",
-        })
+        not_yet("connect")
     }
 
     async fn list_calendars(&mut self) -> SyncResult<Vec<RemoteCalendar>> {
-        Err(SyncError::NotYetImplemented {
-            provider: "CalDAV",
-            method: "list_calendars",
-        })
+        not_yet("list_calendars")
     }
 
     async fn list_tasks(&mut self, _calendar_remote_id: &str) -> SyncResult<Vec<RemoteTask>> {
-        Err(SyncError::NotYetImplemented {
-            provider: "CalDAV",
-            method: "list_tasks",
-        })
+        not_yet("list_tasks")
     }
 
     async fn push_task(&mut self, _task: &RemoteTask) -> SyncResult<Option<String>> {
-        Err(SyncError::NotYetImplemented {
-            provider: "CalDAV",
-            method: "push_task",
-        })
+        not_yet("push_task")
     }
 
     async fn delete_task(&mut self, _calendar_remote_id: &str, _remote_id: &str) -> SyncResult<()> {
-        Err(SyncError::NotYetImplemented {
-            provider: "CalDAV",
-            method: "delete_task",
-        })
+        not_yet("delete_task")
     }
 
     async fn sync_once(&mut self) -> SyncResult<SyncOutcome> {
-        Err(SyncError::NotYetImplemented {
-            provider: "CalDAV",
-            method: "sync_once",
-        })
+        not_yet("sync_once")
     }
+}
+
+fn not_yet<T>(method: &'static str) -> SyncResult<T> {
+    Err(SyncError::NotYetImplemented {
+        provider: "CalDAV",
+        method,
+    })
 }
 
 #[cfg(test)]

@@ -83,6 +83,9 @@ Dialog {
         CheckBox {
             id: showCompletedBox
             text: qsTr("Show completed tasks")
+            // Uncheck the dependent toggle too so a subsequent
+            // open doesn't surface a disabled-but-checked control.
+            onCheckedChanged: if (!checked) { completedAtBottomBox.checked = false; }
         }
         CheckBox {
             id: completedAtBottomBox

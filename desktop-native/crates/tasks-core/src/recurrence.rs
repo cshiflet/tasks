@@ -396,8 +396,13 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 /// current week, jump to the first BYDAY of the week
 /// `interval` steps forward.
 fn next_weekly_byday(base_ms: i64, interval: u32, by_day: &[u8]) -> i64 {
-    // 1970-01-01 was a Thursday → day 0 has weekday TH (index 3).
-    // Mon=0, Tue=1, ..., Sun=6.
+    // Epoch day 0 is 1970-01-01, a Thursday. In the RRULE's
+    // Mon=0, Tue=1, …, Sun=6 scheme, Thursday is index 3. Adding
+    // 3 before the mod-7 normalises epoch day 0 to weekday 3
+    // (Thursday) and day 4 to weekday 0 (Monday) — matches the
+    // Android reference implementation. Confirmed by hand:
+    // 2024-01-15 is a Monday, and days_from_epoch=19737 gives
+    // (19737 + 3) % 7 = 0 = Monday.
     let day_from_epoch = (base_ms / 1000).div_euclid(86_400);
     let weekday = ((day_from_epoch + 3).rem_euclid(7)) as u8; // 0=MO … 6=SU
     for &target in by_day {
