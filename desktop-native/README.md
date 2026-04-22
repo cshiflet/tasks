@@ -103,35 +103,97 @@ Milestone 2 (writes):
       tasks get a `(from completion)` suffix. Complex rule parts
       (BYMONTHDAY, BYSETPOS, positional BYDAY) are dropped silently;
       full Android-parity RRULE rendering is a later pass.
-- [x] Task edit dialog (title / notes / due / priority / hide-until).
-      Edit… button in the detail pane opens a modal form; dates are
-      typed as `YYYY-MM-DD [HH:MM]` and parsed on the Rust side via
-      `tasks_core::datetime::parse_due_input`. Recurrence stays
-      read-only in this dialog — a proper RRULE picker is its own UI.
+- [x] Task edit dialog (title / notes / due / priority / hide-until /
+      tags / reminders / location / parent / timer / recurrence).
+- [ ] Add-new-task + bulk complete + undo/redo
 - [ ] Recurring-task next-occurrence rescheduling on complete
       (needs RRULE parsing + timezone-aware dates)
-- [ ] Recurrence editor (FREQ / BYDAY picker, from-due vs from-
-      completion toggle)
-- [ ] Add-new-task, bulk complete, undo/redo
+- [ ] User-editable preferences panel (sort mode / grouping /
+      show completed+hidden)
+- [ ] `QAbstractListModel` with per-row roles (scaffolding committed
+      in `cxx/task_list_model_base.h`; bridge/QML wiring pending)
+- [ ] Full Android-parity RRULE humanisation (port of
+      `RepeatRuleToString`: positional BYDAY, BYMONTHDAY, locale-aware
+      weekday names, etc.)
 - *Per-task color — **not applicable**: the Room schema at v92 has
   no `tasks.color` column. Android renders row color from the
   owning CalDAV list (`cdl_color`) or tags (`tagdata.color`), both
   of which are edited in their own flows.*
-- [ ] `QAbstractListModel` with per-row roles (scaffolding committed
-      in `cxx/task_list_model_base.h`; bridge/QML wiring pending)
-- [ ] User-editable preferences panel (sort mode / grouping /
-      show completed+hidden)
-- [ ] Full Android-parity RRULE humanisation (port of
-      `RepeatRuleToString`: positional BYDAY, BYMONTHDAY, locale-aware
-      weekday names, etc.)
 
-Milestone 2.5: OS-native reminder notifications (libnotify on
-Linux, NSUserNotification on macOS, WinRT Toast on Windows).
+Milestone 2.5 (OS-native reminders):
 
-Later milestones: CalDAV sync, Google Tasks / Microsoft To Do,
-EteSync, geofencing + widgets, packaging (AppImage / Flatpak,
-notarized `.app` + DMG, MSIX). Full detail in the plan file and in
-`desktop-native/PLAN_UPDATES.md`.
+- [ ] libnotify adapter on Linux
+- [ ] NSUserNotificationCenter (or the Cocoa `UNUserNotification`
+      replacement) on macOS
+- [ ] WinRT Toast on Windows
+- [ ] Reminder scheduler backed by `alarms.time` + `alarms.type`
+      (shared between the three platform adapters)
+
+Milestone 3 (CalDAV sync — the authoritative data-in path):
+
+- [ ] `tasks-sync` crate with a `Provider` trait the UI speaks to
+      (discover / list / push / pull). Implementations under
+      `tasks-sync/src/providers/…`.
+- [ ] CalDAV provider: service discovery via `.well-known/caldav`,
+      PROPFIND / REPORT / PUT / DELETE over HTTP + WebDAV
+      (stack: `reqwest` + `quick-xml` + a lightweight `ical` parser
+      or a port of the relevant `libical` bits).
+- [ ] iCalendar (VTODO) serialization — read *and* write, with
+      RRULE / EXDATE / VALARM round-tripping.
+- [ ] Auth: Basic + Digest; OAuth2 for Fastmail / iCloud where
+      applicable.
+- [ ] Sync engine: ctag-gated incremental pulls, etag-gated push
+      merge, conflict detection, move-between-lists semantics.
+- [ ] Account-management UI (add account, assign lists to CalDAV
+      calendars, trigger sync).
+- [ ] Integration tests against a Radicale instance in CI.
+
+Milestone 4 (Google Tasks + Microsoft To Do):
+
+- [ ] Google Tasks provider: REST API v1, loopback-OAuth2 flow
+      (no embedded webview — system browser + `http://localhost` or
+      `http://127.0.0.1` redirect).
+- [ ] Microsoft To Do provider: Microsoft Graph / To Do REST,
+      same loopback-OAuth2 shape.
+- [ ] Shared token cache using `secret-service` / macOS Keychain /
+      Windows Credential Manager, abstracted behind a
+      `TokenStore` trait.
+- [ ] Per-task `remoteId` semantics aligned with the existing
+      `caldav_tasks` table shape so the three providers can
+      coexist on one desktop install.
+
+Milestone 5 (EteSync):
+
+- [ ] `libetebase` FFI dependency (the Rust crate is a thin wrapper
+      over the shared library; first-party Rust, no foreign sync
+      glue).
+- [ ] Collection / item layout mapped onto the Room task schema.
+- [ ] Zero-knowledge key handling (password → login / encryption
+      key derivation).
+
+Milestone 6 (parity polish):
+
+- [ ] Geofencing on desktop platforms — feasibility research first
+      (QtPositioning is not in cxx-qt-lib; would need a hand-rolled
+      bridge, or delegate to OS-native APIs: `CLLocationManager` on
+      macOS, `Windows.Devices.Geolocation` on Windows, GeoClue2
+      / `libgeoclue` on Linux).
+- [ ] Widgets-equivalent quick-add (KDE Plasma applet, macOS
+      widget extension, Windows tray).
+- [ ] Automation hooks (D-Bus on Linux, URL schemes on macOS,
+      IPC on Windows) as the desktop equivalents of Android's
+      Tasker plug-in surface.
+
+Milestone 7 (packaging):
+
+- [ ] Linux: AppImage + Flatpak (the Flatpak manifest goes into
+      `packaging/linux/`).
+- [ ] macOS: notarized `.app` bundle + signed DMG (codesign + notary
+      scripts live in `packaging/macos/`).
+- [ ] Windows: MSIX + a fallback NSIS installer
+      (`packaging/windows/`).
+
+Full detail in the plan file and in `desktop-native/PLAN_UPDATES.md`.
 
 ## See also
 
