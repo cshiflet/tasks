@@ -344,3 +344,50 @@ fn import_missing_file_reports_io_error() {
     let err = import_json_backup(&db_path, &missing).expect_err("should fail");
     assert!(err.to_string().contains("read"), "err = {err}");
 }
+
+/// C-1 regression: a hostile backup embeds an executable SQL fragment
+/// in `filters.sql`. After import, that column must be NULL so the
+/// saved-filter read path can't execute it.
+#[test]
+fn import_strips_filter_sql_fragment_against_c1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    let json_path = tmp.path().join("backup.json");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+
+    // The SQL fragment here is the exploit shape from C-1: an EXISTS
+    // subquery over `caldav_accounts` that the Android recursive CTE
+    // would happily splice in. We want it NOT to land in the DB.
+    let hostile = serde_json::json!({
+        "version": 140200,
+        "timestamp": 1_700_000_000_000_i64,
+        "data": {
+            "filters": [{
+                "title": "benign-looking",
+                "sql": "EXISTS (SELECT 1 FROM caldav_accounts WHERE tasks.title = cda_password)",
+                "criterion": "anything",
+                "order": 1
+            }]
+        }
+    });
+    std::fs::write(&json_path, hostile.to_string()).unwrap();
+
+    let stats = import_json_backup(&db_path, &json_path).unwrap();
+    assert_eq!(stats.filters, 1, "filter row is still counted");
+
+    let conn = Connection::open(&db_path).unwrap();
+    let sql: Option<String> = conn
+        .query_row("SELECT sql FROM filters", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        sql.is_none(),
+        "imported `sql` must be NULL after C-1 fix; got {:?}",
+        sql
+    );
+    // `criterion` is preserved so a future trusted SQL-rebuilder has
+    // what it needs to reconstruct the filter from structured data.
+    let criterion: Option<String> = conn
+        .query_row("SELECT criterion FROM filters", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(criterion.as_deref(), Some("anything"));
+}

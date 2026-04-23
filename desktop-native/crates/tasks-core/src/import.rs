@@ -394,13 +394,32 @@ fn apply(tx: &rusqlite::Transaction<'_>, data: &BackupData) -> Result<ImportStat
     }
 
     for f in &data.filters {
+        // C-1: do NOT persist the imported `sql` string verbatim.
+        // The Android backup carries user-authored (or 3rd-party-authored)
+        // SQL fragments the Android app later splices into its recursive
+        // query; a hostile backup can hide, e.g.,
+        //   `EXISTS (SELECT 1 FROM caldav_accounts WHERE tasks.title = cda_password)`
+        // there, which on desktop surfaces CalDAV passwords as task titles
+        // when the user clicks the saved filter. Write NULL so the
+        // read path in `query::run_by_filter_id` returns an empty list
+        // rather than executing an untrusted fragment. The structured
+        // `criterion` column is preserved; a future desktop builder can
+        // rebuild trusted SQL from it without touching this path.
+        let _dropped_sql = f.sql.as_deref(); // surfaced only for the log.
+        if _dropped_sql.is_some() {
+            tracing::debug!(
+                filter = f.title.as_deref().unwrap_or(""),
+                "dropping imported `sql` fragment; custom filters from backups \
+                 are no-ops until the desktop builds SQL from `criterion`",
+            );
+        }
         tx.execute(
             "INSERT OR REPLACE INTO filters \
              (title, sql, \"values\", criterion, f_color, f_icon, f_order) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 f.title,
-                f.sql,
+                Option::<String>::None, // <- was `f.sql` — neutralised
                 f.values,
                 f.criterion,
                 f.color,
