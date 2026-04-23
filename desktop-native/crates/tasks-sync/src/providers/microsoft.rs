@@ -125,9 +125,14 @@ impl Provider for MicrosoftToDoProvider {
     }
 
     async fn connect(&mut self) -> SyncResult<()> {
+        // reqwest 0.11's default redirect policy doesn't strip the
+        // Authorization header on cross-host redirects (H-2);
+        // disable auto-redirect so any 3xx surfaces as a protocol
+        // error instead of silently leaking the Bearer token.
         let http = Client::builder()
             .user_agent("tasks-desktop-native/0.1")
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| SyncError::Network(format!("reqwest build: {e}")))?;
 
