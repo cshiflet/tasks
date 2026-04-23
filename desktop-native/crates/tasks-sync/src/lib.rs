@@ -21,6 +21,7 @@
 pub mod convert;
 pub mod engine;
 pub mod ical;
+pub mod oauth;
 pub mod provider;
 pub mod providers;
 

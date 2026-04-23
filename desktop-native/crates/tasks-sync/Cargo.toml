@@ -23,6 +23,14 @@ rusqlite = { workspace = true }
 # string interpolation; parsing nested `<d:response>` trees
 # wants a real pull-parser.
 quick-xml = "0.36"
+# PKCE helper for OAuth2 desktop flow (Google Tasks + Microsoft
+# To Do). Keeps the crypto primitives explicit rather than
+# depending on the full `oauth2` crate (which brings in tokio +
+# reqwest defaults we'd rather pick ourselves).
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
+percent-encoding = "2"
 
 # Additional per-provider deps (reqwest, quick-xml, oauth2,
 # libetebase-rs, …) will land when the individual provider
