@@ -50,6 +50,13 @@ pub enum IcalError {
     /// the field name so callers can report which clip fired.
     #[error("too many {field} entries in VTODO (cap exceeded)")]
     TooMany { field: &'static str },
+    /// Multiple `BEGIN:VTODO` blocks inside one VCALENDAR envelope.
+    /// We used to silently return just the first, which could mask a
+    /// CalDAV server packing two tasks into one response (L-1). Now
+    /// we fail loudly so the caller surfaces a meaningful error
+    /// rather than hiding data.
+    #[error("VCALENDAR contained multiple VTODO blocks")]
+    MultipleVtodos,
 }
 
 pub type IcalResult<T> = Result<T, IcalError>;
@@ -150,6 +157,9 @@ pub fn parse_vcalendar(input: &str) -> IcalResult<VTodo> {
     let mut depth: Vec<&str> = Vec::new();
     let mut current_todo: Option<VTodo> = None;
     let mut current_alarm: Option<VAlarm> = None;
+    // L-1: hold onto the finished VTODO and reject a second
+    // BEGIN:VTODO rather than silently dropping it.
+    let mut completed_todo: Option<VTodo> = None;
 
     for raw_line in lines {
         let line = raw_line.trim_end_matches('\r');
@@ -160,6 +170,12 @@ pub fn parse_vcalendar(input: &str) -> IcalResult<VTodo> {
         match (parsed.name.as_str(), parsed.value.as_str()) {
             ("BEGIN", "VCALENDAR") => depth.push("VCALENDAR"),
             ("BEGIN", "VTODO") => {
+                // L-1: if we've already closed a VTODO, a second
+                // BEGIN:VTODO means the envelope is packing multiple
+                // todos — surface as MultipleVtodos.
+                if completed_todo.is_some() {
+                    return Err(IcalError::MultipleVtodos);
+                }
                 depth.push("VTODO");
                 current_todo = Some(VTodo::default());
             }
@@ -182,9 +198,11 @@ pub fn parse_vcalendar(input: &str) -> IcalResult<VTodo> {
                 depth.pop();
             }
             ("END", "VTODO") => {
-                // Return the first VTODO we close out.
+                // Stash it for return; but keep walking so a second
+                // BEGIN:VTODO inside the same envelope surfaces as
+                // MultipleVtodos (L-1).
                 if let Some(todo) = current_todo.take() {
-                    return Ok(todo);
+                    completed_todo = Some(todo);
                 }
                 depth.pop();
             }
@@ -208,7 +226,7 @@ pub fn parse_vcalendar(input: &str) -> IcalResult<VTodo> {
         }
     }
 
-    Err(IcalError::NoVTodo)
+    completed_todo.ok_or(IcalError::NoVTodo)
 }
 
 /// Serialize a VTODO into a complete VCALENDAR blob with our
@@ -854,6 +872,25 @@ END:VCALENDAR\r\n";
         assert!(
             matches!(err, IcalError::TooMany { field: "VALARM" }),
             "expected TooMany{{VALARM}}, got {err:?}"
+        );
+    }
+
+    /// L-1: a VCALENDAR with two VTODO blocks fails the parse
+    /// instead of silently returning just the first. CalDAV
+    /// multi-status responses wrap each task in its own envelope,
+    /// so this shape only ever shows up as server misbehaviour.
+    #[test]
+    fn multiple_vtodos_are_rejected() {
+        let blob = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VTODO\r\nUID:one\r\nSUMMARY:First\r\nEND:VTODO\r\n",
+            "BEGIN:VTODO\r\nUID:two\r\nSUMMARY:Second\r\nEND:VTODO\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let err = parse_vcalendar(blob).unwrap_err();
+        assert!(
+            matches!(err, IcalError::MultipleVtodos),
+            "expected MultipleVtodos, got {err:?}"
         );
     }
 
