@@ -250,11 +250,87 @@ ORDER BY sequence
 /// Mirrors `TaskListQueryRecursive.newCaldavQuery(list)`. The uuid is
 /// embedded as a single-quoted literal; it always comes from an internal
 /// `CaldavCalendar.uuid` field, never user-controlled free text.
+///
+/// L-3 defence-in-depth: validate the UUID shape even though the
+/// only write path is either (a) our CalDAV pull (which gets UUIDs
+/// from authenticated servers) or (b) the JSON importer. Both are
+/// trusted, but a well-formed assertion here is cheap insurance
+/// that any future write path (e.g. a user-editable CalDAV config
+/// UI) can't regress the query into a SQL-injection primitive via
+/// `cdl_uuid`. The single-quote escape is kept as a last line of
+/// defence for the tame case.
 fn caldav_parent_query(calendar_uuid: &str) -> String {
+    // CalDAV/iCal UUIDs from Fastmail, Nextcloud, Radicale, iCloud
+    // et al. all fall under this character set (letters, digits,
+    // hyphen). Matching that shape rejects e.g. `foo' OR 1=1--` up
+    // front; the single-quote escape below is belt-and-braces for
+    // anything that slips through.
+    if !is_plausible_caldav_uuid(calendar_uuid) {
+        tracing::warn!(
+            uuid_len = calendar_uuid.len(),
+            "caldav calendar uuid rejected by shape check — returning no-match query"
+        );
+        // Fall back to a query that returns zero rows rather than
+        // error: the sidebar previously populated this UUID from
+        // `caldav_lists.cdl_uuid`, so failing silently is kinder
+        // than blowing up the UI.
+        return format!(
+            "INNER JOIN caldav_tasks ON 1=0 WHERE {ACTIVE_AND_VISIBLE} AND tasks.parent = 0"
+        );
+    }
     let escaped = calendar_uuid.replace('\'', "''");
     format!(
         "INNER JOIN caldav_tasks ON caldav_tasks.cd_calendar = '{escaped}' \
          AND caldav_tasks.cd_task = tasks._id AND caldav_tasks.cd_deleted = 0 \
          WHERE {ACTIVE_AND_VISIBLE} AND tasks.parent = 0"
     )
+}
+
+/// Accept 1..=64 chars of `[A-Za-z0-9._:@-]`. Matches the full
+/// range real CalDAV/iCal servers produce (some stash URLs or
+/// colons into the UID) without admitting quote/space/semicolon
+/// chars that have no business in a canonical UUID.
+fn is_plausible_caldav_uuid(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'@'))
+}
+
+#[cfg(test)]
+mod caldav_uuid_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_well_formed_uuids() {
+        // Typical RFC 4122 UUID.
+        assert!(is_plausible_caldav_uuid(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        // iCloud-style opaque id with letters + digits.
+        assert!(is_plausible_caldav_uuid("AB12CD34EF56"));
+        // Fastmail-style dotted id.
+        assert!(is_plausible_caldav_uuid("cal.user-name.home"));
+    }
+
+    #[test]
+    fn rejects_injection_bait() {
+        // Classic OR-bypass attempt.
+        assert!(!is_plausible_caldav_uuid("foo' OR 1=1--"));
+        // Space.
+        assert!(!is_plausible_caldav_uuid("foo bar"));
+        // Semicolon.
+        assert!(!is_plausible_caldav_uuid("foo;drop"));
+        // Empty.
+        assert!(!is_plausible_caldav_uuid(""));
+        // Too long.
+        assert!(!is_plausible_caldav_uuid(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn malformed_uuid_yields_no_match_join() {
+        let sql = caldav_parent_query("foo' OR 1=1--");
+        assert!(sql.contains("INNER JOIN caldav_tasks ON 1=0"));
+        assert!(!sql.contains("'foo"));
+    }
 }

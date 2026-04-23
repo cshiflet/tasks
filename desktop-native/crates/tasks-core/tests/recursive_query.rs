@@ -263,13 +263,25 @@ fn show_completed_rewrites_active_predicate() {
     );
 }
 
+/// L-3 defence-in-depth: a UUID containing a single quote (or any
+/// other non-canonical character) was previously escaped in place;
+/// now it's rejected by the shape check and the resulting query
+/// returns zero rows. The old test asserted the escape path; the
+/// new behaviour is stricter — any malformed uuid short-circuits
+/// to `INNER JOIN caldav_tasks ON 1=0`.
 #[test]
-fn caldav_uuid_is_escaped_for_single_quotes() {
+fn caldav_uuid_with_quote_is_rejected_not_escaped() {
     let filter = QueryFilter::caldav("o'brien");
     let prefs = QueryPreferences::default();
     let sql = build_recursive_query(&filter, &prefs, 0, None);
-    // Single quote inside the uuid must be doubled to keep the SQL valid.
-    assert!(sql.contains("'o''brien'"), "quote not escaped in:\n{sql}");
+    assert!(
+        sql.contains("INNER JOIN caldav_tasks ON 1=0"),
+        "malformed uuid should fall through to a no-match join:\n{sql}"
+    );
+    assert!(
+        !sql.contains("'o'"),
+        "malformed uuid must NOT appear as a quoted literal:\n{sql}"
+    );
 }
 
 #[test]
