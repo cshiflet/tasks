@@ -10,4 +10,6 @@ pub mod caldav;
 pub mod caldav_xml;
 pub mod etesync;
 pub mod google;
+pub mod google_json;
 pub mod microsoft;
+pub mod microsoft_json;

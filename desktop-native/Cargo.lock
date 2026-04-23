@@ -1150,6 +1150,8 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "rusqlite",
+ "serde",
+ "serde_json",
  "sha2",
  "tasks-core",
  "tempfile",

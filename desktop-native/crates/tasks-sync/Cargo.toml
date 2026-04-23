@@ -31,6 +31,10 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
 percent-encoding = "2"
+# JSON parser/serializer for the REST providers (Google Tasks,
+# Microsoft Graph / To Do).
+serde = { workspace = true }
+serde_json = "1"
 
 # Additional per-provider deps (reqwest, quick-xml, oauth2,
 # libetebase-rs, …) will land when the individual provider
