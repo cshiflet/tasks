@@ -178,3 +178,122 @@ jobs:
       # requires platform-specific plumbing that's not worth the coverage.
       # Revisit once the Qt front-end has feature tests worth running on
       # Windows specifically.
+
+  # ---------------------------------------------------------------------------
+  # TEMPORARY: per-push packaging jobs for Linux + Windows.
+  #
+  # Remove these two jobs once the native-client PR merges (or once we stop
+  # needing ad-hoc binaries off feature branches). The canonical release
+  # workflow is `desktop-native-release.yml`, which runs on tag pushes and
+  # `workflow_dispatch`. These PR-scoped jobs exist only to shorten the
+  # iterate → download → test loop while the UX is still shifting shape.
+  #
+  # When removing: drop `package-linux` and `package-windows` below and
+  # delete this comment block. The release workflow keeps working as-is.
+  # ---------------------------------------------------------------------------
+  package-linux:
+    needs: check-linux
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt 6 + tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qt6-base-dev qt6-declarative-dev qt6-tools-dev \
+            qml6-module-qtquick qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts qml6-module-qtquick-window \
+            qml6-module-qtquick-templates qml6-module-qtquick-dialogs \
+            qml6-module-qt-labs-platform qml6-module-qtqml-workerscript \
+            libqt6svg6-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      # Mirrors desktop-native-release.yml's Linux packaging. Version stamp
+      # always uses the short SHA here since PR builds don't carry tags.
+      - name: Assemble tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          VERSION="0.0.0-$(git rev-parse --short HEAD)"
+          OUT="tasks-desktop-${VERSION}-linux-x86_64"
+          mkdir -p "dist/${OUT}/bin"
+          cp target/release/tasks-desktop "dist/${OUT}/bin/"
+          cp ../README.md BUILD.md DECISIONS.md "dist/${OUT}/"
+          dpkg -l libqt6core6t64 libqt6qml6 > "dist/${OUT}/QT_VERSIONS.txt" || true
+          tar -C dist -czf "dist/${OUT}.tar.gz" "${OUT}"
+          echo "archive=desktop-native/dist/${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          # Shorter than the default 90 days — PR-scoped builds roll
+          # over quickly and these aren't official release artefacts.
+          retention-days: 14
+
+  package-windows:
+    needs: check-windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.6.3'
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      # Mirrors desktop-native-release.yml's Windows packaging; see the
+      # top-of-file comment on why these jobs are temporary.
+      - name: Assemble ZIP with windeployqt
+        id: pkg
+        run: |
+          $Sha = (git rev-parse --short HEAD).Trim()
+          $Version = "0.0.0-$Sha"
+          $Out = "tasks-desktop-$Version-windows-x86_64"
+          $StageDir = "dist/$Out"
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          Copy-Item target/release/tasks-desktop.exe $StageDir/
+          windeployqt --qmldir crates/tasks-ui/qml $StageDir/tasks-desktop.exe
+          $Archive = "dist/$Out.zip"
+          Compress-Archive -Path "$StageDir/*" -DestinationPath $Archive -Force
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "archive=desktop-native/$Archive"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$Out.zip"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          retention-days: 14
