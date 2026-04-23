@@ -20,7 +20,7 @@
 //! module) is straight-line code the compiler catches typing
 //! mistakes in. End-to-end smoke testing is the user's job.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use etebase::{
@@ -41,6 +41,16 @@ const COLLECTION_TYPE_VTODO: &str = "etebase.vtodo";
 /// Convenience: wrap Etebase's error type into our `SyncError`.
 fn map_err<T: std::fmt::Display>(label: &'static str, e: T) -> SyncError {
     SyncError::Network(format!("{label}: {e}"))
+}
+
+/// Take the session mutex, turning the `PoisonError` into a
+/// `SyncError` instead of panicking (M-6). A panic on the holding
+/// thread would otherwise propagate here via `.unwrap()` and crash
+/// whichever worker happened to call next.
+fn lock_session(state: &Mutex<Option<Account>>) -> SyncResult<MutexGuard<'_, Option<Account>>> {
+    state
+        .lock()
+        .map_err(|_| SyncError::Other("etesync session poisoned".into()))
 }
 
 pub struct EteSyncProvider {
@@ -104,7 +114,7 @@ impl Provider for EteSyncProvider {
             // wrapper stays live until this closure returns.
             let account = Account::login(client, &username, password.expose_secret())
                 .map_err(|e| SyncError::Auth(format!("login: {e}")))?;
-            *state.lock().unwrap() = Some(account);
+            *lock_session(&state)? = Some(account);
             Ok(())
         })
         .await
@@ -115,7 +125,7 @@ impl Provider for EteSyncProvider {
     async fn list_calendars(&mut self) -> SyncResult<Vec<RemoteCalendar>> {
         let state = self.state.clone();
         tokio::task::spawn_blocking(move || -> SyncResult<Vec<RemoteCalendar>> {
-            let guard = state.lock().unwrap();
+            let guard = lock_session(&state)?;
             let account = guard
                 .as_ref()
                 .ok_or_else(|| SyncError::Auth("EteSync: connect() first".into()))?;
@@ -140,7 +150,7 @@ impl Provider for EteSyncProvider {
         let state = self.state.clone();
         let cal_uid = calendar_remote_id.to_string();
         tokio::task::spawn_blocking(move || -> SyncResult<Vec<RemoteTask>> {
-            let guard = state.lock().unwrap();
+            let guard = lock_session(&state)?;
             let account = guard
                 .as_ref()
                 .ok_or_else(|| SyncError::Auth("EteSync: connect() first".into()))?;
@@ -211,7 +221,7 @@ impl Provider for EteSyncProvider {
         let now_ms = now_ms();
 
         tokio::task::spawn_blocking(move || -> SyncResult<Option<String>> {
-            let guard = state.lock().unwrap();
+            let guard = lock_session(&state)?;
             let account = guard
                 .as_ref()
                 .ok_or_else(|| SyncError::Auth("EteSync: connect() first".into()))?;
@@ -263,7 +273,7 @@ impl Provider for EteSyncProvider {
         let cal_uid = calendar_remote_id.to_string();
         let item_uid = remote_id.to_string();
         tokio::task::spawn_blocking(move || -> SyncResult<()> {
-            let guard = state.lock().unwrap();
+            let guard = lock_session(&state)?;
             let account = guard
                 .as_ref()
                 .ok_or_else(|| SyncError::Auth("EteSync: connect() first".into()))?;
