@@ -44,6 +44,18 @@ pub enum SyncError {
     #[error("local error: {0}")]
     Local(String),
 
+    /// Push was rejected because the remote's etag no longer
+    /// matches what the local row remembered — i.e., somebody
+    /// else edited the task on another client between our last
+    /// pull and this push. Caller decides whether to re-pull +
+    /// retry, surface a UI prompt, or drop the push.
+    #[error("etag conflict on {remote_id}: local {local:?}, server returned {server_message}")]
+    Conflict {
+        remote_id: String,
+        local: Option<String>,
+        server_message: String,
+    },
+
     /// Provider-specific fallback.
     #[error("{0}")]
     Other(String),

@@ -1,9 +1,11 @@
 //! Sync engine: orchestrates pull / reconcile / push between a
 //! [`crate::Provider`] and the desktop's local SQLite database.
 //!
-//! **Status:** pull cycle only. Push happens once the per-provider
-//! networking lands (M3+); the engine is shaped so push is
-//! additive (new method, not a rewrite).
+//! **Status:** pull cycle + push_dirty cycle. `sync_once()`
+//! composes both. Actual network / HTTP lives behind the
+//! [`Provider`] trait — the provider stubs return
+//! `NotYetImplemented` today; [`MockProvider`] exercises the
+//! whole orchestration end-to-end from in-memory state.
 //!
 //! Merge policy for pull: **remote wins** for the columns the
 //! provider is authoritative on (title, notes, dates, recurrence,
@@ -89,6 +91,129 @@ impl<'a> SyncEngine<'a> {
             conflicts: 0,
         })
     }
+
+    /// Push local tasks whose `tasks.modified` is newer than the
+    /// last sync stamp of their `caldav_tasks` row (or which have
+    /// no `caldav_tasks` row at all — that's a brand-new local
+    /// task belonging to a CalDAV list).
+    ///
+    /// On success, the returned etag is stamped back onto
+    /// `cd_etag` + `cd_last_sync`. A
+    /// [`SyncError::Conflict`] from the provider is caught,
+    /// recorded against the task, and the loop continues with the
+    /// remaining rows — one conflict shouldn't block unrelated
+    /// pushes. Callers get a total count of conflicts via
+    /// [`SyncOutcome::conflicts`].
+    pub async fn push_dirty(&mut self) -> SyncResult<SyncOutcome> {
+        self.provider.connect().await?;
+        let conn = open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
+        let dirty =
+            load_dirty_tasks(&conn).map_err(|e| SyncError::Local(format!("load dirty: {e}")))?;
+        drop(conn); // Release the write handle before the async round trips.
+
+        let mut pushed = 0usize;
+        let mut conflicts = 0usize;
+        for task in &dirty {
+            match self.provider.push_task(task).await {
+                Ok(new_etag) => {
+                    let conn = open_rw(self.db_path)
+                        .map_err(|e| SyncError::Local(format!("reopen db: {e}")))?;
+                    record_push_success(&conn, &task.remote_id, new_etag.as_deref(), now_ms())
+                        .map_err(|e| SyncError::Local(format!("stamp etag: {e}")))?;
+                    pushed += 1;
+                }
+                Err(SyncError::Conflict { remote_id, .. }) => {
+                    tracing::warn!("push conflict on {remote_id}; keeping local");
+                    conflicts += 1;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Ok(SyncOutcome {
+            calendars_pulled: 0,
+            tasks_pulled: 0,
+            tasks_pushed: pushed,
+            conflicts,
+        })
+    }
+
+    /// Full sync cycle: pull, then push. Convenience for the
+    /// "sync now" button.
+    pub async fn sync_now(&mut self) -> SyncResult<SyncOutcome> {
+        let pulled = self.pull_all().await?;
+        let pushed = self.push_dirty().await?;
+        Ok(SyncOutcome {
+            calendars_pulled: pulled.calendars_pulled,
+            tasks_pulled: pulled.tasks_pulled,
+            tasks_pushed: pushed.tasks_pushed,
+            conflicts: pushed.conflicts,
+        })
+    }
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Load every task that needs pushing: a caldav_tasks row whose
+/// paired `tasks.modified` exceeds `cd_last_sync`, OR (to cover
+/// brand-new local tasks about to sync for the first time) rows
+/// whose `cd_last_sync` is 0.
+fn load_dirty_tasks(conn: &Connection) -> rusqlite::Result<Vec<RemoteTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT t._id, t.title, t.notes, t.dueDate, t.completed, \
+                t.importance, t.recurrence, t.modified, t.remoteId, \
+                ct.cd_calendar, ct.cd_remote_id, ct.cd_etag, \
+                ct.cd_remote_parent, ct.cd_last_sync \
+         FROM tasks t \
+         JOIN caldav_tasks ct ON ct.cd_task = t._id \
+         WHERE t.deleted = 0 \
+           AND (ct.cd_last_sync = 0 OR t.modified > ct.cd_last_sync)",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let due_ms: i64 = r.get(3)?;
+        let due_has_time = due_ms != 0 && due_ms % 60_000 != 0;
+        Ok(RemoteTask {
+            remote_id: r.get::<_, String>(10)?,
+            calendar_remote_id: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            etag: r.get::<_, Option<String>>(11)?,
+            title: r.get::<_, Option<String>>(1)?,
+            notes: r.get::<_, Option<String>>(2)?,
+            due_ms,
+            due_has_time,
+            completed_ms: r.get::<_, i64>(4)?,
+            priority: r.get::<_, i32>(5)?,
+            recurrence: r.get::<_, Option<String>>(6)?,
+            parent_remote_id: r.get::<_, Option<String>>(12)?,
+            raw_vtodo: None,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// After a successful push, stamp the new etag + last-sync
+/// timestamp so the next push_dirty call doesn't re-send the
+/// same row.
+fn record_push_success(
+    conn: &Connection,
+    remote_id: &str,
+    new_etag: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE caldav_tasks SET cd_etag = ?1, cd_last_sync = ?2 \
+         WHERE cd_remote_id = ?3",
+        params![new_etag, now_ms, remote_id],
+    )?;
+    Ok(())
 }
 
 /// Open a writable handle to the desktop's SQLite. Mirrors the
@@ -509,6 +634,140 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(task_count, 1);
+    }
+
+    /// MockProvider variant whose push_task hands back a canned
+    /// etag and records every call. Used to drive the push_dirty
+    /// path without needing a real server.
+    #[derive(Default, Clone)]
+    struct MockWithPushResult {
+        pushes: Arc<Mutex<Vec<RemoteTask>>>,
+        conflict_on: Option<String>,
+    }
+
+    #[async_trait]
+    impl Provider for MockWithPushResult {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::CalDav
+        }
+        fn account_label(&self) -> &str {
+            "mock-push"
+        }
+        async fn connect(&mut self) -> SyncResult<()> {
+            Ok(())
+        }
+        async fn list_calendars(&mut self) -> SyncResult<Vec<RemoteCalendar>> {
+            Ok(Vec::new())
+        }
+        async fn list_tasks(&mut self, _cal: &str) -> SyncResult<Vec<RemoteTask>> {
+            Ok(Vec::new())
+        }
+        async fn push_task(&mut self, t: &RemoteTask) -> SyncResult<Option<String>> {
+            self.pushes.lock().unwrap().push(t.clone());
+            if self.conflict_on.as_deref() == Some(t.remote_id.as_str()) {
+                Err(SyncError::Conflict {
+                    remote_id: t.remote_id.clone(),
+                    local: t.etag.clone(),
+                    server_message: "etag mismatch".into(),
+                })
+            } else {
+                Ok(Some("etag-new".to_string()))
+            }
+        }
+        async fn delete_task(&mut self, _c: &str, _id: &str) -> SyncResult<()> {
+            Ok(())
+        }
+        async fn sync_once(&mut self) -> SyncResult<SyncOutcome> {
+            Ok(SyncOutcome::default())
+        }
+    }
+
+    fn seed_dirty_task(db_path: &std::path::Path) -> String {
+        // Insert a task + a caldav_tasks row with cd_last_sync = 0
+        // (brand-new local) so push_dirty picks it up.
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
+             modified, completed, deleted, estimatedSeconds, elapsedSeconds, \
+             timerStart, notificationFlags, lastNotified, repeat_from, \
+             collapsed, parent, read_only, remoteId) \
+             VALUES ('Push me', 3, 0, 0, 1, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'task-1')",
+            [],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'cal-1', 'task-1', 0, 0, 0, 0)",
+            [task_id],
+        )
+        .unwrap();
+        "task-1".to_string()
+    }
+
+    #[tokio::test]
+    async fn push_dirty_stamps_etag_after_success() {
+        let (_tmp, db_path) = fresh_db();
+        let uid = seed_dirty_task(&db_path);
+        let mock = MockWithPushResult::default();
+        let pushes = mock.pushes.clone();
+
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome.tasks_pushed, 1);
+        assert_eq!(outcome.conflicts, 0);
+
+        // Pushed exactly the one dirty task. Scope the guard so
+        // clippy is happy about the subsequent `.await`.
+        {
+            let seen = pushes.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].remote_id, uid);
+        }
+
+        // Etag + last-sync stamped back onto the row.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (etag, last_sync): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT cd_etag, cd_last_sync FROM caldav_tasks WHERE cd_remote_id = ?1",
+                [&uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(etag.as_deref(), Some("etag-new"));
+        assert!(last_sync > 0);
+
+        // Second push_dirty finds no dirty rows.
+        let outcome2 = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome2.tasks_pushed, 0);
+    }
+
+    #[tokio::test]
+    async fn push_dirty_reports_conflicts_without_aborting() {
+        let (_tmp, db_path) = fresh_db();
+        let uid = seed_dirty_task(&db_path);
+        let mock = MockWithPushResult {
+            conflict_on: Some(uid.clone()),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome.tasks_pushed, 0);
+        assert_eq!(outcome.conflicts, 1);
+
+        // Conflict did *not* stamp an etag — local row stays
+        // "dirty" for the next push_dirty attempt.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let last_sync: i64 = conn
+            .query_row(
+                "SELECT cd_last_sync FROM caldav_tasks WHERE cd_remote_id = ?1",
+                [&uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_sync, 0);
     }
 
     #[tokio::test]
