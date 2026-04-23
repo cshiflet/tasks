@@ -78,3 +78,33 @@ fn default_db_path_exposes_a_usable_path() {
     let path = tasks_core::default_db_path().expect("default data dir should resolve");
     assert!(path.ends_with("tasks-desktop/tasks.db") || path.ends_with("tasks-desktop\\tasks.db"));
 }
+
+/// L-5 regression (Unix-only): opening a symlink at the DB path
+/// must be refused. Windows' `mklink` requires admin unless
+/// Developer Mode is on, so this test is gated to Unix; the
+/// defence runs identically on all platforms via `symlink_metadata`.
+#[cfg(unix)]
+#[test]
+fn open_refuses_symlink_against_l5() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real.db");
+    // Stand up a real DB at one path, then symlink a second path to it.
+    let db = Database::open_or_create_read_only(&real).unwrap();
+    drop(db);
+
+    let link = tmp.path().join("linked.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let err =
+        Database::open_read_only(&link).expect_err("symlink should be refused at the DB path");
+    let msg = err.to_string();
+    assert!(msg.contains("symlink"), "err = {msg}");
+
+    // And the create-or-open path rejects the symlink too, even
+    // before it would attempt to create.
+    let link2 = tmp.path().join("linked2.db");
+    std::os::unix::fs::symlink(&real, &link2).unwrap();
+    let err = Database::open_or_create_read_only(&link2)
+        .expect_err("open_or_create should also refuse symlinks");
+    assert!(err.to_string().contains("symlink"), "err = {err}");
+}

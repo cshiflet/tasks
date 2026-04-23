@@ -65,6 +65,16 @@ impl Database {
     /// Open `path` read-only and verify the Room identity hash.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        // L-5: reject symlinks on the final path component before
+        // opening. A user-writable symlink at the default data dir
+        // could otherwise redirect the DB handle to a location
+        // outside the app's own sandbox (e.g. `/etc/shadow` on
+        // Linux, `C:\Windows\System32\...` on Windows). We use
+        // symlink_metadata so the check doesn't itself follow the
+        // link. Missing files are fine — `open_or_create_read_only`
+        // needs to bootstrap them — so we skip the check when the
+        // path doesn't exist yet.
+        reject_if_symlink(&path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&path, flags)?;
 
@@ -102,6 +112,11 @@ impl Database {
     /// takes the read-only path.
     pub fn open_or_create_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        // L-5: reject a symlink at the target even in the "does-not-
+        // exist yet" branch — if the default data dir got pre-staged
+        // with a symlink pointing elsewhere, `create_empty_db` would
+        // otherwise follow it when creating the file.
+        reject_if_symlink(path)?;
         if !path.exists() {
             create_empty_db(path)?;
         }
@@ -150,6 +165,31 @@ fn create_empty_db(path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+/// Reject a path whose final component is a symlink. Non-existent
+/// paths are OK (the caller may be about to create the file);
+/// anything else that fails `symlink_metadata` is also surfaced
+/// so IO errors on the parent dir don't get silently swallowed.
+///
+/// `symlink_metadata` does NOT follow symlinks — that's the whole
+/// point; it reports on the link itself.
+fn reject_if_symlink(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink; refusing to open for safety (L-5)",
+                path.display()
+            ),
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CoreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("stat {}: {e}", path.display()),
+        ))),
+    }
 }
 
 fn read_identity_hash(conn: &Connection) -> Result<String> {
