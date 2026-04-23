@@ -1,0 +1,524 @@
+//! Sync engine: orchestrates pull / reconcile / push between a
+//! [`crate::Provider`] and the desktop's local SQLite database.
+//!
+//! **Status:** pull cycle only. Push happens once the per-provider
+//! networking lands (M3+); the engine is shaped so push is
+//! additive (new method, not a rewrite).
+//!
+//! Merge policy for pull: **remote wins** for the columns the
+//! provider is authoritative on (title, notes, dates, recurrence,
+//! status, parent). Local-only state — tags, alarms, geofence —
+//! is preserved unchanged across pulls because the provider
+//! doesn't speak it (or, when it eventually does, the engine
+//! grows a separate replace_* helper to cover it). Sync conflict
+//! detection (etag mismatch) is the next step; this engine
+//! refuses no writes today.
+//!
+//! The sync runs inside a single transaction per pull cycle so a
+//! mid-pull failure (network drop, parse error) leaves the DB
+//! exactly where it was.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+
+use crate::provider::{Provider, RemoteCalendar, RemoteTask, SyncError, SyncOutcome, SyncResult};
+
+/// Drives one or more sync cycles against `provider`, persisting
+/// pulled state into the local SQLite at `db_path`.
+pub struct SyncEngine<'a> {
+    db_path: &'a Path,
+    provider: Box<dyn Provider>,
+}
+
+impl<'a> SyncEngine<'a> {
+    pub fn new(db_path: &'a Path, provider: Box<dyn Provider>) -> Self {
+        Self { db_path, provider }
+    }
+
+    /// Connect + pull every calendar's tasks. Returns the count of
+    /// rows pulled. Does not push.
+    pub async fn pull_all(&mut self) -> SyncResult<SyncOutcome> {
+        self.provider.connect().await?;
+        let calendars = self.provider.list_calendars().await?;
+
+        let mut conn =
+            open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| SyncError::Local(format!("begin tx: {e}")))?;
+
+        for cal in &calendars {
+            upsert_calendar(&tx, cal).map_err(|e| SyncError::Local(format!("calendar: {e}")))?;
+        }
+
+        let mut tasks_pulled = 0usize;
+        // Two-pass to avoid parent ordering hazards: insert/update
+        // every task first (parent stays 0), then a second pass
+        // backfills `tasks.parent` once every remoteId is in place.
+        let mut all_tasks: Vec<RemoteTask> = Vec::new();
+        for cal in &calendars {
+            let tasks = self.provider.list_tasks(&cal.remote_id).await?;
+            for t in &tasks {
+                let task_id = upsert_task(&tx, t)
+                    .map_err(|e| SyncError::Local(format!("task {}: {e}", t.remote_id)))?;
+                upsert_caldav_task(&tx, task_id, t)
+                    .map_err(|e| SyncError::Local(format!("caldav_task {}: {e}", t.remote_id)))?;
+                tasks_pulled += 1;
+            }
+            all_tasks.extend(tasks);
+        }
+
+        let parent_links = relink_parents(&tx, &all_tasks)
+            .map_err(|e| SyncError::Local(format!("relink: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| SyncError::Local(format!("commit: {e}")))?;
+
+        tracing::info!(
+            "sync pull: {} calendars, {} tasks, {} parent links",
+            calendars.len(),
+            tasks_pulled,
+            parent_links
+        );
+        Ok(SyncOutcome {
+            calendars_pulled: calendars.len(),
+            tasks_pulled,
+            tasks_pushed: 0,
+            conflicts: 0,
+        })
+    }
+}
+
+/// Open a writable handle to the desktop's SQLite. Mirrors the
+/// shape `tasks_core::write` uses so the locking semantics are
+/// the same.
+fn open_rw(path: &Path) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(std::time::Duration::from_millis(1_000))?;
+    Ok(conn)
+}
+
+fn upsert_calendar(tx: &rusqlite::Transaction<'_>, cal: &RemoteCalendar) -> rusqlite::Result<()> {
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT cdl_id FROM caldav_lists WHERE cdl_uuid = ?1",
+            params![cal.remote_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let access = if cal.read_only { 2 } else { 1 }; // CalendarAccess::READ_ONLY / READ_WRITE
+    let color = cal.color.unwrap_or(0);
+    if let Some(_id) = existing {
+        tx.execute(
+            "UPDATE caldav_lists SET cdl_name = ?1, cdl_color = ?2, cdl_url = ?3, \
+             cdl_access = ?4, cdl_ctag = ?5 WHERE cdl_uuid = ?6",
+            params![
+                cal.name,
+                color,
+                cal.url,
+                access,
+                cal.change_tag,
+                cal.remote_id
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO caldav_lists \
+             (cdl_uuid, cdl_name, cdl_color, cdl_url, cdl_access, cdl_ctag, \
+              cdl_order, cdl_last_sync) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)",
+            params![
+                cal.remote_id,
+                cal.name,
+                color,
+                cal.url,
+                access,
+                cal.change_tag
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Result<i64> {
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT _id FROM tasks WHERE remoteId = ?1",
+            params![t.remote_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let now_ms = t.completed_ms.max(t.due_ms).max(1);
+    let due_ms = encode_due_with_has_time(t.due_ms, t.due_has_time);
+    let title_arg: Option<&str> = t.title.as_deref();
+    let notes_arg: Option<&str> = t.notes.as_deref();
+    let recurrence_arg: Option<&str> = t.recurrence.as_deref();
+
+    if let Some(id) = existing {
+        tx.execute(
+            "UPDATE tasks SET title = ?1, notes = ?2, dueDate = ?3, \
+             completed = ?4, importance = ?5, recurrence = ?6, modified = ?7 \
+             WHERE _id = ?8",
+            params![
+                title_arg,
+                notes_arg,
+                due_ms,
+                t.completed_ms,
+                t.priority,
+                recurrence_arg,
+                now_ms,
+                id,
+            ],
+        )?;
+        Ok(id)
+    } else {
+        tx.execute(
+            "INSERT INTO tasks \
+             (title, importance, dueDate, hideUntil, created, modified, \
+              completed, deleted, notes, estimatedSeconds, elapsedSeconds, \
+              timerStart, notificationFlags, lastNotified, recurrence, \
+              repeat_from, collapsed, parent, read_only, remoteId) \
+             VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5, 0, ?6, 0, 0, 0, 0, 0, ?7, \
+                     0, 0, 0, 0, ?8)",
+            params![
+                title_arg,
+                t.priority,
+                due_ms,
+                now_ms,
+                t.completed_ms,
+                notes_arg,
+                recurrence_arg,
+                t.remote_id,
+            ],
+        )?;
+        Ok(tx.last_insert_rowid())
+    }
+}
+
+/// If `due_has_time` is set, ensure the milliseconds value carries
+/// a non-zero seconds component so `tasks.dueDate % 60_000 > 0`
+/// (Tasks.org's "has time" flag) reads true. CalDAV-sourced rows
+/// often have `HH:00:00` exactly, which would otherwise look
+/// date-only to the local query path.
+fn encode_due_with_has_time(due_ms: i64, has_time: bool) -> i64 {
+    if due_ms == 0 || !has_time {
+        return due_ms;
+    }
+    if due_ms % 60_000 == 0 {
+        due_ms + 1_000
+    } else {
+        due_ms
+    }
+}
+
+fn upsert_caldav_task(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: i64,
+    t: &RemoteTask,
+) -> rusqlite::Result<()> {
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT cd_id FROM caldav_tasks WHERE cd_remote_id = ?1",
+            params![t.remote_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(_id) = existing {
+        tx.execute(
+            "UPDATE caldav_tasks SET cd_task = ?1, cd_calendar = ?2, \
+             cd_etag = ?3, cd_object = ?4, cd_remote_parent = ?5 \
+             WHERE cd_remote_id = ?6",
+            params![
+                task_id,
+                t.calendar_remote_id,
+                t.etag,
+                t.raw_vtodo
+                    .as_deref()
+                    .map(|_| format!("{}.ics", t.remote_id)),
+                t.parent_remote_id,
+                t.remote_id,
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_etag, cd_object, \
+              cd_last_sync, cd_deleted, cd_remote_parent, gt_moved, \
+              gt_remote_order) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, 0, 0)",
+            params![
+                task_id,
+                t.calendar_remote_id,
+                t.remote_id,
+                t.etag,
+                format!("{}.ics", t.remote_id),
+                t.parent_remote_id,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Backfill `tasks.parent` from each task's `parent_remote_id`. Has
+/// to run after every task in the batch is inserted so the parent
+/// lookup can find rows that arrived later in the pull. Mirrors
+/// `tasks_core::import::relink_subtasks`.
+fn relink_parents(tx: &rusqlite::Transaction<'_>, tasks: &[RemoteTask]) -> rusqlite::Result<usize> {
+    if tasks.is_empty() {
+        return Ok(0);
+    }
+    // Build remote_id → local _id map for the rows we just touched.
+    let mut local_id_by_remote: HashMap<&str, i64> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT _id, remoteId FROM tasks WHERE remoteId IS NOT NULL AND remoteId != ''",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let owned: Vec<(i64, String)> = rows.collect::<Result<_, _>>()?;
+        // Reborrow against `tasks`'s string slices for the lookup.
+        for (id, remote_id) in &owned {
+            for t in tasks {
+                if t.remote_id == *remote_id {
+                    local_id_by_remote.insert(t.remote_id.as_str(), *id);
+                }
+            }
+        }
+    }
+    let mut linked = 0;
+    for t in tasks {
+        if let Some(parent_remote) = t.parent_remote_id.as_deref() {
+            if let (Some(child_id), Some(parent_id)) = (
+                local_id_by_remote.get(t.remote_id.as_str()),
+                local_id_by_remote.get(parent_remote),
+            ) {
+                tx.execute(
+                    "UPDATE tasks SET parent = ?1 WHERE _id = ?2",
+                    params![parent_id, child_id],
+                )?;
+                linked += 1;
+            }
+        }
+    }
+    Ok(linked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{AccountCredentials, ProviderKind};
+    use crate::providers::caldav::CalDavProvider;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+    use tasks_core::db::Database;
+
+    /// In-memory provider for engine tests. Holds a fixed list of
+    /// calendars + per-calendar tasks; records every push call
+    /// for assertions.
+    #[derive(Clone, Default)]
+    struct MockProvider {
+        calendars: Vec<RemoteCalendar>,
+        tasks: HashMap<String, Vec<RemoteTask>>,
+        pushes: Arc<Mutex<Vec<RemoteTask>>>,
+        deletes: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::CalDav
+        }
+        fn account_label(&self) -> &str {
+            "mock"
+        }
+        async fn connect(&mut self) -> SyncResult<()> {
+            Ok(())
+        }
+        async fn list_calendars(&mut self) -> SyncResult<Vec<RemoteCalendar>> {
+            Ok(self.calendars.clone())
+        }
+        async fn list_tasks(&mut self, cal: &str) -> SyncResult<Vec<RemoteTask>> {
+            Ok(self.tasks.get(cal).cloned().unwrap_or_default())
+        }
+        async fn push_task(&mut self, t: &RemoteTask) -> SyncResult<Option<String>> {
+            self.pushes.lock().unwrap().push(t.clone());
+            Ok(Some("etag-pushed".to_string()))
+        }
+        async fn delete_task(&mut self, cal: &str, id: &str) -> SyncResult<()> {
+            self.deletes
+                .lock()
+                .unwrap()
+                .push((cal.to_string(), id.to_string()));
+            Ok(())
+        }
+        async fn sync_once(&mut self) -> SyncResult<SyncOutcome> {
+            Ok(SyncOutcome::default())
+        }
+    }
+
+    fn calendar(uuid: &str, name: &str) -> RemoteCalendar {
+        RemoteCalendar {
+            remote_id: uuid.to_string(),
+            name: name.to_string(),
+            url: Some(format!("https://example/dav/{uuid}/")),
+            color: Some(0),
+            change_tag: Some("ctag-1".to_string()),
+            read_only: false,
+        }
+    }
+
+    fn task(uid: &str, cal: &str, parent: Option<&str>) -> RemoteTask {
+        RemoteTask {
+            remote_id: uid.to_string(),
+            calendar_remote_id: cal.to_string(),
+            etag: Some("etag-1".to_string()),
+            title: Some(format!("Task {uid}")),
+            notes: None,
+            due_ms: 1_705_341_600_000,
+            due_has_time: true,
+            completed_ms: 0,
+            priority: 0,
+            recurrence: None,
+            parent_remote_id: parent.map(str::to_string),
+            raw_vtodo: None,
+        }
+    }
+
+    fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("tasks.db");
+        drop(Database::open_or_create_read_only(&db_path).unwrap());
+        (tmp, db_path)
+    }
+
+    #[tokio::test]
+    async fn pull_inserts_calendars_and_tasks() {
+        let (_tmp, db_path) = fresh_db();
+        let mut tasks = HashMap::new();
+        tasks.insert("cal-1".to_string(), vec![task("u-1", "cal-1", None)]);
+        let mock = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.pull_all().await.unwrap();
+        assert_eq!(outcome.calendars_pulled, 1);
+        assert_eq!(outcome.tasks_pulled, 1);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM caldav_lists", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE remoteId = 'u-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Task u-1");
+        let cal: String = conn
+            .query_row(
+                "SELECT cd_calendar FROM caldav_tasks WHERE cd_remote_id = 'u-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cal, "cal-1");
+    }
+
+    #[tokio::test]
+    async fn pull_relinks_parent_subtask_relationships() {
+        let (_tmp, db_path) = fresh_db();
+        // Subtask listed *before* parent in the pull — the relink
+        // pass must still resolve it.
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            "cal-1".to_string(),
+            vec![
+                task("child", "cal-1", Some("parent")),
+                task("parent", "cal-1", None),
+            ],
+        );
+        let mock = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        engine.pull_all().await.unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let parent_id: i64 = conn
+            .query_row("SELECT _id FROM tasks WHERE remoteId = 'parent'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let child_parent: i64 = conn
+            .query_row(
+                "SELECT parent FROM tasks WHERE remoteId = 'child'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_parent, parent_id);
+    }
+
+    #[tokio::test]
+    async fn second_pull_is_idempotent_and_updates_in_place() {
+        let (_tmp, db_path) = fresh_db();
+        let mut tasks = HashMap::new();
+        tasks.insert("cal-1".to_string(), vec![task("u-1", "cal-1", None)]);
+        let mut mock = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let provider1 = mock.clone();
+        let mut engine = SyncEngine::new(&db_path, Box::new(provider1));
+        engine.pull_all().await.unwrap();
+        // First pull: capture _id.
+        let first_id: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT _id FROM tasks WHERE remoteId = 'u-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        // Mutate the remote title and pull again.
+        mock.tasks
+            .get_mut("cal-1")
+            .unwrap()
+            .iter_mut()
+            .for_each(|t| t.title = Some("Renamed".into()));
+        let mut engine2 = SyncEngine::new(&db_path, Box::new(mock));
+        engine2.pull_all().await.unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (id, title): (i64, String) = conn
+            .query_row(
+                "SELECT _id, title FROM tasks WHERE remoteId = 'u-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // Same row id (UPDATE, not INSERT), new title.
+        assert_eq!(id, first_id);
+        assert_eq!(title, "Renamed");
+        let task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(task_count, 1);
+    }
+
+    #[tokio::test]
+    async fn caldav_provider_is_acceptable_to_engine_signature() {
+        // Compile-time check: a real Provider impl plugs into the
+        // engine without trait-bound friction. (CalDavProvider
+        // returns NotYetImplemented today, so we'd assert the
+        // error rather than running pull_all.)
+        let (_tmp, db_path) = fresh_db();
+        let p = CalDavProvider::new(AccountCredentials::default(), "test");
+        let _engine = SyncEngine::new(&db_path, Box::new(p));
+    }
+}

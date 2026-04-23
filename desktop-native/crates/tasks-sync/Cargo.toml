@@ -13,14 +13,17 @@ async-trait = "0.1"
 # Error plumbing shared with tasks-core.
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# Shared data shapes (Task, CaldavCalendar, …). The sync crate
-# translates remote payloads into these.
+# Shared data shapes (Task, CaldavCalendar, …) and the SQLite
+# bridge. The engine writes pulled state directly into the
+# desktop's local DB.
 tasks-core = { path = "../tasks-core" }
+rusqlite = { workspace = true }
 
-# Additional per-provider deps (reqwest, tokio, quick-xml, oauth2,
+# Additional per-provider deps (reqwest, quick-xml, oauth2,
 # libetebase-rs, …) will land when the individual provider
 # skeletons gain actual network code. Keeping the skeleton dep
 # set minimal so the crate compiles cleanly today.
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -1065,7 +1065,9 @@ name = "tasks-sync"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rusqlite",
  "tasks-core",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

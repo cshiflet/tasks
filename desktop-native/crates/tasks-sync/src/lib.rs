@@ -19,9 +19,12 @@
 //! * Milestone 5 — [`providers::etesync`]
 
 pub mod convert;
+pub mod engine;
 pub mod ical;
 pub mod provider;
 pub mod providers;
+
+pub use engine::SyncEngine;
 
 pub use convert::{remote_task_to_vtodo, vtodo_to_remote_task};
 
