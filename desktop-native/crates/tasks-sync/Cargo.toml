@@ -35,6 +35,12 @@ percent-encoding = "2"
 # Microsoft Graph / To Do).
 serde = { workspace = true }
 serde_json = "1"
+# EteSync SDK. First real provider dependency; pulls libetebase
+# and its sodiumoxide transitive dep, which is why per-provider
+# crates stay out of the skeleton until their provider lands.
+# Synchronous API — every call wraps in `tokio::task::spawn_blocking`.
+etebase = "0.5"
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
 
 # Additional per-provider deps (reqwest, quick-xml, oauth2,
 # libetebase-rs, …) will land when the individual provider
@@ -43,4 +49,3 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
