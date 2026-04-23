@@ -305,12 +305,20 @@ impl Provider for MicrosoftToDoProvider {
         }
         // Graph returns the updated resource with the fresh
         // `@odata.etag` — thread it back so the next pull is idempotent.
+        // M-5: a non-empty body that fails to parse is a real
+        // contract drift worth surfacing. An empty 2xx (some Graph
+        // endpoints return 204 No Content on create) still falls
+        // back to `Ok(None)`.
         #[derive(Deserialize)]
         struct EtagOnly {
             #[serde(rename = "@odata.etag")]
             etag: Option<String>,
         }
-        let parsed: EtagOnly = serde_json::from_str(&body).unwrap_or(EtagOnly { etag: None });
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed: EtagOnly = serde_json::from_str(&body)
+            .map_err(|e| SyncError::Protocol(format!("push response JSON: {e}")))?;
         Ok(parsed.etag)
     }
 

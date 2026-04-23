@@ -355,11 +355,19 @@ impl Provider for GoogleTasksProvider {
         // The response body is a full Task JSON including the new
         // etag; thread it back to the engine so the next pull is
         // idempotent.
+        // M-5: a non-empty body that fails to parse indicates a
+        // server-side contract drift worth surfacing rather than
+        // silently returning `None`. An empty 2xx (rare but legal)
+        // still falls back to `Ok(None)`.
         #[derive(Deserialize)]
         struct EtagOnly {
             etag: Option<String>,
         }
-        let parsed: EtagOnly = serde_json::from_str(&body).unwrap_or(EtagOnly { etag: None });
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed: EtagOnly = serde_json::from_str(&body)
+            .map_err(|e| SyncError::Protocol(format!("push response JSON: {e}")))?;
         Ok(parsed.etag)
     }
 
