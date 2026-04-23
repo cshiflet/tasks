@@ -29,6 +29,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, IF_MATCH};
 use reqwest::{Client, StatusCode};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use super::google_json::{
@@ -110,7 +111,11 @@ impl GoogleTasksProvider {
             let refresh = s.tokens.refresh_token.clone().ok_or_else(|| {
                 SyncError::Auth("Google access token expired and no refresh_token stored".into())
             })?;
-            let new = refresh_access_token(&s.http, &self.client_id, &refresh).await?;
+            // One expose_secret() per refresh — the raw token only
+            // leaves the wrapper to go into the POST body and is
+            // immediately rewrapped below.
+            let new =
+                refresh_access_token(&s.http, &self.client_id, refresh.expose_secret()).await?;
             // Google doesn't always rotate the refresh token; preserve
             // the existing one if the response omits it.
             let rotated_refresh = new.refresh_token.clone().or(Some(refresh));
@@ -123,7 +128,10 @@ impl GoogleTasksProvider {
                 let _ = store.put(ProviderKind::GoogleTasks, &self.account_label, &s.tokens);
             }
         }
-        HeaderValue::from_str(&format!("Bearer {}", s.tokens.access_token))
+        // Single boundary point for the Bearer header; the value is
+        // exposed just long enough to be copied into the
+        // `HeaderValue` which is then passed by reference.
+        HeaderValue::from_str(&format!("Bearer {}", s.tokens.access_token.expose_secret()))
             .map_err(|e| SyncError::Auth(format!("bad bearer header: {e}")))
     }
 }
@@ -497,8 +505,11 @@ fn parse_token_response(body: &str) -> SyncResult<OAuthTokens> {
         .map(|secs| now_ms() + secs * 1000)
         .unwrap_or(0);
     Ok(OAuthTokens {
-        access_token: raw.access_token,
-        refresh_token: raw.refresh_token,
+        // Wrap the parsed strings into SecretString as soon as they
+        // leave serde; they stay wrapped all the way to the HTTP
+        // boundary.
+        access_token: SecretString::from(raw.access_token),
+        refresh_token: raw.refresh_token.map(SecretString::from),
         expires_at_ms,
     })
 }
@@ -570,8 +581,11 @@ mod tests {
           "scope": "https://www.googleapis.com/auth/tasks"
         }"#;
         let t = parse_token_response(body).unwrap();
-        assert_eq!(t.access_token, "AT-1");
-        assert_eq!(t.refresh_token.as_deref(), Some("RT-1"));
+        assert_eq!(t.access_token.expose_secret(), "AT-1");
+        assert_eq!(
+            t.refresh_token.as_ref().map(|s| s.expose_secret()),
+            Some("RT-1")
+        );
         // Within a few ms of "now + 3600s".
         let target = now_ms() + 3_600_000;
         assert!((t.expires_at_ms - target).abs() < 5_000);
@@ -582,7 +596,7 @@ mod tests {
         // Google omits `refresh_token` on a refresh-token refresh.
         let body = r#"{"access_token": "AT-2", "expires_in": 3599, "token_type": "Bearer"}"#;
         let t = parse_token_response(body).unwrap();
-        assert_eq!(t.access_token, "AT-2");
+        assert_eq!(t.access_token.expose_secret(), "AT-2");
         assert!(t.refresh_token.is_none());
         assert!(t.expires_at_ms > 0);
     }

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 use crate::provider::ProviderKind;
@@ -24,15 +25,31 @@ use crate::provider::ProviderKind;
 /// callers store an absolute `expires_at_ms` rather than a
 /// relative TTL so a paused app doesn't come back thinking its
 /// token is still fresh.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Both tokens are wrapped in [`SecretString`] so they zeroize on
+/// drop and refuse to Debug-print. The HTTP layer exposes them
+/// exactly at the point of building the `Authorization` header /
+/// the token refresh POST body.
+#[derive(Debug, Clone)]
 pub struct OAuthTokens {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
     /// Milliseconds since Unix epoch at which the access token
     /// expires. `0` = unknown (rare — Google/MS both return an
     /// `expires_in`).
     pub expires_at_ms: i64,
 }
+
+impl PartialEq for OAuthTokens {
+    fn eq(&self, other: &Self) -> bool {
+        self.access_token.expose_secret() == other.access_token.expose_secret()
+            && self.refresh_token.as_ref().map(|s| s.expose_secret())
+                == other.refresh_token.as_ref().map(|s| s.expose_secret())
+            && self.expires_at_ms == other.expires_at_ms
+    }
+}
+
+impl Eq for OAuthTokens {}
 
 impl OAuthTokens {
     /// True when the access token is within `grace_ms` of its
@@ -124,8 +141,8 @@ mod tests {
 
     fn sample() -> OAuthTokens {
         OAuthTokens {
-            access_token: "AT".into(),
-            refresh_token: Some("RT".into()),
+            access_token: SecretString::from("AT".to_string()),
+            refresh_token: Some(SecretString::from("RT".to_string())),
             expires_at_ms: 1_700_000_000_000,
         }
     }
@@ -151,7 +168,7 @@ mod tests {
                 ProviderKind::MicrosoftToDo,
                 "alice",
                 &OAuthTokens {
-                    access_token: "other".into(),
+                    access_token: SecretString::from("other".to_string()),
                     refresh_token: None,
                     expires_at_ms: 0,
                 },
@@ -162,7 +179,8 @@ mod tests {
             store
                 .get(ProviderKind::MicrosoftToDo, "alice")
                 .unwrap()
-                .access_token,
+                .access_token
+                .expose_secret(),
             "other"
         );
     }
@@ -182,7 +200,7 @@ mod tests {
     #[test]
     fn needs_refresh_respects_grace_window() {
         let t = OAuthTokens {
-            access_token: "x".into(),
+            access_token: SecretString::from("x".to_string()),
             refresh_token: None,
             expires_at_ms: 1000,
         };

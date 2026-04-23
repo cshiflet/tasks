@@ -17,6 +17,9 @@ tracing-subscriber = { workspace = true }
 cxx = { workspace = true }
 cxx-qt = { workspace = true }
 cxx-qt-lib = { workspace = true }
+# Secret-wrapped password on `StoredAccount` so the ViewModel can't
+# stringify / log the raw bytes, and the value zeroes on drop.
+secrecy = { workspace = true }
 
 [build-dependencies]
 cxx-qt-build = { workspace = true }

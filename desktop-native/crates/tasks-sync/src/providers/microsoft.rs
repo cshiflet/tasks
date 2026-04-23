@@ -21,6 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, IF_MATCH};
 use reqwest::{Client, StatusCode};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use super::microsoft_json::{
@@ -95,7 +96,11 @@ impl MicrosoftToDoProvider {
             let refresh = s.tokens.refresh_token.clone().ok_or_else(|| {
                 SyncError::Auth("access token expired and no refresh_token stored".into())
             })?;
-            let new = refresh_access_token(&s.http, &self.client_id, &refresh).await?;
+            // One expose_secret() per refresh — see M-1 for why this
+            // is the only boundary where the token crosses into
+            // plain bytes.
+            let new =
+                refresh_access_token(&s.http, &self.client_id, refresh.expose_secret()).await?;
             // Azure AD usually rotates refresh tokens but isn't
             // contractually required to; preserve the previous one
             // if the response omits it.
@@ -109,7 +114,8 @@ impl MicrosoftToDoProvider {
                 let _ = store.put(ProviderKind::MicrosoftToDo, &self.account_label, &s.tokens);
             }
         }
-        HeaderValue::from_str(&format!("Bearer {}", s.tokens.access_token))
+        // Single M-1 boundary: Bearer header build site.
+        HeaderValue::from_str(&format!("Bearer {}", s.tokens.access_token.expose_secret()))
             .map_err(|e| SyncError::Auth(format!("bad bearer header: {e}")))
     }
 }
@@ -438,8 +444,9 @@ fn parse_token_response(body: &str) -> SyncResult<OAuthTokens> {
         .map(|secs| now_ms() + secs * 1000)
         .unwrap_or(0);
     Ok(OAuthTokens {
-        access_token: raw.access_token,
-        refresh_token: raw.refresh_token,
+        // Wrap parsed tokens the moment they leave serde.
+        access_token: SecretString::from(raw.access_token),
+        refresh_token: raw.refresh_token.map(SecretString::from),
         expires_at_ms,
     })
 }
@@ -510,8 +517,11 @@ mod tests {
           "refresh_token": "RT-1"
         }"#;
         let t = parse_token_response(body).unwrap();
-        assert_eq!(t.access_token, "AT-1");
-        assert_eq!(t.refresh_token.as_deref(), Some("RT-1"));
+        assert_eq!(t.access_token.expose_secret(), "AT-1");
+        assert_eq!(
+            t.refresh_token.as_ref().map(|s| s.expose_secret()),
+            Some("RT-1")
+        );
         let target = now_ms() + 3_599_000;
         assert!((t.expires_at_ms - target).abs() < 5_000);
     }

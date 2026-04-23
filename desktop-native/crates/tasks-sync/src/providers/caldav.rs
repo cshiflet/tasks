@@ -30,6 +30,7 @@ use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, IF_MATCH};
 use reqwest::{Client, Method, Url};
+use secrecy::ExposeSecret;
 
 use super::caldav_xml::{
     parse_calendar_home_set, parse_calendar_listing, parse_principal_response, parse_task_listing,
@@ -439,11 +440,14 @@ async fn report(
 }
 
 fn build_auth_header(credentials: &AccountCredentials) -> SyncResult<HeaderValue> {
+    // This is the single point where the secret crosses into an
+    // `HeaderValue`; `expose_secret()` is the documented M-1 API
+    // to opt out of the zeroize wrapper.
     if let Some(token) = &credentials.oauth_access_token {
-        HeaderValue::from_str(&format!("Bearer {token}"))
+        HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
             .map_err(|e| SyncError::Auth(format!("bad oauth token header: {e}")))
     } else if let (Some(user), Some(pass)) = (&credentials.username, &credentials.password) {
-        let encoded = B64_STANDARD.encode(format!("{user}:{pass}"));
+        let encoded = B64_STANDARD.encode(format!("{user}:{}", pass.expose_secret()));
         HeaderValue::from_str(&format!("Basic {encoded}"))
             .map_err(|e| SyncError::Auth(format!("bad basic auth header: {e}")))
     } else {
@@ -478,12 +482,8 @@ mod tests {
 
     #[test]
     fn kind_and_label_are_reported() {
-        let creds = AccountCredentials {
-            server_url: Some("https://example.com/dav/".into()),
-            username: Some("alice".into()),
-            password: Some("hunter2".into()),
-            ..Default::default()
-        };
+        let creds =
+            AccountCredentials::new_password("https://example.com/dav/", "alice", "hunter2");
         let p = CalDavProvider::new(creds, "Fastmail / alice");
         assert_eq!(p.kind(), ProviderKind::CalDav);
         assert_eq!(p.account_label(), "Fastmail / alice");
@@ -491,21 +491,14 @@ mod tests {
 
     #[test]
     fn build_auth_header_picks_bearer_when_oauth_set() {
-        let creds = AccountCredentials {
-            oauth_access_token: Some("tok".into()),
-            ..Default::default()
-        };
+        let creds = AccountCredentials::new_oauth("tok", None);
         let h = build_auth_header(&creds).unwrap();
         assert_eq!(h, "Bearer tok");
     }
 
     #[test]
     fn build_auth_header_falls_back_to_basic() {
-        let creds = AccountCredentials {
-            username: Some("alice".into()),
-            password: Some("secret".into()),
-            ..Default::default()
-        };
+        let creds = AccountCredentials::new_password("https://ex", "alice", "secret");
         let h = build_auth_header(&creds).unwrap();
         // base64("alice:secret") = "YWxpY2U6c2VjcmV0".
         assert_eq!(h, "Basic YWxpY2U6c2VjcmV0");

@@ -12,6 +12,7 @@
 //! `providers::*` modules implement.
 
 use async_trait::async_trait;
+use secrecy::SecretString;
 use thiserror::Error;
 
 /// Uniform error shape for every provider.
@@ -94,13 +95,47 @@ impl ProviderKind {
 ///   `server_url` is unused.
 /// * EteSync: `server_url` + `username` + `password` (used to
 ///   derive the login + encryption keys — never sent verbatim).
+///
+/// Password + OAuth fields are [`SecretString`] (zeroize-on-drop,
+/// no `Debug` / `Display` impl) so a stray log call can't bleed
+/// the secret into a crash report. The three secret fields are
+/// expected to be consumed exactly at the HTTP boundary via
+/// `.expose_secret()` — nowhere else.
 #[derive(Debug, Clone, Default)]
 pub struct AccountCredentials {
     pub server_url: Option<String>,
     pub username: Option<String>,
-    pub password: Option<String>,
-    pub oauth_access_token: Option<String>,
-    pub oauth_refresh_token: Option<String>,
+    pub password: Option<SecretString>,
+    pub oauth_access_token: Option<SecretString>,
+    pub oauth_refresh_token: Option<SecretString>,
+}
+
+impl AccountCredentials {
+    /// Construct a username + password bundle (CalDAV / EteSync).
+    pub fn new_password(
+        server_url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            server_url: Some(server_url.into()),
+            username: Some(username.into()),
+            password: Some(SecretString::from(password.into())),
+            oauth_access_token: None,
+            oauth_refresh_token: None,
+        }
+    }
+
+    /// Construct an OAuth bundle (Google / Microsoft).
+    pub fn new_oauth(access_token: impl Into<String>, refresh_token: Option<String>) -> Self {
+        Self {
+            server_url: None,
+            username: None,
+            password: None,
+            oauth_access_token: Some(SecretString::from(access_token.into())),
+            oauth_refresh_token: refresh_token.map(SecretString::from),
+        }
+    }
 }
 
 /// A remote calendar / task list as the provider knows it. Maps

@@ -45,6 +45,10 @@ tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
 # pulls reqwest (blocking); we want the async version with rustls
 # so a user's system OpenSSL issues don't block a sync.
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+# Zeroize-on-drop wrapper around String for passwords + OAuth tokens.
+# See the field-level comments on `AccountCredentials` /
+# `OAuthTokens` for why this matters.
+secrecy = { workspace = true }
 
 # Additional per-provider deps (reqwest, quick-xml, oauth2,
 # libetebase-rs, …) will land when the individual provider

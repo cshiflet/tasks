@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use etebase::{
     Account, Client, Collection, CollectionAccessLevel, FetchOptions, Item, ItemMetadata,
 };
+use secrecy::ExposeSecret;
 
 use crate::ical::{parse_vcalendar, serialize_vcalendar};
 use crate::provider::{
@@ -98,7 +99,10 @@ impl Provider for EteSyncProvider {
         let joined = tokio::task::spawn_blocking(move || -> SyncResult<()> {
             let client = Client::new("tasks-desktop-native", &server_url)
                 .map_err(|e| map_err("Client::new", e))?;
-            let account = Account::login(client, &username, &password)
+            // Single spot where the password leaves its secret
+            // wrapper and crosses into the `etebase` FFI; the
+            // wrapper stays live until this closure returns.
+            let account = Account::login(client, &username, password.expose_secret())
                 .map_err(|e| SyncError::Auth(format!("login: {e}")))?;
             *state.lock().unwrap() = Some(account);
             Ok(())
@@ -340,12 +344,7 @@ mod tests {
 
     #[test]
     fn kind_and_label_are_reported() {
-        let creds = AccountCredentials {
-            server_url: Some("https://api.etebase.com".into()),
-            username: Some("alice".into()),
-            password: Some("hunter2".into()),
-            ..Default::default()
-        };
+        let creds = AccountCredentials::new_password("https://api.etebase.com", "alice", "hunter2");
         let p = EteSyncProvider::new(creds, "alice@etebase");
         assert_eq!(p.kind(), ProviderKind::EteSync);
         assert_eq!(p.account_label(), "alice@etebase");

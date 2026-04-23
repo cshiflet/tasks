@@ -266,6 +266,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
+use secrecy::SecretString;
 
 use tasks_core::datetime::{
     describe_alarm, format_due_label, format_duration_hhmm, parse_due_input, parse_duration_input,
@@ -294,6 +295,12 @@ const KIND_ETESYNC: i32 = 3;
 /// `password` is captured but not yet consumed — the SyncEngine
 /// wiring is the next commit. Silencing dead_code until then so the
 /// type signature stays stable across the two commits.
+///
+/// `password` is wrapped in [`SecretString`] (M-1) so it zeroes on
+/// drop and can't be accidentally Debug-printed alongside the rest
+/// of the struct. Its single consumer — the future SyncEngine
+/// handoff — exposes the inner value only at the FFI boundary via
+/// `.expose_secret()`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct StoredAccount {
@@ -301,7 +308,7 @@ struct StoredAccount {
     label: String,
     server: String,
     username: String,
-    password: String,
+    password: SecretString,
 }
 
 pub struct TaskListViewModelRust {
@@ -609,7 +616,7 @@ impl qobject::TaskListViewModel {
             label: label_s,
             server: server_s,
             username: username_s,
-            password: password_s,
+            password: SecretString::from(password_s),
         });
         publish_accounts(self.as_mut());
         self.as_mut()
