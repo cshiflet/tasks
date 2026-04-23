@@ -18,6 +18,11 @@ tracing = { workspace = true }
 # desktop's local DB.
 tasks-core = { path = "../tasks-core" }
 rusqlite = { workspace = true }
+# XML parsing for CalDAV PROPFIND / REPORT multi-status
+# responses. Request bodies are small enough to build with
+# string interpolation; parsing nested `<d:response>` trees
+# wants a real pull-parser.
+quick-xml = "0.36"
 
 # Additional per-provider deps (reqwest, quick-xml, oauth2,
 # libetebase-rs, …) will land when the individual provider

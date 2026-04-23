@@ -7,6 +7,7 @@
 //! actual network code.
 
 pub mod caldav;
+pub mod caldav_xml;
 pub mod etesync;
 pub mod google;
 pub mod microsoft;
