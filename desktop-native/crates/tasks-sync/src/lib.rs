@@ -18,9 +18,17 @@
 //! * Milestone 4 — [`providers::google`], [`providers::microsoft`]
 //! * Milestone 5 — [`providers::etesync`]
 
+pub mod convert;
+pub mod ical;
 pub mod provider;
 pub mod providers;
 
+pub use convert::{remote_task_to_vtodo, vtodo_to_remote_task};
+
+pub use ical::{
+    parse_vcalendar, serialize_vcalendar, AlarmTrigger, IcalError, IcalResult, VAlarm, VTodo,
+    VTodoStatus,
+};
 pub use provider::{
     AccountCredentials, Provider, ProviderKind, RemoteCalendar, RemoteTask, SyncError, SyncOutcome,
     SyncResult,

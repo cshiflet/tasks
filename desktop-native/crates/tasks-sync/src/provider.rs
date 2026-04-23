@@ -122,6 +122,13 @@ pub struct RemoteTask {
     pub title: Option<String>,
     pub notes: Option<String>,
     pub due_ms: i64,
+    /// Whether `due_ms` carries a time-of-day. Tasks.org's local
+    /// schema folds this into `tasks.dueDate`'s seconds component
+    /// (`secs % 60 > 0` flags timed); but iCal carries it
+    /// explicitly via `DUE` vs `DUE;VALUE=DATE`, and the
+    /// difference matters on round-trip — a 18:00 UTC due would
+    /// otherwise serialise as a date-only because seconds == 0.
+    pub due_has_time: bool,
     pub completed_ms: i64,
     pub priority: i32,
     pub recurrence: Option<String>,
