@@ -61,6 +61,7 @@ impl LoopbackReceiver {
             .set_nonblocking(false)
             .map_err(|e| OAuthError::Random(format!("set_nonblocking: {e}")))?;
         let deadline = std::time::Instant::now() + timeout;
+        let bound_port = self.addr.port();
 
         // We can't use TcpListener::accept_timeout directly; poll
         // set_read_timeout on a peer stream instead. The idiom:
@@ -77,11 +78,15 @@ impl LoopbackReceiver {
                 ));
             }
             match self.listener.accept() {
-                Ok((stream, _peer)) => match handle_stream(stream, expected_state) {
+                Ok((stream, _peer)) => match handle_stream(stream, expected_state, bound_port) {
                     Ok(params) => return Ok(params),
                     Err(OAuthError::MalformedRedirect(msg)) => {
                         tracing::debug!("ignoring malformed loopback hit: {msg}");
-                        // Keep accepting until timeout.
+                        // Keep accepting until timeout. A slow
+                        // client that never completes its request
+                        // within the per-stream 1 s deadline
+                        // (H-3 / slow-loris — also covers L-4)
+                        // lands here too.
                         continue;
                     }
                     Err(other) => return Err(other),
@@ -98,19 +103,36 @@ impl LoopbackReceiver {
     }
 }
 
+/// Per-stream read deadline (H-3). A browser redirect is sub-
+/// millisecond in practice; 1 second is generous enough to tolerate
+/// a sleepy laptop on localhost while still aborting a slow-loris
+/// client that dribbles bytes to hold the socket open. This also
+/// addresses L-4 — no separate fix needed.
+const STREAM_DEADLINE: Duration = Duration::from_secs(1);
+
 fn handle_stream(
     mut stream: TcpStream,
     expected_state: &str,
+    bound_port: u16,
 ) -> Result<RedirectParams, OAuthError> {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_read_timeout(Some(STREAM_DEADLINE)).ok();
+    stream.set_write_timeout(Some(STREAM_DEADLINE)).ok();
 
     // Read enough of the request to get the first line + maybe
     // some headers. Browsers don't send request bodies on the
-    // redirect GET, so 8 KiB is plenty.
+    // redirect GET, so 8 KiB is plenty. Enforce a wall-clock
+    // deadline across all read()s so a client that sends one byte
+    // at a time doesn't park the listener.
     let mut buf = [0u8; 8192];
     let mut read_total = 0usize;
+    let start = std::time::Instant::now();
     while read_total < buf.len() {
+        if start.elapsed() >= STREAM_DEADLINE {
+            // Don't bother with a 408; just drop the connection.
+            return Err(OAuthError::MalformedRedirect(
+                "request headers incomplete before deadline".into(),
+            ));
+        }
         match stream.read(&mut buf[read_total..]) {
             Ok(0) => break,
             Ok(n) => {
@@ -119,15 +141,23 @@ fn handle_stream(
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // read_timeout fired — drop the slow client.
+                return Err(OAuthError::MalformedRedirect(
+                    "read timed out on loopback stream".into(),
+                ));
+            }
             Err(e) => {
                 return Err(OAuthError::MalformedRedirect(format!("read: {e}")));
             }
         }
     }
     let text = String::from_utf8_lossy(&buf[..read_total]);
-    let first_line = text
-        .lines()
+    let mut lines = text.lines();
+    let first_line = lines
         .next()
         .ok_or_else(|| OAuthError::MalformedRedirect("empty request".into()))?;
 
@@ -137,6 +167,42 @@ fn handle_stream(
     let path = parts
         .next()
         .ok_or_else(|| OAuthError::MalformedRedirect("no path in request line".into()))?;
+
+    // Only accept the exact callback path. Anything else is a 400.
+    // Without this any local process (or a browser poking the
+    // loopback port during dev-tools auto-discovery) could feed
+    // the receiver an attacker-shaped URL.
+    let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    if path_only != "/cb" {
+        let _ = write_bad_request(&mut stream);
+        return Err(OAuthError::MalformedRedirect(format!(
+            "unexpected path {path_only}"
+        )));
+    }
+
+    // Require the Host header to match our bound loopback port.
+    // DNS rebinding and a drive-by browser hitting the same port
+    // from a public origin both rely on a Host header the server
+    // didn't expect; reject anything that isn't exactly
+    // `127.0.0.1:<bound_port>`.
+    let expected_host = format!("127.0.0.1:{bound_port}");
+    let host_header = lines
+        .clone()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("Host") {
+                Some(value.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    if host_header != expected_host {
+        let _ = write_bad_request(&mut stream);
+        return Err(OAuthError::MalformedRedirect(format!(
+            "unexpected Host header {host_header:?}"
+        )));
+    }
 
     let params = parse_redirect(path, expected_state)?;
 
@@ -163,6 +229,21 @@ fn handle_stream(
     Ok(params)
 }
 
+fn write_bad_request(stream: &mut TcpStream) -> std::io::Result<()> {
+    let body = "bad request";
+    let response = format!(
+        "HTTP/1.1 400 Bad Request\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,8 +268,9 @@ mod tests {
             // Give the receiver a brief moment to start accepting.
             std::thread::sleep(Duration::from_millis(50));
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s.write_all(b"GET /cb?code=abc&state=xyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .unwrap();
+            let req =
+                format!("GET /cb?code=abc&state=xyz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+            s.write_all(req.as_bytes()).unwrap();
             // Drain the response so the server's write_all returns.
             let mut buf = [0u8; 512];
             let _ = s.read(&mut buf);
@@ -218,8 +300,9 @@ mod tests {
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s.write_all(b"GET /cb?code=abc&state=wrong HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .unwrap();
+            let req =
+                format!("GET /cb?code=abc&state=wrong HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+            s.write_all(req.as_bytes()).unwrap();
             let mut buf = [0u8; 512];
             let _ = s.read(&mut buf);
         });
@@ -227,6 +310,95 @@ mod tests {
             .wait_for_redirect("expected", Duration::from_secs(2))
             .unwrap_err();
         assert!(matches!(err, OAuthError::StateMismatch { .. }));
+        handle.join().unwrap();
+    }
+
+    /// H-3 path allowlist: anything other than `/cb` returns 400
+    /// and the receiver keeps accepting. If the deadline fires
+    /// without a good request we bubble `MalformedRedirect`.
+    #[test]
+    fn wrong_path_is_rejected_and_receiver_keeps_going() {
+        let receiver = LoopbackReceiver::bind().unwrap();
+        let port = receiver.port();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let req = format!("GET /admin HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+            // Read should show a 400 response.
+            let response = String::from_utf8_lossy(&buf).to_string();
+            assert!(response.contains("400"), "response: {response}");
+        });
+        // Receiver stays up until timeout — there's no valid /cb hit.
+        let err = receiver
+            .wait_for_redirect("state", Duration::from_millis(500))
+            .unwrap_err();
+        assert!(matches!(err, OAuthError::MalformedRedirect(_)));
+        handle.join().unwrap();
+    }
+
+    /// H-3 Host-header check: a request that spoofs a different
+    /// Host lands in 400-territory and the receiver moves on.
+    #[test]
+    fn wrong_host_is_rejected() {
+        let receiver = LoopbackReceiver::bind().unwrap();
+        let port = receiver.port();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            // A DNS-rebinding-style request claiming a public host.
+            let req = b"GET /cb?code=abc&state=ok HTTP/1.1\r\nHost: attacker.example.com\r\n\r\n";
+            s.write_all(req).unwrap();
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+            let response = String::from_utf8_lossy(&buf).to_string();
+            assert!(response.contains("400"), "response: {response}");
+        });
+        let err = receiver
+            .wait_for_redirect("ok", Duration::from_millis(500))
+            .unwrap_err();
+        assert!(matches!(err, OAuthError::MalformedRedirect(_)));
+        handle.join().unwrap();
+    }
+
+    /// H-3 / L-4 slow-loris: a client that connects but never
+    /// finishes its headers must be dropped within the per-stream
+    /// deadline, and the listener must keep accepting after the
+    /// drop.
+    #[test]
+    fn slow_client_is_dropped_within_deadline() {
+        let receiver = LoopbackReceiver::bind().unwrap();
+        let port = receiver.port();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            // Open the socket, write only a partial request line
+            // (no terminating CRLFCRLF), and hold it open past the
+            // 1 s deadline.
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let _ = s.write_all(b"GET /cb?co");
+            // Sleep past the deadline + a small margin.
+            std::thread::sleep(Duration::from_millis(1500));
+            // Drop.
+            drop(s);
+        });
+        // The receiver should give up on the slow client inside
+        // STREAM_DEADLINE (~1 s) and then time out on its own
+        // wall-clock deadline a short while later.
+        let start = std::time::Instant::now();
+        let err = receiver
+            .wait_for_redirect("state", Duration::from_millis(2500))
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(err, OAuthError::MalformedRedirect(_)));
+        // We should have waited about the outer timeout, not
+        // significantly longer — confirming we didn't block
+        // forever on the slow client.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "receiver hung past outer deadline: {elapsed:?}"
+        );
         handle.join().unwrap();
     }
 }
