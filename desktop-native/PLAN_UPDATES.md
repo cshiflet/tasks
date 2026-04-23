@@ -596,3 +596,82 @@ Dependencies pulled in so far: `quick-xml`, `sha2`, `base64`,
 `tokio` (dev-only). No reqwest, no oauth2 crate, no
 libetebase-rs yet — those arrive with each provider's first
 network commit.
+
+## 11. All four sync providers wired (Milestones 3, 4, 5 — code complete)
+
+Every provider stub in §9 is now a real implementation. Same
+`Provider` trait surface; same `SyncEngine::sync_now()` still
+composes them. Order in which they landed and what each added:
+
+- **EteSync (Milestone 5).** Wraps `etebase` 0.5 via
+  `tokio::task::spawn_blocking` since the crate is synchronous.
+  `Account` is not Clone, so the session sits behind an
+  `Arc<Mutex<Option<Account>>>` and every provider call clones
+  the Arc into the spawn_blocking closure. Uses collection type
+  `etebase.vtodo`; item.uid() → `RemoteTask::remote_id`.
+  Content round-trips through `parse_vcalendar` +
+  `vtodo_to_remote_task` so the existing VALARM / RRULE / parent
+  handling applies uniformly.
+- **CalDAV (Milestone 3).** `reqwest` 0.11 with rustls-tls.
+  3-step discovery cascade (`PROPFIND /` → current-user-principal
+  → calendar-home-set) runs inside `connect()`; results persist
+  on a `Session` kept under `Arc<tokio::sync::Mutex<Option<…>>>`.
+  PROPFIND and REPORT use `Method::from_bytes(b"…")` since reqwest
+  doesn't ship them. Pushes PUT with `If-Match: "<etag>"`; 412 →
+  `SyncError::Conflict`. Bearer auth honoured first (for
+  Fastmail/iCloud when they grow OAuth) with Basic as the
+  fallback. DELETE tolerates 404.
+- **Google Tasks (Milestone 4a).** Tasks REST v1. OAuth2
+  installed-app flow: `authorize()` binds a `LoopbackReceiver`,
+  opens the auth URL via a caller-supplied closure, blocks on
+  the redirect inside `spawn_blocking`, exchanges the code at
+  `oauth2.googleapis.com/token`. `ensure_fresh()` refreshes the
+  access token 60 s before expiry and writes the rotated tokens
+  back to the `TokenStore`. `list_tasks` requests
+  `showCompleted=true&showHidden=true` since Tasks.org surfaces
+  both; tombstones (`deleted=true`) are dropped on pull so the
+  engine's own tombstone pass handles them. Update uses PUT;
+  create uses POST when `remote_id` is empty.
+- **Microsoft To Do (Milestone 4b).** Microsoft Graph
+  `/me/todo`. Same PKCE loopback shape as Google, different
+  endpoints + pagination: OData `@odata.nextLink` (absolute URL,
+  not a page token). Scopes: `Tasks.ReadWrite offline_access`.
+  Update uses PATCH (PUT replaces the whole resource on Graph
+  and would drop fields we don't serialise). etag lives on
+  `@odata.etag`. 429 rate-limit responses bucketed as
+  `SyncError::Network` so the engine retries on its next tick.
+
+Testing: every provider ships offline unit tests for the
+pure-logic bits (auth header selection, token response parsing,
+HTTP error classification, path-segment encoding). Network paths
+await real accounts + integration fixtures; we can't mint
+credentials in CI. Workspace totals 182 tests after the
+Microsoft commit, green under `cargo clippy --all-targets -D
+warnings`.
+
+Dependencies added with the real implementations:
+`reqwest` 0.11 (rustls-tls + json), `etebase` 0.5, `tokio` 1 as
+a real (not just dev) dep for `spawn_blocking` + async Mutex.
+No `oauth2` crate — the PKCE + URL plumbing stayed in
+`tasks_sync::oauth`, which is enough for all three OAuth
+providers.
+
+Remaining follow-ups before any provider is user-visible:
+
+- **UI wiring.** The cxx-qt bridge needs an Accounts panel that
+  lists configured providers, surfaces the `authorize()` call
+  for OAuth ones, and exposes `SyncEngine::sync_now` to a "Sync
+  now" toolbar button. Currently the sync layer compiles + tests
+  but isn't reachable from QML.
+- **OS-native token store.** `InMemoryTokenStore` is fine for
+  tests but loses OAuth tokens on restart. Keyring adapters
+  (libsecret / Keychain / Credential Manager) stay additive on
+  top of the existing `TokenStore` trait.
+- **Integration fixtures.** Radicale for CalDAV, a recorded
+  Graph + Tasks API fixture via a tape recorder
+  (rustic-tape / vcr-rs) for the REST providers, and an Etebase
+  test-server container for the E2EE path.
+- **Refresh-token leaks on ensure_fresh failure.** Currently a
+  refresh-endpoint 4xx drops the session into an Auth error and
+  the user has to reauthorise. That's correct but unfriendly;
+  the UI should surface "reauthorise" as a first-class action.
