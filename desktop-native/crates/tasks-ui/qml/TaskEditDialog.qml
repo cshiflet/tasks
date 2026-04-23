@@ -299,6 +299,14 @@ ApplicationWindow {
             // a phantom horizontal scrollbar alongside the vertical
             // one.
             contentWidth: availableWidth
+            // Keep the vertical scrollbar pinned so it reserves its
+            // width inside `availableWidth` — with the default
+            // `AsNeeded` policy the bar is an overlay and sits on
+            // top of the form, hiding the right edge of fields (the
+            // UI#4 report). Horizontal bar stays off; we never want
+            // that one.
+            ScrollBar.vertical.policy: ScrollBar.AlwaysOn
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
                 width: scroll.availableWidth
@@ -341,20 +349,34 @@ ApplicationWindow {
                 text: qsTr("Due")
                 opacity: 0.7
             }
-            TextField {
-                id: dueField
+            RowLayout {
                 Layout.fillWidth: true
-                placeholderText: qsTr("YYYY-MM-DD or YYYY-MM-DD HH:MM")
+                spacing: 4
+                TextField {
+                    id: dueField
+                    Layout.fillWidth: true
+                    placeholderText: qsTr("YYYY-MM-DD or YYYY-MM-DD HH:MM")
+                }
+                DatePickerButton {
+                    target: dueField
+                }
             }
 
             Label {
                 text: qsTr("Hide until")
                 opacity: 0.7
             }
-            TextField {
-                id: hideField
+            RowLayout {
                 Layout.fillWidth: true
-                placeholderText: qsTr("Same format as Due; blank = visible now")
+                spacing: 4
+                TextField {
+                    id: hideField
+                    Layout.fillWidth: true
+                    placeholderText: qsTr("Same format as Due; blank = visible now")
+                }
+                DatePickerButton {
+                    target: hideField
+                }
             }
 
             Label {
@@ -639,8 +661,13 @@ ApplicationWindow {
                              && /(^|;)(COUNT|UNTIL)=/.test(
                                  dialog.initialRecurrenceRaw)
                     text: qsTr("Note: saving will drop the COUNT / UNTIL on the existing rule.")
-                    color: Qt.darker("red", 0.8)
-                    opacity: 0.8
+                    // Use Material's theme-aware red rather than
+                    // `Qt.darker("red", 0.8)` — a dark red on a
+                    // dark background was unreadable. Material.Red
+                    // resolves to #EF5350 in dark mode and #F44336
+                    // in light.
+                    color: Material.color(Material.Red)
+                    opacity: 0.9
                     font.pointSize: Qt.application.font.pointSize - 1
                     wrapMode: Text.Wrap
                 }

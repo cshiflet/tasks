@@ -26,6 +26,7 @@ fn main() {
                 "qml/SettingsWindow.qml",
                 "qml/ListSettingsPane.qml",
                 "qml/AccountsPane.qml",
+                "qml/DatePickerButton.qml",
                 "qml/PriorityDot.qml",
             ],
             ..Default::default()

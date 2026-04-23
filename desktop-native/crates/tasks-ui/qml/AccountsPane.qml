@@ -128,10 +128,15 @@ ColumnLayout {
         }
     }
 
+    // Divider between the accounts list and the add-account form.
+    // Uses Material's foreground colour at low opacity so it renders
+    // as a faint line in both themes — the old `rgba(0, 0, 0, 0.12)`
+    // disappeared entirely on dark backgrounds.
     Rectangle {
         Layout.fillWidth: true
         height: 1
-        color: Qt.rgba(0, 0, 0, 0.12)
+        color: Material.foreground
+        opacity: 0.12
     }
 
     Label {

@@ -43,6 +43,27 @@ fn main() -> ExitCode {
         env::set_var("QT_QUICK_CONTROLS_STYLE", "Material");
     }
 
+    // On Windows 11, tell Qt's `windows` QPA plugin to request the
+    // OS "immersive dark mode" on every native title bar when the
+    // system is set to a dark accent colour. Without this, Qt
+    // leaves the title bars white regardless of system theme, and
+    // `QGuiApplication::styleHints()->colorScheme()` stays
+    // `Unknown` — which in turn breaks `Material.theme:
+    // Material.System` propagation into child windows (fixes both
+    // UI#1 "ugly unthemed title bars" and UI#2 "main light, edit
+    // dark" reports on Windows 11).
+    //
+    // Env-var form is the least-invasive plumbing: no QPA plugin
+    // selection, no platform-specific FFI. `darkmode=2` means
+    // both Qt-styled Windows chrome AND native immersive dark
+    // title bars (vs `=1` which only styles the app chrome).
+    // Accept a caller override so power users can force a specific
+    // value for debugging.
+    #[cfg(target_os = "windows")]
+    if env::var_os("QT_QPA_PLATFORM").is_none() {
+        env::set_var("QT_QPA_PLATFORM", "windows:darkmode=2");
+    }
+
     let mut app = QGuiApplication::new();
     let mut engine = QQmlApplicationEngine::new();
 
