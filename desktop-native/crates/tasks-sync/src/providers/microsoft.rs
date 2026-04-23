@@ -40,6 +40,13 @@ const AUTHORIZATION_ENDPOINT: &str =
     "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
 const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
 const API_ROOT: &str = "https://graph.microsoft.com/v1.0/me/todo";
+/// Fixed origin all Graph calls must stay on. `@odata.nextLink` is
+/// an absolute URL the server picks, so we clamp every page URL
+/// before attaching the Bearer token — otherwise a compromised
+/// Graph edge could bounce the request at a third-party host and
+/// leak the token. Scheme/host/port match is exact.
+const GRAPH_HOST: &str = "graph.microsoft.com";
+const GRAPH_SCHEME: &str = "https";
 /// `Tasks.ReadWrite` covers todo read + write; `offline_access`
 /// is what makes the token endpoint hand us a refresh_token.
 const SCOPES: &[&str] = &["Tasks.ReadWrite", "offline_access"];
@@ -157,6 +164,9 @@ impl Provider for MicrosoftToDoProvider {
         let mut url = format!("{API_ROOT}/lists");
         let mut out = Vec::new();
         loop {
+            // Clamp every URL (first page + each `@odata.nextLink`)
+            // to the Graph origin before attaching the Bearer token.
+            check_graph_origin(&url)?;
             let resp = s
                 .http
                 .get(&url)
@@ -195,6 +205,9 @@ impl Provider for MicrosoftToDoProvider {
         );
         let mut out = Vec::new();
         loop {
+            // Clamp the first page + every `@odata.nextLink` to the
+            // Graph origin; see H-1 for the token-leak rationale.
+            check_graph_origin(&url)?;
             let resp = s
                 .http
                 .get(&url)
@@ -432,6 +445,22 @@ fn percent_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
+/// Ensure `url` is `https://graph.microsoft.com/...`; reject any
+/// other origin before issuing an authenticated request.
+fn check_graph_origin(url: &str) -> SyncResult<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| SyncError::Protocol(format!("bad follow-up URL {url}: {e}")))?;
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme == GRAPH_SCHEME && host == GRAPH_HOST {
+        Ok(())
+    } else {
+        Err(SyncError::Protocol(format!(
+            "off-origin redirect to {host}"
+        )))
+    }
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -522,5 +551,18 @@ mod tests {
     #[test]
     fn percent_encode_safeguards_path_segments() {
         assert_eq!(percent_encode("AAMkA/lis"), "AAMkA%2Flis");
+    }
+
+    #[test]
+    fn check_graph_origin_rejects_off_origin_nextlink() {
+        // Baseline: the real Graph host is accepted.
+        assert!(check_graph_origin("https://graph.microsoft.com/v1.0/me/todo/lists").is_ok());
+        // A malicious `@odata.nextLink` pointing elsewhere is rejected.
+        let err = check_graph_origin("https://evil.example.org/v1.0/me/todo/lists").unwrap_err();
+        assert!(matches!(err, SyncError::Protocol(m) if m.contains("evil.example.org")));
+        // Scheme downgrade → rejected.
+        assert!(check_graph_origin("http://graph.microsoft.com/v1.0/me/todo/lists").is_err());
+        // Subdomain shenanigans → rejected (exact host match only).
+        assert!(check_graph_origin("https://graph.microsoft.com.evil.example.org/v1.0").is_err());
     }
 }

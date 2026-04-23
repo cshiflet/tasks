@@ -47,6 +47,13 @@ use crate::token_store::{OAuthTokens, TokenStore};
 const AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const API_ROOT: &str = "https://tasks.googleapis.com/tasks/v1";
+/// Fixed origin every authenticated Tasks API request must stay on.
+/// We clamp the request URL before attaching the Bearer token
+/// (preventative: the current code only composes URLs from
+/// constants, but future work that pages via server-provided
+/// absolute URLs must not leak the token). Matches H-1's shape.
+const TASKS_HOST: &str = "tasks.googleapis.com";
+const TASKS_SCHEME: &str = "https";
 /// The single scope we need — read + write Google Tasks.
 const SCOPE: &str = "https://www.googleapis.com/auth/tasks";
 /// Refresh the access token when it's this close to expiring.
@@ -183,6 +190,8 @@ impl Provider for GoogleTasksProvider {
                 url.push_str("&pageToken=");
                 url.push_str(&percent_encode(t));
             }
+            // Preventative origin clamp; see H-1 rationale.
+            check_tasks_origin(&url)?;
             let resp = s
                 .http
                 .get(&url)
@@ -228,6 +237,8 @@ impl Provider for GoogleTasksProvider {
                 url.push_str("&pageToken=");
                 url.push_str(&percent_encode(t));
             }
+            // Preventative origin clamp; see H-1 rationale.
+            check_tasks_origin(&url)?;
             let resp = s
                 .http
                 .get(&url)
@@ -301,6 +312,8 @@ impl Provider for GoogleTasksProvider {
                 "{API_ROOT}/lists/{}/tasks",
                 percent_encode(&task.calendar_remote_id)
             );
+            // Preventative origin clamp; see H-1 rationale.
+            check_tasks_origin(&post_url)?;
             s.http
                 .post(post_url)
                 .headers(headers)
@@ -308,6 +321,8 @@ impl Provider for GoogleTasksProvider {
                 .send()
                 .await
         } else {
+            // Preventative origin clamp; see H-1 rationale.
+            check_tasks_origin(&url)?;
             s.http
                 .put(&url)
                 .headers(headers)
@@ -353,6 +368,8 @@ impl Provider for GoogleTasksProvider {
             percent_encode(calendar_remote_id),
             percent_encode(remote_id)
         );
+        // Preventative origin clamp; see H-1 rationale.
+        check_tasks_origin(&url)?;
         let resp = s
             .http
             .delete(&url)
@@ -487,6 +504,24 @@ fn percent_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
+/// Clamp `url` to `https://tasks.googleapis.com/...` before
+/// attaching the Bearer token. Mirrors the CalDAV / Microsoft
+/// guards in H-1 so a future paging change that picks up a
+/// server-provided absolute URL can't bounce the token elsewhere.
+fn check_tasks_origin(url: &str) -> SyncResult<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| SyncError::Protocol(format!("bad follow-up URL {url}: {e}")))?;
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme == TASKS_SCHEME && host == TASKS_HOST {
+        Ok(())
+    } else {
+        Err(SyncError::Protocol(format!(
+            "off-origin redirect to {host}"
+        )))
+    }
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -571,5 +606,19 @@ mod tests {
         // the path segment encoding must be safe for anything.
         assert_eq!(percent_encode("a/b"), "a%2Fb");
         assert_eq!(percent_encode("MDE:XYZ"), "MDE%3AXYZ");
+    }
+
+    #[test]
+    fn check_tasks_origin_rejects_off_origin_targets() {
+        // Canonical host is accepted.
+        assert!(check_tasks_origin("https://tasks.googleapis.com/tasks/v1/lists").is_ok());
+        // Off-origin target is refused before the Bearer token goes
+        // out (H-1 preventative clamp).
+        let err = check_tasks_origin("https://evil.example.org/tasks/v1/lists").unwrap_err();
+        assert!(matches!(err, SyncError::Protocol(m) if m.contains("evil.example.org")));
+        // Scheme downgrade → rejected.
+        assert!(check_tasks_origin("http://tasks.googleapis.com/tasks/v1/lists").is_err());
+        // Subdomain trick → rejected (exact host match only).
+        assert!(check_tasks_origin("https://tasks.googleapis.com.evil.example/tasks/v1").is_err());
     }
 }

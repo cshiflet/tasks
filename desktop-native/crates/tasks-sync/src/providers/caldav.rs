@@ -48,6 +48,54 @@ struct Session {
     http: Client,
     auth: HeaderValue,
     calendar_home: Url,
+    /// Origin (scheme + host + port) derived from `calendar_home`
+    /// at connect time. Every follow-up URL the server hands us
+    /// (`<d:href>`, object URLs, etc.) is clamped against this so
+    /// a malicious server can't bounce an authenticated request at
+    /// an arbitrary third-party host and leak the Basic / Bearer
+    /// header.
+    trusted_origin: TrustedOrigin,
+}
+
+/// Scheme + host + (optional) port captured from a provider's
+/// trusted root URL. Follow-up URLs are rejected unless all three
+/// match — that closes the token-leak primitive where the server
+/// gets to pick where our Authorization header travels next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl TrustedOrigin {
+    fn from_url(url: &Url) -> SyncResult<Self> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| SyncError::Protocol(format!("no host in {url}")))?
+            .to_ascii_lowercase();
+        Ok(Self {
+            scheme: url.scheme().to_ascii_lowercase(),
+            host,
+            port: url.port_or_known_default(),
+        })
+    }
+
+    fn check(&self, target: &Url) -> SyncResult<()> {
+        let host = target
+            .host_str()
+            .map(|h| h.to_ascii_lowercase())
+            .unwrap_or_default();
+        let scheme = target.scheme().to_ascii_lowercase();
+        let port = target.port_or_known_default();
+        if scheme == self.scheme && host == self.host && port == self.port {
+            Ok(())
+        } else {
+            Err(SyncError::Protocol(format!(
+                "off-origin redirect to {host}"
+            )))
+        }
+    }
 }
 
 pub struct CalDavProvider {
@@ -123,11 +171,13 @@ impl Provider for CalDavProvider {
         let calendar_home = root
             .join(&home_href)
             .map_err(|e| SyncError::Protocol(format!("bad home-set href: {e}")))?;
+        let trusted_origin = TrustedOrigin::from_url(&calendar_home)?;
 
         *self.session.lock().await = Some(Session {
             http,
             auth,
             calendar_home,
+            trusted_origin,
         });
         Ok(())
     }
@@ -154,6 +204,11 @@ impl Provider for CalDavProvider {
                 .calendar_home
                 .join(&l.href)
                 .map_err(|e| SyncError::Protocol(format!("bad calendar href {}: {e}", l.href)))?;
+            // Clamp against the authenticated origin: a malicious
+            // server could otherwise emit `<d:href>https://evil/…`
+            // and the next authenticated request would leak the
+            // Basic / Bearer header to that host.
+            s.trusted_origin.check(&url)?;
             out.push(RemoteCalendar {
                 remote_id: url.as_str().to_string(),
                 name: l.display_name.unwrap_or_else(|| l.href.clone()),
@@ -173,6 +228,7 @@ impl Provider for CalDavProvider {
             .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
         let cal_url = Url::parse(calendar_remote_id)
             .map_err(|e| SyncError::Protocol(format!("bad calendar url: {e}")))?;
+        s.trusted_origin.check(&cal_url)?;
         let body = report(
             &s.http,
             cal_url.clone(),
@@ -199,6 +255,10 @@ impl Provider for CalDavProvider {
             let obj_url = cal_url
                 .join(href)
                 .map_err(|e| SyncError::Protocol(format!("bad task href {href}: {e}")))?;
+            // Clamp each `<d:href>` against the trusted origin so
+            // a rogue server can't hand us a third-party URL for a
+            // subsequent authenticated PUT/DELETE.
+            s.trusted_origin.check(&obj_url)?;
             let mut rt = vtodo_to_remote_task(&vtodo, calendar_remote_id, Some(data.clone()));
             // For CalDAV we key local rows by the VTODO UID so
             // push/delete can look it up by the local row's
@@ -225,9 +285,11 @@ impl Provider for CalDavProvider {
         //   <calendar_url>/<UID>.ics
         let cal_url = Url::parse(&task.calendar_remote_id)
             .map_err(|e| SyncError::Protocol(format!("bad calendar url: {e}")))?;
+        s.trusted_origin.check(&cal_url)?;
         let obj_url = cal_url
             .join(&format!("{}.ics", task.remote_id))
             .map_err(|e| SyncError::Protocol(format!("bad obj href: {e}")))?;
+        s.trusted_origin.check(&obj_url)?;
 
         let body = {
             let vtodo = remote_task_to_vtodo(task, now_ms(), None);
@@ -284,9 +346,11 @@ impl Provider for CalDavProvider {
             .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
         let cal_url = Url::parse(calendar_remote_id)
             .map_err(|e| SyncError::Protocol(format!("bad calendar url: {e}")))?;
+        s.trusted_origin.check(&cal_url)?;
         let obj_url = cal_url
             .join(&format!("{remote_id}.ics"))
             .map_err(|e| SyncError::Protocol(format!("bad obj href: {e}")))?;
+        s.trusted_origin.check(&obj_url)?;
         let resp = s
             .http
             .delete(obj_url)
@@ -454,5 +518,31 @@ mod tests {
         assert_eq!(parse_hex_color("00ff00"), Some(0xFF00_FF00_u32 as i32));
         assert_eq!(parse_hex_color("AA112233"), Some(0xAA11_2233_u32 as i32));
         assert!(parse_hex_color("nope").is_none());
+    }
+
+    #[test]
+    fn trusted_origin_rejects_off_origin_targets() {
+        // Guard against the H-1 attack: server hands us a `<d:href>`
+        // pointing at a third-party host, and the next authenticated
+        // request leaks our Basic / Bearer header there.
+        let home = Url::parse("https://dav.example.com/calendars/alice/").unwrap();
+        let origin = TrustedOrigin::from_url(&home).unwrap();
+
+        // Exact origin → accepted.
+        let ok = Url::parse("https://dav.example.com/calendars/alice/work/").unwrap();
+        assert!(origin.check(&ok).is_ok());
+
+        // Different host → rejected.
+        let evil = Url::parse("https://evil.example.org/calendars/alice/").unwrap();
+        let err = origin.check(&evil).unwrap_err();
+        assert!(matches!(err, SyncError::Protocol(msg) if msg.contains("evil.example.org")));
+
+        // Scheme downgrade → rejected.
+        let http = Url::parse("http://dav.example.com/calendars/alice/").unwrap();
+        assert!(origin.check(&http).is_err());
+
+        // Different port → rejected.
+        let other_port = Url::parse("https://dav.example.com:8443/calendars/alice/").unwrap();
+        assert!(origin.check(&other_port).is_err());
     }
 }
