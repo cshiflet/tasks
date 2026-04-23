@@ -329,18 +329,40 @@ fn parse_property(line: &str) -> IcalResult<Property> {
     let header = &line[..colon_pos];
     let value = unescape_text(&line[colon_pos + 1..]);
 
+    // L-2: a CR/LF inside an unescaped value byte is a protocol
+    // smell; the unfolder should have stripped them. If one slips
+    // through (e.g. an unescaped \r that the continuation rule
+    // didn't match), reject outright to keep the downstream
+    // serializer / HTTP-header handoff safe.
+    if value.contains('\r') || value.contains('\n') {
+        return Err(IcalError::MalformedLine(line.to_string()));
+    }
+
     let mut header_parts = header.split(';');
-    let name = header_parts
+    let raw_name = header_parts
         .next()
-        .ok_or_else(|| IcalError::MalformedLine(line.to_string()))?
-        .to_uppercase();
+        .ok_or_else(|| IcalError::MalformedLine(line.to_string()))?;
+    // L-2: empty property name (line starting with `:` or `;`) is
+    // malformed; tolerate_and_drop was the previous behaviour,
+    // which quietly masked bad data.
+    if raw_name.trim().is_empty() {
+        return Err(IcalError::MalformedLine(line.to_string()));
+    }
+    let name = raw_name.to_uppercase();
     let mut params = Vec::new();
     for part in header_parts {
-        if let Some(eq) = part.find('=') {
-            let pname = part[..eq].trim().to_uppercase();
-            let pval = part[eq + 1..].trim_matches('"').to_string();
-            params.push((pname, pval));
+        // L-2: a parameter without `=` (e.g. `UID;FOO:val`) is
+        // malformed per RFC 5545 §3.2; reject rather than drop.
+        let eq = part
+            .find('=')
+            .ok_or_else(|| IcalError::MalformedLine(line.to_string()))?;
+        let pname = part[..eq].trim();
+        if pname.is_empty() {
+            return Err(IcalError::MalformedLine(line.to_string()));
         }
+        let pname = pname.to_uppercase();
+        let pval = part[eq + 1..].trim_matches('"').to_string();
+        params.push((pname, pval));
     }
     Ok(Property {
         name,
@@ -873,6 +895,39 @@ END:VCALENDAR\r\n";
             matches!(err, IcalError::TooMany { field: "VALARM" }),
             "expected TooMany{{VALARM}}, got {err:?}"
         );
+    }
+
+    /// L-2: malformed parameter without `=` is rejected.
+    #[test]
+    fn property_parameter_without_equals_is_rejected() {
+        // `UID;FOO:value` has a parameter chunk `FOO` with no `=`.
+        // RFC 5545 §3.2 requires `param-name = param-value`.
+        let blob =
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID;FOO:value\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let err = parse_vcalendar(blob).unwrap_err();
+        assert!(matches!(err, IcalError::MalformedLine(_)));
+    }
+
+    /// L-2: an empty parameter name (e.g. `UID;=val:value`) is
+    /// malformed.
+    #[test]
+    fn property_empty_param_name_is_rejected() {
+        let blob =
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID;=x:value\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let err = parse_vcalendar(blob).unwrap_err();
+        assert!(matches!(err, IcalError::MalformedLine(_)));
+    }
+
+    /// L-2: a line whose property name is empty (leading `:`) is
+    /// rejected instead of silently dropped.
+    #[test]
+    fn property_empty_name_is_rejected() {
+        // `:value` inside a VTODO — the old parser would have
+        // up-cased the empty name and kept walking.
+        let blob =
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\n:value\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let err = parse_vcalendar(blob).unwrap_err();
+        assert!(matches!(err, IcalError::MalformedLine(_)));
     }
 
     /// L-1: a VCALENDAR with two VTODO blocks fails the parse

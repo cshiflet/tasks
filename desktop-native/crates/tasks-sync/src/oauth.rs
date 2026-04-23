@@ -145,6 +145,12 @@ pub fn build_authorization_request(
 /// Parse the loopback redirect URL for the authorization `code` +
 /// matching `state`. Returns `Err(AuthorizationDenied)` if the
 /// server redirected with an `error` param instead of `code`.
+///
+/// L-2: pair-level validation fails loudly on empty keys, pairs
+/// with no `=`, and decoded values containing CR/LF. The CR/LF
+/// guard matters because the decoded `code` / `state` eventually
+/// crosses into HTTP header / log formats, where embedded CRLF is
+/// a header-injection primitive.
 pub fn parse_redirect(url: &str, expected_state: &str) -> OAuthResult<RedirectParams> {
     // We accept either a full URL ("http://127.0.0.1:12345/?code=…")
     // or just the query string ("code=…"). Loopback servers
@@ -163,11 +169,23 @@ pub fn parse_redirect(url: &str, expected_state: &str) -> OAuthResult<RedirectPa
         if pair.is_empty() {
             continue;
         }
-        let (k, v) = match pair.split_once('=') {
-            Some(kv) => kv,
-            None => continue,
-        };
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| OAuthError::MalformedRedirect(format!("no '=' in pair {pair:?}")))?;
+        if k.is_empty() {
+            return Err(OAuthError::MalformedRedirect(format!(
+                "empty key in pair {pair:?}"
+            )));
+        }
         let decoded = percent_decode(v);
+        if decoded.contains('\r') || decoded.contains('\n') {
+            // Prevents header-injection where the redirect URL
+            // smuggles CR/LF into what we later format into a log
+            // line or an HTTP header.
+            return Err(OAuthError::MalformedRedirect(format!(
+                "CR/LF in value for {k:?}"
+            )));
+        }
         match k {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
@@ -360,6 +378,35 @@ mod tests {
     fn redirect_missing_code_errors() {
         let err = parse_redirect("http://127.0.0.1:1/cb?state=x", "x").unwrap_err();
         assert!(matches!(err, OAuthError::MissingParam("code")));
+    }
+
+    /// L-2: a pair with no `=` is rejected outright instead of
+    /// silently dropped.
+    #[test]
+    fn redirect_rejects_pair_without_equals() {
+        let err = parse_redirect("http://127.0.0.1:1/cb?code=abc&broken&state=x", "x").unwrap_err();
+        assert!(matches!(err, OAuthError::MalformedRedirect(m) if m.contains("broken")));
+    }
+
+    /// L-2: an empty key (`=value`) is rejected.
+    #[test]
+    fn redirect_rejects_empty_key() {
+        let err = parse_redirect("http://127.0.0.1:1/cb?code=abc&=evil&state=x", "x").unwrap_err();
+        assert!(matches!(err, OAuthError::MalformedRedirect(m) if m.contains("empty key")));
+    }
+
+    /// L-2: CR/LF inside a decoded value is a header-injection
+    /// primitive once the value crosses into a log line or header
+    /// — reject before it ever gets that far.
+    #[test]
+    fn redirect_rejects_crlf_in_value() {
+        // "a%0Db" decodes to "a\rb".
+        let err = parse_redirect("http://127.0.0.1:1/cb?code=a%0Db&state=x", "x").unwrap_err();
+        assert!(matches!(err, OAuthError::MalformedRedirect(m) if m.contains("CR/LF")));
+        // "a%0Ab" decodes to "a\nb".
+        let err2 =
+            parse_redirect("http://127.0.0.1:1/cb?code=abc&state=a%0Ab", "whatever").unwrap_err();
+        assert!(matches!(err2, OAuthError::MalformedRedirect(m) if m.contains("CR/LF")));
     }
 
     #[test]
