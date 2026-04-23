@@ -25,6 +25,9 @@ pub mod loopback;
 pub mod oauth;
 pub mod provider;
 pub mod providers;
+pub mod token_store;
+
+pub use token_store::{InMemoryTokenStore, OAuthTokens, TokenStore, TokenStoreError};
 
 pub use engine::SyncEngine;
 
