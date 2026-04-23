@@ -204,3 +204,96 @@ entirely. See `PLAN_UPDATES.md` §6.6 for the knock-on effects on
 Milestone 1 framing (a JSON-import path or CalDAV sync must
 eventually seed the file; "read-only companion against a live
 Android DB" was never a realistic UX).
+
+## 13. Sync crate: async-trait + `Box<dyn Provider>`
+
+**Chosen** over separate provider types + generics because:
+
+- **Four backends, one UI.** CalDAV, Google Tasks, Microsoft To Do,
+  and EteSync all need to co-exist on one desktop install. The UI
+  holds `Vec<Box<dyn Provider>>` indexed by account and never sees
+  concrete provider types, so a user can connect all four without
+  cross-crate type changes.
+- **`async-trait` over associated-type futures.** Keeps the trait
+  object-safe (`dyn Provider`) and avoids pinning every call site
+  on a specific `impl Future<Output = …>`. The desugaring cost is
+  one heap allocation per method call — negligible against
+  network round-trip latency.
+- **No tokio-style runtime pinned at the trait boundary.** Each
+  provider picks its own executor: CalDAV / Google / MS want a
+  real async runtime (`reqwest`'s), EteSync wraps blocking FFI
+  via `spawn_blocking`. The trait surface doesn't care.
+
+## 14. Sync crate: skeletons first, network second
+
+**Chosen** over shipping each provider as one big commit:
+
+- The provider shapes — `AccountCredentials`, `RemoteCalendar`,
+  `RemoteTask`, `SyncError` — are the hard part. Landing the
+  trait + every stub + a `MockProvider`-driven orchestrator
+  up front lets the UI and the merge logic evolve without
+  waiting for HTTP / auth / encryption plumbing.
+- Every stub returns `SyncError::NotYetImplemented` from its
+  network method. Callers fail loudly instead of silently
+  returning empty data — exactly the signal the UI needs to
+  surface "this provider isn't wired yet" to the user.
+- Per-provider dependencies (`reqwest`, `oauth2`, `libetebase-rs`)
+  stay out of `Cargo.toml` until each backend's first real
+  network commit. Keeps the skeleton build fast and the
+  dependency surface area honest.
+
+## 15. iCal handling: hand-rolled parser, not `icalendar` crate
+
+**Chosen** over the third-party `icalendar` crate:
+
+- **Scope control.** Tasks.org's wire use of RFC 5545 is a small
+  subset (VTODO + a handful of properties + VALARM). Writing that
+  as ~350 lines of pull-parsed Rust is cheaper than auditing the
+  icalendar crate's 10k+ line surface for our specific
+  round-trip-stability needs.
+- **Lossless round-trip.** The desktop writes VTODOs back to
+  CalDAV; any property we parse must serialise byte-for-byte
+  similar enough that Android-side diffs aren't a constant noise
+  source. A hand-rolled parser + serializer in the same file
+  makes that invariant auditable.
+- **No heavy transitive deps.** The iCal crate tree pulls in
+  date/time libraries we don't need.
+
+Scope trade-off: advanced RFC 5545 features (VTIMEZONE, EXDATE,
+RDATE, RECURRENCE-ID) are not supported yet and will be added
+directly to this module as they're needed.
+
+## 16. OAuth2: PKCE by hand, skip the `oauth2` crate
+
+**Chosen** over the `oauth2` crate:
+
+- **Forced-runtime avoidance.** `oauth2` defaults to `reqwest`
+  with its own tokio configuration; we want to pick the HTTP
+  client and runtime ourselves (rustls-tls, custom user agent).
+- **Crypto primitives we already need.** `sha2` + `base64` +
+  `getrandom` are standard Rust deps each weighing ~50 KB of
+  binary. The `oauth2` crate's dep tree is several megabytes.
+- **Pure-logic + loopback + token-store separate.** The three
+  concerns split naturally into three modules we can test
+  independently (`oauth`, `loopback`, `token_store`).
+
+## 17. Sync engine: "remote wins" pull merge, etag-gated push
+
+**Chosen** over three-way merges:
+
+- **Server as source of truth.** CalDAV / Google / Microsoft each
+  have their own conflict-resolution model; rather than
+  reimplementing, let the server win on pull and push only when
+  the local etag still matches (412 Precondition Failed surfaces
+  as `SyncError::Conflict` back to the UI).
+- **Local-only state is non-authoritative per field.** Pull never
+  overwrites `tags`, `alarms`, or `geofences` because the
+  provider doesn't speak those tables; the local edit dialog is
+  the sole writer for them. When the provider eventually does
+  (Microsoft Graph has categories + reminders), the engine grows
+  a per-field replace helper that respects the same "server
+  wins if set, else preserve local" policy.
+- **Deletes propagate on pull.** A task that was in the previous
+  listing but isn't in the current one is soft-deleted locally —
+  matches the Android client and gives the UI's trash filter
+  something to surface.

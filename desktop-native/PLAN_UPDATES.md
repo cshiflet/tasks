@@ -526,6 +526,73 @@ backends can land in any order and co-exist on one desktop
 install without UI churn.
 
 Per-provider dependency sets stay out of the crate's `Cargo.toml`
-for now (no `reqwest`, `oauth2`, `quick-xml`, or `libetebase-rs`
-yet). Those arrive with the first actual network commit per
-provider so the skeleton build stays fast.
+for now (no `reqwest`, `oauth2`, or `libetebase-rs` yet). Those
+arrive with the first actual network commit per provider so the
+skeleton build stays fast.
+
+## 10. Sync-layer substrate (follow-up to §9)
+
+On top of the trait/stub skeleton, the pure-logic half of every
+sync path landed — everything that doesn't require a live server
+or credentials can be tested today from fixture strings:
+
+- **`tasks_sync::ical`** — RFC 5545 VTODO parser + serializer
+  covering the subset Tasks.org emits/consumes. Line folding,
+  TEXT escaping, VALARM offsets + absolute triggers,
+  RELATED-TO=PARENT, CATEGORIES, CREATED/LAST-MODIFIED. Out of
+  scope: VTIMEZONE/TZID, RECURRENCE-ID, EXDATE/RDATE,
+  attachments.
+- **`tasks_sync::convert`** — lossless VTodo ↔ RemoteTask
+  translation. Priority buckets canonical-round-trip (HIGH→1,
+  MEDIUM→5, LOW→9, NONE→0); `RemoteTask.due_has_time` was
+  added so CalDAV `HH:00:00Z` dates don't collapse to date-only
+  through the Tasks.org has-time-flag heuristic.
+- **`tasks_sync::providers::caldav_xml`** — PROPFIND request
+  templates for the service-discovery cascade + REPORT body for
+  `calendar-query` VTODO listings. Quick-xml pull-parser turns
+  multi-status responses into typed structs (calendar listing,
+  task resource listing, principal). XML-escapes hrefs for
+  `calendar-multiget`.
+- **`tasks_sync::oauth`** — PKCE challenge generation (RFC 7636
+  test-vector-validated), authorization URL construction,
+  redirect parsing (with state CSRF check), token + refresh
+  request body assembly. Sticks to `sha2` + `base64` +
+  `percent-encoding` + `getrandom` so the full `oauth2` crate's
+  tokio/reqwest defaults don't leak in.
+- **`tasks_sync::loopback`** — OAuth redirect receiver. Binds
+  127.0.0.1:0, hands the caller the port to embed in the
+  redirect URI, blocks on a single incoming request, parses via
+  `oauth::parse_redirect`, responds with a "you can close this
+  window" page. Uses `std::net` only — no tokio, no reqwest.
+- **`tasks_sync::providers::google_json`** +
+  **`…::microsoft_json`** — REST payload shapes for the two
+  OAuth providers, with RFC 3339 parsers that handle both Z
+  suffixes and ±HH:MM offsets. Importance ↔ priority buckets
+  for Microsoft (high/normal/low → HIGH/MEDIUM/LOW, unknown →
+  NONE). Shared `OdataList<T>` envelope with `@odata.nextLink`
+  pagination.
+- **`tasks_sync::token_store`** — abstract `TokenStore` trait
+  + `InMemoryTokenStore`. Keyed on `(ProviderKind, account)` so
+  a user can connect two Google accounts side by side.
+  OS-native keychain adapters (libsecret / Keychain / Credential
+  Manager) land additively with the first real OAuth provider.
+- **`tasks_sync::engine::SyncEngine`** — orchestrator. Pulls
+  all calendars and tasks inside one rusqlite transaction
+  ("remote wins" merge, preserving local-only tags/alarms/
+  geofence); pushes dirty rows via the provider's `push_task`;
+  surfaces `SyncError::Conflict` per-row without aborting the
+  batch; tombstones tasks that disappear from a remote pull.
+  `sync_now()` composes pull + push for the UI's "Sync now"
+  button.
+
+All exercised end-to-end from test code via a `MockProvider`
+with in-memory calendar + task fixtures. The per-provider
+implementations (actual reqwest/libcurl, etebase-rs FFI) will
+plug in as thin wrappers over `oauth`, `loopback`, and the
+JSON/XML helpers already here.
+
+Dependencies pulled in so far: `quick-xml`, `sha2`, `base64`,
+`getrandom`, `percent-encoding`, `serde_json`, `async-trait`,
+`tokio` (dev-only). No reqwest, no oauth2 crate, no
+libetebase-rs yet — those arrive with each provider's first
+network commit.
