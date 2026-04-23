@@ -40,9 +40,37 @@ pub enum IcalError {
     BadDate(String),
     #[error("no VTODO found in input")]
     NoVTodo,
+    /// Input exceeded the 1 MiB parser cap. Real VCALENDAR bodies
+    /// sit well under 100 KiB; anything larger is either wildly
+    /// malformed or an attempt to exhaust memory via the parser.
+    #[error("VCALENDAR input too large: {bytes} bytes")]
+    TooLarge { bytes: usize },
+    /// `VALARM`, `CATEGORIES`, or another bounded collection
+    /// overflowed its per-VTODO cap. We stop parsing and surface
+    /// the field name so callers can report which clip fired.
+    #[error("too many {field} entries in VTODO (cap exceeded)")]
+    TooMany { field: &'static str },
 }
 
 pub type IcalResult<T> = Result<T, IcalError>;
+
+/// Hard cap on VCALENDAR input (M-3). Real bodies sit well under
+/// 100 KiB; a multi-megabyte blob is a misbehaving server or an
+/// attempt to exhaust memory. 1 MiB leaves plenty of headroom for
+/// the occasional VCALENDAR with long CATEGORIES or a couple of
+/// inline VALARMs.
+pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+
+/// Per-VTODO cap on VALARM blocks (M-3). Tasks.org's UI allows a
+/// small handful; 128 is generous enough to survive round-tripping
+/// a pathological calendar without letting a malicious payload
+/// unbounded-allocate a `Vec<VAlarm>`.
+pub const MAX_ALARMS_PER_VTODO: usize = 128;
+
+/// Per-VTODO cap on CATEGORIES entries (M-3). 64 tags is more
+/// than any reasonable user would attach; anything larger is
+/// almost certainly adversarial.
+pub const MAX_CATEGORIES_PER_VTODO: usize = 64;
 
 /// One VTODO row, normalised. Mostly the wire-level representation
 /// — translation onto [`crate::RemoteTask`] lives in
@@ -113,6 +141,11 @@ pub enum AlarmTrigger {
 /// the natural shape (CalDAV reports usually wrap each VTODO in
 /// its own VCALENDAR envelope).
 pub fn parse_vcalendar(input: &str) -> IcalResult<VTodo> {
+    // M-3 input cap: refuse to unfold or allocate for pathological
+    // payloads. 1 MiB is far above any legitimate VCALENDAR size.
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(IcalError::TooLarge { bytes: input.len() });
+    }
     let lines = unfold(input);
     let mut depth: Vec<&str> = Vec::new();
     let mut current_todo: Option<VTodo> = None;
@@ -139,6 +172,11 @@ pub fn parse_vcalendar(input: &str) -> IcalResult<VTodo> {
             }
             ("END", "VALARM") => {
                 if let (Some(todo), Some(alarm)) = (current_todo.as_mut(), current_alarm.take()) {
+                    // M-3 alarm cap: fail loudly if a VTODO carries
+                    // more than MAX_ALARMS_PER_VTODO VALARM blocks.
+                    if todo.alarms.len() >= MAX_ALARMS_PER_VTODO {
+                        return Err(IcalError::TooMany { field: "VALARM" });
+                    }
                     todo.alarms.push(alarm);
                 }
                 depth.pop();
@@ -330,12 +368,23 @@ fn apply_vtodo_property(todo: &mut VTodo, p: &Property) -> IcalResult<()> {
         }
         "RRULE" => todo.rrule = Some(p.value.clone()),
         "CATEGORIES" => {
-            todo.categories = p
-                .value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            // M-3 categories cap. CATEGORIES can repeat across
+            // multiple property lines (callers append), so count
+            // the running total after extending.
+            let mut extended = std::mem::take(&mut todo.categories);
+            for piece in p.value.split(',') {
+                let s = piece.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                if extended.len() >= MAX_CATEGORIES_PER_VTODO {
+                    return Err(IcalError::TooMany {
+                        field: "CATEGORIES",
+                    });
+                }
+                extended.push(s.to_string());
+            }
+            todo.categories = extended;
         }
         "RELATED-TO" => {
             // Default RELTYPE is PARENT per RFC 5545 §3.2.15.
@@ -775,5 +824,59 @@ END:VCALENDAR\r\n";
         let blob = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\nRELATED-TO:p\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
         let v = parse_vcalendar(blob).unwrap();
         assert_eq!(v.parent_uid.as_deref(), Some("p"));
+    }
+
+    /// M-3 input cap: a pathologically large VCALENDAR blob is
+    /// rejected before we allocate line-by-line.
+    #[test]
+    fn too_large_input_is_rejected() {
+        let blob = "X".repeat(MAX_INPUT_BYTES + 1);
+        let err = parse_vcalendar(&blob).unwrap_err();
+        match err {
+            IcalError::TooLarge { bytes } => {
+                assert_eq!(bytes, MAX_INPUT_BYTES + 1);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    /// M-3 VALARM cap: more than MAX_ALARMS_PER_VTODO alarms fail
+    /// the parse rather than silently dropping (or unbounded-
+    /// allocating) the excess.
+    #[test]
+    fn too_many_valarms_are_rejected() {
+        let mut blob = String::from("BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\n");
+        for _ in 0..(MAX_ALARMS_PER_VTODO + 1) {
+            blob.push_str("BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\n");
+        }
+        blob.push_str("END:VTODO\r\nEND:VCALENDAR\r\n");
+        let err = parse_vcalendar(&blob).unwrap_err();
+        assert!(
+            matches!(err, IcalError::TooMany { field: "VALARM" }),
+            "expected TooMany{{VALARM}}, got {err:?}"
+        );
+    }
+
+    /// M-3 CATEGORIES cap: more than MAX_CATEGORIES_PER_VTODO tags
+    /// fail the parse.
+    #[test]
+    fn too_many_categories_are_rejected() {
+        let tags: Vec<String> = (0..(MAX_CATEGORIES_PER_VTODO + 5))
+            .map(|i| format!("tag{i}"))
+            .collect();
+        let cats = tags.join(",");
+        let blob = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\nCATEGORIES:{cats}\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+        );
+        let err = parse_vcalendar(&blob).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IcalError::TooMany {
+                    field: "CATEGORIES"
+                }
+            ),
+            "expected TooMany{{CATEGORIES}}, got {err:?}"
+        );
     }
 }
