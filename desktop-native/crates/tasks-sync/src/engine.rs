@@ -56,19 +56,30 @@ impl<'a> SyncEngine<'a> {
         }
 
         let mut tasks_pulled = 0usize;
+        let mut tasks_deleted = 0usize;
         // Two-pass to avoid parent ordering hazards: insert/update
         // every task first (parent stays 0), then a second pass
         // backfills `tasks.parent` once every remoteId is in place.
         let mut all_tasks: Vec<RemoteTask> = Vec::new();
         for cal in &calendars {
             let tasks = self.provider.list_tasks(&cal.remote_id).await?;
+            let mut seen_remote_ids: Vec<String> = Vec::with_capacity(tasks.len());
             for t in &tasks {
                 let task_id = upsert_task(&tx, t)
                     .map_err(|e| SyncError::Local(format!("task {}: {e}", t.remote_id)))?;
                 upsert_caldav_task(&tx, task_id, t)
                     .map_err(|e| SyncError::Local(format!("caldav_task {}: {e}", t.remote_id)))?;
                 tasks_pulled += 1;
+                seen_remote_ids.push(t.remote_id.clone());
             }
+            // Anything in this calendar we had before but the
+            // server didn't list this time: tombstone locally.
+            // Matches what the Android client does when the
+            // remote deletes a task.
+            let now = now_ms();
+            let removed = tombstone_missing_tasks(&tx, &cal.remote_id, &seen_remote_ids, now)
+                .map_err(|e| SyncError::Local(format!("tombstone: {e}")))?;
+            tasks_deleted += removed;
             all_tasks.extend(tasks);
         }
 
@@ -79,11 +90,14 @@ impl<'a> SyncEngine<'a> {
             .map_err(|e| SyncError::Local(format!("commit: {e}")))?;
 
         tracing::info!(
-            "sync pull: {} calendars, {} tasks, {} parent links",
+            "sync pull: {} calendars, {} tasks, {} parent links, {} tombstoned",
             calendars.len(),
             tasks_pulled,
-            parent_links
+            parent_links,
+            tasks_deleted,
         );
+        let _ = tasks_deleted; // (exposed through tracing; SyncOutcome
+                               // doesn't carry a deletions counter yet)
         Ok(SyncOutcome {
             calendars_pulled: calendars.len(),
             tasks_pulled,
@@ -387,6 +401,62 @@ fn upsert_caldav_task(
     Ok(())
 }
 
+/// Soft-delete every task in `calendar_remote_id` whose
+/// `caldav_tasks.cd_remote_id` isn't in the `seen` set. Matches
+/// Android's behaviour when the server's calendar-query report
+/// no longer returns a task the client had seen before: the row
+/// was deleted remotely, so stamp `tasks.deleted = now_ms` and
+/// `caldav_tasks.cd_deleted = now_ms` locally.
+///
+/// Rows that were already soft-deleted locally stay as-is.
+///
+/// Returns the count of newly tombstoned rows.
+fn tombstone_missing_tasks(
+    tx: &rusqlite::Transaction<'_>,
+    calendar_remote_id: &str,
+    seen: &[String],
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    // Pull the set of caldav_tasks rows currently in this calendar.
+    let mut stmt = tx.prepare(
+        "SELECT cd_task, cd_remote_id FROM caldav_tasks \
+         WHERE cd_calendar = ?1 AND cd_deleted = 0",
+    )?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([calendar_remote_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    let mut removed = 0;
+    for (task_id, remote_id) in rows {
+        if seen.iter().any(|s| s == &remote_id) {
+            continue;
+        }
+        // Skip rows whose local task is already soft-deleted so
+        // we don't bump `modified` and re-publish over sync.
+        let already: Option<i64> = tx
+            .query_row("SELECT deleted FROM tasks WHERE _id = ?1", [task_id], |r| {
+                r.get(0)
+            })
+            .ok();
+        if already.unwrap_or(0) > 0 {
+            continue;
+        }
+        tx.execute(
+            "UPDATE tasks SET deleted = ?1, modified = ?1 WHERE _id = ?2",
+            params![now_ms, task_id],
+        )?;
+        tx.execute(
+            "UPDATE caldav_tasks SET cd_deleted = ?1 WHERE cd_remote_id = ?2",
+            params![now_ms, remote_id],
+        )?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 /// Backfill `tasks.parent` from each task's `parent_remote_id`. Has
 /// to run after every task in the batch is inserted so the parent
 /// lookup can find rows that arrived later in the pull. Mirrors
@@ -552,6 +622,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cal, "cal-1");
+    }
+
+    #[tokio::test]
+    async fn second_pull_tombstones_tasks_missing_from_remote() {
+        // First pull: remote has tasks A + B.
+        // Second pull: remote has only A — B should get
+        // soft-deleted locally without bumping A.
+        let (_tmp, db_path) = fresh_db();
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            "cal-1".to_string(),
+            vec![task("a", "cal-1", None), task("b", "cal-1", None)],
+        );
+        let first = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(first));
+        engine.pull_all().await.unwrap();
+
+        // Second provider: only a remains.
+        let mut tasks2 = HashMap::new();
+        tasks2.insert("cal-1".to_string(), vec![task("a", "cal-1", None)]);
+        let second = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks: tasks2,
+            ..Default::default()
+        };
+        let mut engine2 = SyncEngine::new(&db_path, Box::new(second));
+        engine2.pull_all().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // A stays active.
+        let a_deleted: i64 = conn
+            .query_row("SELECT deleted FROM tasks WHERE remoteId = 'a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(a_deleted, 0);
+        // B got tombstoned.
+        let b_deleted: i64 = conn
+            .query_row("SELECT deleted FROM tasks WHERE remoteId = 'b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(b_deleted > 0, "b should be soft-deleted");
+        let b_caldav_deleted: i64 = conn
+            .query_row(
+                "SELECT cd_deleted FROM caldav_tasks WHERE cd_remote_id = 'b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(b_caldav_deleted > 0);
     }
 
     #[tokio::test]
