@@ -66,18 +66,36 @@ jobs:
       - name: GUI smoke test (offscreen Qt)
         env:
           QT_QPA_PLATFORM: offscreen
+          # Bump QML binding warnings into stderr so the grep below can
+          # catch regressions. Without this, `Unable to assign [undefined]`
+          # et al. only show up at the default QtWarningMsg level.
+          QT_LOGGING_RULES: "qt.qml.binding*.warning=true"
         run: |
           cargo build --workspace
           # Launch the binary for 3 seconds under offscreen Qt; any QML
           # import error or crash surfaces as a non-SIGTERM exit code.
+          # stderr is tee'd so the grep below can catch QML warnings
+          # the process emits without exiting.
           set +e
-          timeout 3 ./target/debug/tasks-desktop
+          timeout 3 ./target/debug/tasks-desktop 2> smoke-stderr.log
           rc=$?
+          set -e
           # timeout returns 124 on expiry or 143 when the child was
           # SIGTERMed — either means the process ran without crashing.
           if [ "$rc" != "124" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
             echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            cat smoke-stderr.log >&2 || true
             exit $rc
+          fi
+          # Fail the job if the engine logged any known-bad patterns:
+          #   * binding loops (always a symptom of a real dep cycle)
+          #   * `Unable to assign [undefined]` — usually a stale-array
+          #     access after a model-change race
+          #   * `TypeError:` from QML — unresolved property on a VM
+          #   * `file::…qml:…:` unknown-component / import errors
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:" smoke-stderr.log; then
+            echo "QML smoke test found warnings — see matches above" >&2
+            exit 1
           fi
 
   # macOS and Windows jobs only run build + test — fmt/clippy/schema-hash
@@ -110,16 +128,24 @@ jobs:
       - name: GUI smoke test (offscreen Qt)
         env:
           QT_QPA_PLATFORM: offscreen
+          QT_LOGGING_RULES: "qt.qml.binding*.warning=true"
         run: |
           cargo build --workspace
           set +e
           # macOS `timeout` isn't BSD-default; use perl as a portable
           # fallback.
-          perl -e 'alarm 3; exec @ARGV' -- ./target/debug/tasks-desktop
+          perl -e 'alarm 3; exec @ARGV' -- ./target/debug/tasks-desktop \
+            2> smoke-stderr.log
           rc=$?
+          set -e
           if [ "$rc" != "142" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
             echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            cat smoke-stderr.log >&2 || true
             exit $rc
+          fi
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:" smoke-stderr.log; then
+            echo "QML smoke test found warnings — see matches above" >&2
+            exit 1
           fi
 
   check-windows:
