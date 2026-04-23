@@ -44,7 +44,13 @@ tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
 # HTTP client for CalDAV + Google/Microsoft REST. Etebase already
 # pulls reqwest (blocking); we want the async version with rustls
 # so a user's system OpenSSL issues don't block a sync.
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# Needed for `StreamExt::next()` on `reqwest::Response::bytes_stream()`
+# in the capped body reader (M-2). reqwest already pulls
+# futures_util as a transitive, but we name it explicitly so the
+# import path in src/providers/http_util.rs isn't leaning on a
+# transitive re-export.
+futures-util = { version = "0.3", default-features = false }
 # Zeroize-on-drop wrapper around String for passwords + OAuth tokens.
 # See the field-level comments on `AccountCredentials` /
 # `OAuthTokens` for why this matters.

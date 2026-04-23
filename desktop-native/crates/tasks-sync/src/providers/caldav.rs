@@ -37,6 +37,7 @@ use super::caldav_xml::{
     PROPFIND_CALENDAR_HOME_SET, PROPFIND_CALENDAR_LIST, PROPFIND_CURRENT_USER_PRINCIPAL,
     REPORT_CALENDAR_QUERY_VTODO,
 };
+use super::http_util::{read_body_capped, DEFAULT_BODY_CAP};
 use crate::ical::{parse_vcalendar, serialize_vcalendar};
 use crate::provider::{
     AccountCredentials, Provider, ProviderKind, RemoteCalendar, RemoteTask, SyncError, SyncOutcome,
@@ -326,7 +327,9 @@ impl Provider for CalDavProvider {
             .map_err(|e| SyncError::Network(format!("PUT: {e}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::PRECONDITION_FAILED {
-            let msg = resp.text().await.unwrap_or_default();
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
             return Err(SyncError::Conflict {
                 remote_id: task.remote_id.clone(),
                 local: task.etag.clone(),
@@ -334,7 +337,9 @@ impl Provider for CalDavProvider {
             });
         }
         if !status.is_success() {
-            let msg = resp.text().await.unwrap_or_default();
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
             return Err(SyncError::Network(format!("PUT {status}: {msg}")));
         }
         let new_etag = resp
@@ -366,7 +371,9 @@ impl Provider for CalDavProvider {
             .map_err(|e| SyncError::Network(format!("DELETE: {e}")))?;
         if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
             let status = resp.status();
-            let msg = resp.text().await.unwrap_or_default();
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
             return Err(SyncError::Network(format!("DELETE {status}: {msg}")));
         }
         Ok(())
@@ -404,12 +411,12 @@ async fn propfind(
         .map_err(|e| SyncError::Network(format!("PROPFIND: {e}")))?;
     let status = resp.status();
     if !status.is_success() && status.as_u16() != 207 {
-        let msg = resp.text().await.unwrap_or_default();
+        let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+            .await
+            .unwrap_or_default();
         return Err(SyncError::Network(format!("PROPFIND {status}: {msg}")));
     }
-    resp.text()
-        .await
-        .map_err(|e| SyncError::Network(format!("PROPFIND body read: {e}")))
+    read_body_capped(resp, DEFAULT_BODY_CAP).await
 }
 
 async fn report(
@@ -431,12 +438,12 @@ async fn report(
         .map_err(|e| SyncError::Network(format!("REPORT: {e}")))?;
     let status = resp.status();
     if !status.is_success() && status.as_u16() != 207 {
-        let msg = resp.text().await.unwrap_or_default();
+        let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+            .await
+            .unwrap_or_default();
         return Err(SyncError::Network(format!("REPORT {status}: {msg}")));
     }
-    resp.text()
-        .await
-        .map_err(|e| SyncError::Network(format!("REPORT body read: {e}")))
+    read_body_capped(resp, DEFAULT_BODY_CAP).await
 }
 
 fn build_auth_header(credentials: &AccountCredentials) -> SyncResult<HeaderValue> {

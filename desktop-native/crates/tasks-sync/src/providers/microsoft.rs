@@ -24,6 +24,7 @@ use reqwest::{Client, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
+use super::http_util::{read_body_capped, DEFAULT_BODY_CAP};
 use super::microsoft_json::{
     parse_task_lists, parse_tasks, remote_to_task_json, task_list_to_remote_calendar,
     task_to_remote,
@@ -186,10 +187,7 @@ impl Provider for MicrosoftToDoProvider {
                 .await
                 .map_err(|e| SyncError::Network(format!("lists.list: {e}")))?;
             let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| SyncError::Network(format!("read body: {e}")))?;
+            let body = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
             if !status.is_success() {
                 return Err(classify_http_error(status, body, "lists.list"));
             }
@@ -227,10 +225,7 @@ impl Provider for MicrosoftToDoProvider {
                 .await
                 .map_err(|e| SyncError::Network(format!("tasks.list: {e}")))?;
             let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| SyncError::Network(format!("read body: {e}")))?;
+            let body = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
             if !status.is_success() {
                 return Err(classify_http_error(status, body, "tasks.list"));
             }
@@ -297,10 +292,7 @@ impl Provider for MicrosoftToDoProvider {
         .map_err(|e| SyncError::Network(format!("tasks push: {e}")))?;
 
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| SyncError::Network(format!("read body: {e}")))?;
+        let body = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
         if status == StatusCode::PRECONDITION_FAILED {
             return Err(SyncError::Conflict {
                 remote_id: task.remote_id.clone(),
@@ -343,7 +335,9 @@ impl Provider for MicrosoftToDoProvider {
         if status.is_success() || status == StatusCode::NOT_FOUND {
             return Ok(());
         }
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_body_capped(resp, DEFAULT_BODY_CAP)
+            .await
+            .unwrap_or_default();
         Err(classify_http_error(status, body, "tasks.delete"))
     }
 
@@ -392,10 +386,7 @@ pub async fn authorize(
         .await
         .map_err(|e| SyncError::Network(format!("token exchange: {e}")))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| SyncError::Network(format!("token exchange body: {e}")))?;
+    let text = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
     if !status.is_success() {
         return Err(SyncError::Auth(format!(
             "token exchange failed: {status}: {text}"
@@ -418,10 +409,7 @@ async fn refresh_access_token(
         .await
         .map_err(|e| SyncError::Network(format!("refresh: {e}")))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| SyncError::Network(format!("refresh body: {e}")))?;
+    let text = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
     if !status.is_success() {
         return Err(SyncError::Auth(format!("refresh failed: {status}: {text}")));
     }
