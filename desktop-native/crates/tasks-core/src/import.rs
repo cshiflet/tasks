@@ -26,12 +26,21 @@
 //! (`INSERT OR REPLACE`), so re-importing the same backup is
 //! idempotent.
 
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 
 use crate::error::{CoreError, Result};
+
+/// Hard ceiling on the size of a JSON backup the importer will
+/// read. Real Android exports are measured in single-digit MiB;
+/// 200 MiB is generous headroom. A hostile or broken file larger
+/// than this is rejected before we allocate any buffer — defends
+/// H-4 (memory-exhaustion DoS via an adversarial backup).
+const MAX_BACKUP_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Counts of rows inserted, keyed by entity type.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -321,13 +330,42 @@ fn normalize_windows_path(input: &Path) -> std::path::PathBuf {
 pub fn import_json_backup(target_path: &Path, source_path: &Path) -> Result<ImportStats> {
     let source_path = normalize_windows_path(source_path);
     let source_path = source_path.as_path();
-    let raw = std::fs::read_to_string(source_path).map_err(|e| {
+    // H-4: bound the input before touching it. `fs::metadata` is
+    // cheap and gives us the size without opening for read. Rejecting
+    // here means we never allocate a buffer for an adversarial file.
+    // Use "read" in the user-facing prefix so missing-file
+    // callers see a message they can parse — matches the wording
+    // the old `read_to_string` error path used.
+    let meta = std::fs::metadata(source_path).map_err(|e| {
         CoreError::Io(std::io::Error::new(
             e.kind(),
             format!("read {}: {e}", source_path.display()),
         ))
     })?;
-    let backup: BackupRoot = serde_json::from_str(&raw).map_err(|e| {
+    if meta.len() > MAX_BACKUP_BYTES {
+        return Err(CoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "backup {} is {} bytes; import cap is {} bytes",
+                source_path.display(),
+                meta.len(),
+                MAX_BACKUP_BYTES,
+            ),
+        )));
+    }
+    // Stream-parse from a buffered reader instead of
+    // `fs::read_to_string`. serde_json's reader API allocates
+    // internally but avoids the extra whole-file-in-String copy,
+    // and its default recursion limit (128) still guards against
+    // deeply-nested JSON stack blow-up.
+    let file = File::open(source_path).map_err(|e| {
+        CoreError::Io(std::io::Error::new(
+            e.kind(),
+            format!("read {}: {e}", source_path.display()),
+        ))
+    })?;
+    let reader = BufReader::new(file);
+    let backup: BackupRoot = serde_json::from_reader(reader).map_err(|e| {
         CoreError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("parse {}: {e}", source_path.display()),

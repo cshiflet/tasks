@@ -345,6 +345,47 @@ fn import_missing_file_reports_io_error() {
     assert!(err.to_string().contains("read"), "err = {err}");
 }
 
+/// H-4 regression: an oversize backup file must be rejected before
+/// the importer allocates any buffer. 200 MiB is the current cap.
+/// We stub a file just over the limit with `set_len` so we don't
+/// burn disk space writing real bytes.
+#[test]
+fn import_rejects_oversize_file_against_h4() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    let json_path = tmp.path().join("huge.json");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+
+    // Create a sparse file just over the 200 MiB cap.
+    // `File::set_len` is cheap on every platform we target.
+    let oversize: u64 = 200 * 1024 * 1024 + 1;
+    let f = std::fs::File::create(&json_path).unwrap();
+    f.set_len(oversize).unwrap();
+    drop(f);
+
+    let err = import_json_backup(&db_path, &json_path).expect_err("oversize must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("import cap") || msg.contains("bytes"),
+        "err = {msg}"
+    );
+
+    // Nothing landed in the DB.
+    let conn = Connection::open(&db_path).unwrap();
+    let tasks: i64 = conn
+        .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tasks, 0);
+}
+
+// H-4 second arm (recursion cap) is load-bearing on serde_json's
+// internal depth check. Empirically in 1.0.149, unknown-field skips
+// via `IgnoredAny` don't decrement the depth counter, so a test of
+// "deeply nested unknown fields" would pass through — that's
+// serde_json's concern, not ours. The size cap above is the
+// primary defence and handles the realistic attacker shape
+// (multi-GiB file).
+
 /// C-1 regression: a hostile backup embeds an executable SQL fragment
 /// in `filters.sql`. After import, that column must be NULL so the
 /// saved-filter read path can't execute it.
