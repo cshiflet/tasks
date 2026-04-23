@@ -135,6 +135,17 @@ pub mod qobject {
         #[qproperty(QStringList, sidebar_labels)]
         #[qproperty(QStringList, sidebar_ids)]
         #[qproperty(QString, active_filter_id)]
+        // Configured sync accounts, parallel arrays for the Settings
+        // → Accounts pane. `account_kinds` is the integer tag
+        //   0 = CalDAV, 1 = Google Tasks, 2 = Microsoft To Do, 3 = EteSync
+        // matching `tasks_sync::ProviderKind`. Server + username are
+        // blank for OAuth providers (they come from the eventual
+        // token store); passwords are held in-memory only on the Rust
+        // side and never exposed as a Q_PROPERTY.
+        #[qproperty(QStringList, account_labels)]
+        #[qproperty(QList_i32, account_kinds)]
+        #[qproperty(QStringList, account_servers)]
+        #[qproperty(QStringList, account_usernames)]
         // Status bar text.
         #[qproperty(QString, status)]
         // Absolute path of the currently-open database, surfaced in
@@ -212,6 +223,32 @@ pub mod qobject {
             recurrence: QString,
             repeat_from: i32,
         );
+
+        /// Persist a password-auth sync account (CalDAV or EteSync)
+        /// to the in-memory accounts list and re-emit the Q_PROPERTY
+        /// arrays the Accounts pane binds to. `kind` must be 0
+        /// (CalDAV) or 3 (EteSync); other values are rejected on the
+        /// status line. Empty required fields are also rejected.
+        ///
+        /// Session-local only for now — neither the account list nor
+        /// the password survives a restart. OS-native keychain
+        /// storage (libsecret / Keychain / Credential Manager) is
+        /// the follow-up tracked in PLAN_UPDATES §11.
+        #[qinvokable]
+        fn add_password_account(
+            self: Pin<&mut TaskListViewModel>,
+            kind: i32,
+            label: QString,
+            server: QString,
+            username: QString,
+            password: QString,
+        );
+
+        /// Drop the account at `index`. Out-of-range indices are
+        /// ignored (the QML row shouldn't be able to produce one,
+        /// but paranoia is cheap).
+        #[qinvokable]
+        fn remove_account(self: Pin<&mut TaskListViewModel>, index: i32);
     }
 
     // Opt the view model into cxx-qt's Threading surface so the
@@ -240,6 +277,32 @@ use tasks_core::query::{
 };
 use tasks_core::recurrence::humanize_rrule;
 use tasks_core::watch::DatabaseWatcher;
+
+/// Provider kind tags that match `tasks_sync::ProviderKind` in
+/// numeric order. Kept as bare integers at the bridge boundary so
+/// QML can pass the picker's index through without a named type.
+const KIND_CALDAV: i32 = 0;
+const KIND_GOOGLE_TASKS: i32 = 1;
+const KIND_MICROSOFT_TODO: i32 = 2;
+const KIND_ETESYNC: i32 = 3;
+
+/// Non-Qt account record. `password` is held on the Rust side only
+/// so it never crosses the FFI boundary into QML. Cleared when the
+/// view model is dropped; OS-native keychain storage lands with the
+/// follow-up tracked in PLAN_UPDATES §11.
+///
+/// `password` is captured but not yet consumed — the SyncEngine
+/// wiring is the next commit. Silencing dead_code until then so the
+/// type signature stays stable across the two commits.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct StoredAccount {
+    kind: i32,
+    label: String,
+    server: String,
+    username: String,
+    password: String,
+}
 
 pub struct TaskListViewModelRust {
     // List state.
@@ -289,6 +352,14 @@ pub struct TaskListViewModelRust {
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
     active_filter_id: QString,
+    // Accounts state (parallel arrays; see Q_PROPERTY comments above).
+    account_labels: QStringList,
+    account_kinds: QList<i32>,
+    account_servers: QStringList,
+    account_usernames: QStringList,
+    // Non-Qt account storage: keeps the password alongside the
+    // user-facing fields without exposing it to QML. Session-local.
+    accounts: Vec<StoredAccount>,
     // Status.
     status: QString,
     db_path_display: QString,
@@ -360,6 +431,11 @@ impl Default for TaskListViewModelRust {
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
+            account_labels: QStringList::default(),
+            account_kinds: QList::default(),
+            account_servers: QStringList::default(),
+            account_usernames: QStringList::default(),
+            accounts: Vec::new(),
             status: QString::default(),
             db_path_display: QString::default(),
             db_path: None,
@@ -487,6 +563,69 @@ impl qobject::TaskListViewModel {
         self.as_mut()
             .set_pref_completed_at_bottom(completed_at_bottom);
         self.as_mut().reload_active_filter();
+    }
+
+    /// Add a CalDAV or EteSync account to the session's accounts
+    /// list. Validates kind + required fields up front so the
+    /// Accounts pane gets a single-line status message on reject
+    /// instead of a silent drop.
+    pub fn add_password_account(
+        mut self: Pin<&mut Self>,
+        kind: i32,
+        label: QString,
+        server: QString,
+        username: QString,
+        password: QString,
+    ) {
+        if kind != KIND_CALDAV && kind != KIND_ETESYNC {
+            let msg = match kind {
+                KIND_GOOGLE_TASKS => {
+                    "Google Tasks sign-in lands with the OAuth flow (PLAN_UPDATES \u{00A7}11)."
+                }
+                KIND_MICROSOFT_TODO => {
+                    "Microsoft To Do sign-in lands with the OAuth flow (PLAN_UPDATES \u{00A7}11)."
+                }
+                _ => "Unknown account type.",
+            };
+            self.as_mut().set_status(QString::from(msg));
+            return;
+        }
+        let label_s = label.to_string().trim().to_string();
+        let server_s = server.to_string().trim().to_string();
+        let username_s = username.to_string().trim().to_string();
+        let password_s = password.to_string();
+        if label_s.is_empty()
+            || server_s.is_empty()
+            || username_s.is_empty()
+            || password_s.is_empty()
+        {
+            self.as_mut().set_status(QString::from(
+                "All four fields (label, server, username, password) are required.",
+            ));
+            return;
+        }
+        self.as_mut().rust_mut().accounts.push(StoredAccount {
+            kind,
+            label: label_s,
+            server: server_s,
+            username: username_s,
+            password: password_s,
+        });
+        publish_accounts(self.as_mut());
+        self.as_mut()
+            .set_status(QString::from("Account saved (session-local)."));
+    }
+
+    /// Drop the account at `index`. No-op on out-of-range.
+    pub fn remove_account(mut self: Pin<&mut Self>, index: i32) {
+        let idx = index as usize;
+        if index < 0 || idx >= self.accounts.len() {
+            return;
+        }
+        let removed = self.as_mut().rust_mut().accounts.remove(idx);
+        publish_accounts(self.as_mut());
+        self.as_mut()
+            .set_status(QString::from(&format!("Removed \"{}\".", removed.label)));
     }
 
     /// Create a new task in the open DB with `title`. If the user
@@ -883,6 +1022,26 @@ impl qobject::TaskListViewModel {
         self.as_mut().set_priorities(QList::default());
         self.as_mut().rust_mut().task_cache.clear();
     }
+}
+
+/// Rebuild the four Q_PROPERTY arrays the Accounts pane binds to
+/// from `self.accounts`. Called after every add/remove.
+fn publish_accounts(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    let snapshot: Vec<StoredAccount> = vm.accounts.clone();
+    let mut kinds: QList<i32> = QList::default();
+    let mut labels: QList<QString> = QList::default();
+    let mut servers: QList<QString> = QList::default();
+    let mut users: QList<QString> = QList::default();
+    for a in &snapshot {
+        kinds.append(a.kind);
+        labels.append(QString::from(&a.label));
+        servers.append(QString::from(&a.server));
+        users.append(QString::from(&a.username));
+    }
+    vm.as_mut().set_account_kinds(kinds);
+    vm.as_mut().set_account_labels(QStringList::from(&labels));
+    vm.as_mut().set_account_servers(QStringList::from(&servers));
+    vm.as_mut().set_account_usernames(QStringList::from(&users));
 }
 
 fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>) {

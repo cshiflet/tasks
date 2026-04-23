@@ -675,3 +675,63 @@ Remaining follow-ups before any provider is user-visible:
   refresh-endpoint 4xx drops the session into an Auth error and
   the user has to reauthorise. That's correct but unfriendly;
   the UI should surface "reauthorise" as a first-class action.
+
+## 12. Settings window lands; edit dialog becomes a real Window
+
+Two UX pieces that fell out of first user testing of v0.0.8
+landed together on this branch:
+
+- **Tabbed Settings window.** The single "Preferences…" toolbar
+  button that used to open a list-view-only Dialog is now a
+  "Settings…" button that opens a top-level `ApplicationWindow`
+  with a TabBar across `List` + `Accounts`. The previous
+  preferences controls (sort mode + direction, show completed /
+  hidden, completed-at-bottom) moved into the List tab
+  unchanged; their Save button still calls
+  `updatePreferences(...)` on the bridge. The Settings window
+  itself is a real window with native title-bar move/resize/
+  close; hide-on-close preserves the selected tab between opens.
+- **Accounts pane (first pass).** New QML pane with an add/remove
+  form over a parallel-array Q_PROPERTY surface on the bridge
+  (`account_labels`, `account_kinds`, `account_servers`,
+  `account_usernames`) backed by an in-memory `Vec<StoredAccount>`
+  on the Rust side. CalDAV and EteSync entries accept
+  label + server + username + password inline and land
+  immediately; Google Tasks + Microsoft To Do appear in the
+  provider picker but their "Sign in…" button is disabled with
+  a tooltip pointing at §11's OAuth-flow follow-up. Passwords
+  are held on the Rust side only and never cross the FFI
+  boundary into QML.
+- **Sync engine is not yet reachable.** Adding an account only
+  records it; no Provider is constructed, no
+  `SyncEngine::sync_now` is dispatched. The next commit pulls a
+  tokio runtime onto the bridge and wires the "Sync now" action
+  plus OAuth authorize() for the two browser-flow providers.
+- **Edit dialog: scrollable, movable, resizable.** The previous
+  `TaskEditDialog` was a `QtQuick.Controls.Dialog` with a pinned
+  implicit size, which cut off the bottom of the form (Tags /
+  Location / Reminders / Repeats) on compact displays and
+  couldn't be moved or resized. The new version is a top-level
+  `ApplicationWindow` with a ScrollView wrapping the full form,
+  a manual Cancel / Save footer row, and native
+  move/resize/close from the window manager. The notes field's
+  inner ScrollView was removed so the outer viewport handles
+  all scrolling (avoids nested-scroll mouse-wheel ambiguity);
+  validation messages from the Rust-side parser stay pinned
+  below the scroll so they're always visible after a failed
+  save.
+
+Remaining Settings/Accounts follow-ups (explicit):
+
+- Persist accounts + preferences to `QSettings` (or an
+  equivalent desktop-native config store) so neither the list
+  of accounts nor the password + list preferences evaporate on
+  restart. Separate keystore for the password itself
+  (libsecret / Keychain / Credential Manager) already tracked
+  in §11.
+- Wire the Accounts pane's "Sync now" action per row (requires
+  a tokio runtime on the bridge + a `Provider` factory that
+  reads `StoredAccount` + credentials from the keystore).
+- Swap the OAuth provider entries from "coming soon" to a real
+  `authorize()` button once the browser-opener + loopback
+  plumbing is reachable from QML.

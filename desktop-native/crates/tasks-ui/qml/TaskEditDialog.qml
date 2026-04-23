@@ -2,32 +2,71 @@
 //
 // The caller (TaskDetailPane) seeds `initialTitle`, `initialNotes`,
 // `initialDueText`, `initialHideUntilText`, and `initialPriority`
-// from the view model's `selected*` properties, then opens the
-// dialog. Saving calls `vm.updateSelectedTask(...)` — the Rust side
+// from the view model's `selected*` properties, then calls `open()`.
+// Saving calls `vm.updateSelectedTask(...)` — the Rust side
 // re-parses the date text, writes the UPDATE, reloads the active
 // filter, and refreshes the detail pane. Cancel discards without
 // touching the DB.
 //
-// Recurrence is intentionally read-only in this dialog: editing a
-// repeat rule properly needs its own FREQ/BYDAY picker, which
-// belongs in a follow-up. The summary field below is a reminder of
-// what's currently set, not an editable field.
+// Window vs Dialog: this is a top-level ApplicationWindow, not a
+// Controls.Dialog, so the OS window manager supplies native
+// move/resize/close affordances for free. The previous Dialog-based
+// version had a pinned implicitWidth/implicitHeight that cut off
+// the lower half of the form on compact displays; the Window
+// version wraps its content in a ScrollView and sets a reasonable
+// minimum size, so the user can shrink or grow the window to fit.
+//
+// Recurrence editing is limited to FREQ / INTERVAL / BYDAY /
+// repeat-from; COUNT / UNTIL round-trip unparsed and surface a
+// footer warning when the incoming rule carries one.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 
-Dialog {
+ApplicationWindow {
     id: dialog
-    modal: true
     title: qsTr("Edit task")
-    standardButtons: Dialog.Cancel | Dialog.Save
+    // Sized so the common fields fit without scrolling on a
+    // typical desktop; users can resize, since this is a real
+    // window. Minimums keep the form legible on shrink.
+    width: 620
+    height: 680
+    minimumWidth: 480
+    minimumHeight: 420
+    // Hide-on-close rather than destroy so the TaskDetailPane's
+    // `TaskEditDialog { id: editDialog }` reference stays valid for
+    // the next open.
+    visible: false
+    // Application-modal so the main window is blocked until the
+    // edit finishes. The user can still move/resize this window,
+    // which the old Dialog couldn't do.
+    modality: Qt.ApplicationModal
+    // `Qt.Dialog` + the visibility flags give the window manager
+    // the "this is a dialog" hints (centered on open, no taskbar
+    // entry on some desktops) without locking out move/resize.
+    flags: Qt.Dialog | Qt.WindowTitleHint | Qt.WindowSystemMenuHint
+           | Qt.WindowCloseButtonHint | Qt.WindowMinMaxButtonsHint
+    // Match the main window's theme so a dark-mode desktop doesn't
+    // pop a light edit window.
+    Material.theme: Material.System
+    Material.accent: Material.Blue
 
-    // Pin an explicit size so the wrap-mode TextArea inside doesn't
-    // drive the dialog's own implicit size (the binding-loop trap
-    // that bit the confirm-delete dialog earlier).
-    implicitWidth: 520
-    implicitHeight: 520
+    // Compatibility shims so call sites written against the old
+    // Dialog-based API (`editDialog.open()`) continue to work.
+    function open() {
+        show();
+        raise();
+        requestActivate();
+    }
+    function accept() {
+        if (saveChanges()) {
+            close();
+        }
+    }
+    function reject() {
+        close();
+    }
 
     // View model handle, passed in from TaskDetailPane.
     required property QtObject vm
@@ -242,9 +281,28 @@ Dialog {
         }
     }
 
+    // Outer layout: scroll view for the form + a pinned footer
+    // holding validation + Cancel/Save buttons.
     ColumnLayout {
+        id: outerLayout
         anchors.fill: parent
+        anchors.margins: 12
         spacing: 10
+
+        ScrollView {
+            id: scroll
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            clip: true
+            // Pin content width to the viewport so child RowLayouts
+            // / GridLayouts don't blow out horizontally and produce
+            // a phantom horizontal scrollbar alongside the vertical
+            // one.
+            contentWidth: availableWidth
+
+            ColumnLayout {
+                width: scroll.availableWidth
+                spacing: 10
 
         Label {
             text: qsTr("Title")
@@ -260,17 +318,17 @@ Dialog {
             text: qsTr("Notes (Markdown)")
             opacity: 0.7
         }
-        ScrollView {
+        // Notes field no longer has its own ScrollView — the outer
+        // one handles vertical scrolling for the whole form. A
+        // preferred height keeps the editor tall enough to be
+        // useful on first open.
+        TextArea {
+            id: notesField
             Layout.fillWidth: true
-            Layout.fillHeight: true
-            Layout.minimumHeight: 100
-
-            TextArea {
-                id: notesField
-                wrapMode: TextArea.Wrap
-                selectByMouse: true
-                placeholderText: qsTr("Notes. Markdown renders in the detail pane.")
-            }
+            Layout.preferredHeight: 140
+            wrapMode: TextArea.Wrap
+            selectByMouse: true
+            placeholderText: qsTr("Notes. Markdown renders in the detail pane.")
         }
 
         GridLayout {
@@ -587,11 +645,20 @@ Dialog {
                     wrapMode: Text.Wrap
                 }
             }
+                // Closes the inner GridLayout that started near the
+                // top of the form (the one that holds Due / Hide /
+                // Priority / Estimate / Elapsed / Parent / List /
+                // Tags / Location / Reminders / Repeats).
+            }
+                // Closes the inner ColumnLayout that the form lives
+                // in (child of the ScrollView).
+            }
         }
 
         // Shows the Rust-side parse error ("Due: month out of range")
         // after a failed Save so the user can correct and retry
-        // without re-opening the dialog.
+        // without re-opening the dialog. Lives outside the ScrollView
+        // so it always stays visible at the bottom of the window.
         Label {
             id: validation
             Layout.fillWidth: true
@@ -599,11 +666,35 @@ Dialog {
             wrapMode: Text.Wrap
             visible: text.length > 0
         }
+
+        // Footer: Cancel on the left (flat, secondary action),
+        // Save on the right (highlighted primary). Mirrors the
+        // previous Dialog.standardButtons ordering.
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+            Item { Layout.fillWidth: true }
+            Button {
+                text: qsTr("Cancel")
+                flat: true
+                onClicked: dialog.reject()
+            }
+            Button {
+                text: qsTr("Save")
+                highlighted: true
+                onClicked: dialog.accept()
+            }
+        }
     }
 
-    onAccepted: {
+    // Called by the footer Save button (and by `accept()` from the
+    // compatibility shim at the top). Returns true on success so
+    // the caller knows whether to close the window; callers that
+    // want to keep the window open on validation failure can act on
+    // the return value.
+    function saveChanges() {
         if (!vm) {
-            return;
+            return false;
         }
         // The Rust side re-parses and will refuse malformed dates;
         // the dialog closes optimistically here. If save fails the

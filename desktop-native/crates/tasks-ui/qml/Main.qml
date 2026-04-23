@@ -128,12 +128,14 @@ ApplicationWindow {
                 onClicked: importDialog.open()
             }
             Button {
-                text: qsTr("Preferences…")
+                text: qsTr("Settings…")
                 ToolTip.visible: hovered
-                ToolTip.text: qsTr("Adjust sort and visibility")
+                ToolTip.text: qsTr("List preferences, sync accounts")
                 onClicked: {
-                    prefsDialog.loadFromVm();
-                    prefsDialog.open();
+                    settingsWindow.loadFromVm();
+                    settingsWindow.visible = true;
+                    settingsWindow.raise();
+                    settingsWindow.requestActivate();
                 }
             }
             Button {
@@ -143,9 +145,12 @@ ApplicationWindow {
         }
     }
 
-    PreferencesDialog {
-        id: prefsDialog
-        anchors.centerIn: parent
+    // Settings is now a top-level Window (resizable, natively
+    // decorated) holding tabs for List preferences + Accounts.
+    // Hide-on-close preserves the selected tab and in-flight form
+    // state between re-opens.
+    SettingsWindow {
+        id: settingsWindow
         vm: viewModel
     }
 

@@ -131,9 +131,10 @@ Pane {
         }
     }
 
+    // The edit dialog is a top-level ApplicationWindow now, so it
+    // manages its own position + size. No anchor to the pane.
     TaskEditDialog {
         id: editDialog
-        anchors.centerIn: parent
         vm: root.vm
     }
 
