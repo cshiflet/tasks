@@ -41,6 +41,10 @@ serde_json = "1"
 # Synchronous API — every call wraps in `tokio::task::spawn_blocking`.
 etebase = "0.5"
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+# HTTP client for CalDAV + Google/Microsoft REST. Etebase already
+# pulls reqwest (blocking); we want the async version with rustls
+# so a user's system OpenSSL issues don't block a sync.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
 
 # Additional per-provider deps (reqwest, quick-xml, oauth2,
 # libetebase-rs, …) will land when the individual provider
