@@ -3,6 +3,7 @@
 // update when `selectTask(id)` is invoked from the list pane.
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Material
 import QtQuick.Layouts
 
 import com.tasks.desktop
@@ -11,6 +12,58 @@ Pane {
     id: root
     padding: 16
     required property QtObject vm
+
+    // Look up a label from a parallel-array (uids, labels) Q_PROPERTY pair.
+    // Returns the empty string when not found, so the rendered Label can
+    // bind directly to it.
+    function _labelFor(uid, uids, labels) {
+        if (!uid || !uids || !labels) { return ""; }
+        for (let i = 0; i < uids.length; i++) {
+            if (uids[i] === uid) { return labels[i] || ""; }
+        }
+        return "";
+    }
+    function _selectedListName() {
+        if (!root.vm) { return ""; }
+        return _labelFor(
+            root.vm.selectedCaldavCalendarUuid,
+            root.vm.caldavCalendarUuids,
+            root.vm.caldavCalendarLabels);
+    }
+    function _selectedPlaceName() {
+        if (!root.vm) { return ""; }
+        return _labelFor(
+            root.vm.selectedPlaceUid,
+            root.vm.placeUids,
+            root.vm.placeLabels);
+    }
+    function _selectedParentTitle() {
+        if (!root.vm || root.vm.selectedParentId === 0) { return ""; }
+        const ids = root.vm.parentCandidateIds;
+        const labels = root.vm.parentCandidateLabels;
+        for (let i = 0; i < ids.length; i++) {
+            if (ids[i] === root.vm.selectedParentId) {
+                return labels[i] || qsTr("(untitled task)");
+            }
+        }
+        return "";
+    }
+    function _selectedTagNames() {
+        if (!root.vm) { return []; }
+        const out = [];
+        const uids = root.vm.tagUids;
+        const labels = root.vm.tagLabels;
+        for (let i = 0; i < root.vm.selectedTagUids.length; i++) {
+            const u = root.vm.selectedTagUids[i];
+            for (let j = 0; j < uids.length; j++) {
+                if (uids[j] === u) {
+                    out.push(labels[j] || u);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -31,6 +84,122 @@ Pane {
                 font.bold: true
                 wrapMode: Text.WordWrap
                 font.strikeout: root.vm && root.vm.selectedCompleted
+            }
+        }
+
+        // Metadata strip: list, parent, location, reminder count.
+        // Each chip-like Label only renders if there's a value, so an
+        // unannotated task collapses cleanly to nothing.
+        Flow {
+            Layout.fillWidth: true
+            spacing: 8
+
+            // CalDAV list pill.
+            Label {
+                visible: root._selectedListName().length > 0
+                text: qsTr("📋 %1").arg(root._selectedListName())
+                opacity: 0.75
+                font.pointSize: Qt.application.font.pointSize - 1
+                leftPadding: 6
+                rightPadding: 6
+                topPadding: 2
+                bottomPadding: 2
+                background: Rectangle {
+                    color: Material.foreground
+                    opacity: 0.08
+                    radius: 4
+                }
+            }
+            // Parent task pill.
+            Label {
+                visible: root._selectedParentTitle().length > 0
+                text: qsTr("↳ %1").arg(root._selectedParentTitle())
+                opacity: 0.75
+                font.pointSize: Qt.application.font.pointSize - 1
+                leftPadding: 6
+                rightPadding: 6
+                topPadding: 2
+                bottomPadding: 2
+                background: Rectangle {
+                    color: Material.foreground
+                    opacity: 0.08
+                    radius: 4
+                }
+            }
+            // Location pill (with arrival/departure trigger hint).
+            Label {
+                visible: root._selectedPlaceName().length > 0
+                text: {
+                    let trig = "";
+                    if (root.vm && root.vm.selectedPlaceArrival && root.vm.selectedPlaceDeparture) {
+                        trig = qsTr(" (arrival + departure)");
+                    } else if (root.vm && root.vm.selectedPlaceArrival) {
+                        trig = qsTr(" (arrival)");
+                    } else if (root.vm && root.vm.selectedPlaceDeparture) {
+                        trig = qsTr(" (departure)");
+                    }
+                    return qsTr("📍 %1%2").arg(root._selectedPlaceName()).arg(trig);
+                }
+                opacity: 0.75
+                font.pointSize: Qt.application.font.pointSize - 1
+                leftPadding: 6
+                rightPadding: 6
+                topPadding: 2
+                bottomPadding: 2
+                background: Rectangle {
+                    color: Material.foreground
+                    opacity: 0.08
+                    radius: 4
+                }
+            }
+            // Reminder count pill. ToolTip is bound through a
+            // dedicated HoverHandler since Label has no `hovered`
+            // property of its own.
+            Label {
+                id: reminderPill
+                visible: root.vm && root.vm.selectedAlarmLabels.length > 0
+                text: qsTr("⏰ %1").arg(root.vm ? root.vm.selectedAlarmLabels.length : 0)
+                opacity: 0.75
+                font.pointSize: Qt.application.font.pointSize - 1
+                leftPadding: 6
+                rightPadding: 6
+                topPadding: 2
+                bottomPadding: 2
+                background: Rectangle {
+                    color: Material.foreground
+                    opacity: 0.08
+                    radius: 4
+                }
+                HoverHandler { id: reminderHover }
+                ToolTip.visible: reminderHover.hovered
+                                 && root.vm
+                                 && root.vm.selectedAlarmLabels.length > 0
+                ToolTip.text: root.vm ? root.vm.selectedAlarmLabels.join("\n") : ""
+            }
+        }
+
+        // Tags row — wraps to multiple lines when there are many.
+        Flow {
+            Layout.fillWidth: true
+            spacing: 6
+            visible: root._selectedTagNames().length > 0
+
+            Repeater {
+                model: root._selectedTagNames()
+                Label {
+                    required property string modelData
+                    text: modelData
+                    font.pointSize: Qt.application.font.pointSize - 1
+                    leftPadding: 6
+                    rightPadding: 6
+                    topPadding: 2
+                    bottomPadding: 2
+                    background: Rectangle {
+                        color: Material.color(Material.Blue, Material.Shade400)
+                        opacity: 0.18
+                        radius: 8
+                    }
+                }
             }
         }
 
@@ -162,10 +331,26 @@ Pane {
         onAccepted: if (root.vm) root.vm.deleteSelectedTask()
     }
 
-    Label {
+    // Empty-state column. Slightly larger title with a one-line
+    // hint so an unselected pane reads as deliberately blank, not
+    // broken.
+    ColumnLayout {
         anchors.centerIn: parent
+        spacing: 4
         visible: !root.vm || root.vm.selectedId === 0
-        text: qsTr("Select a task to see details")
-        opacity: 0.5
+
+        Label {
+            Layout.alignment: Qt.AlignHCenter
+            text: qsTr("No task selected")
+            font.pointSize: Qt.application.font.pointSize + 2
+            font.bold: true
+            opacity: 0.55
+        }
+        Label {
+            Layout.alignment: Qt.AlignHCenter
+            text: qsTr("Pick a row from the list to see its details here.")
+            opacity: 0.45
+            font.pointSize: Qt.application.font.pointSize - 1
+        }
     }
 }

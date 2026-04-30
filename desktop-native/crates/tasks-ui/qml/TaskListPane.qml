@@ -60,10 +60,24 @@ Pane {
                 contentItem: RowLayout {
                     spacing: 8
 
-                    // Indent guide for subtasks.
+                    // Indent guide for subtasks. A faint vertical
+                    // line at the right edge of the indent space
+                    // makes the parent → child relationship readable
+                    // at a glance (L-1); the previous empty Item left
+                    // pure whitespace.
                     Item {
                         implicitWidth: root.vm ? root.vm.indents[index] * 16 : 0
                         implicitHeight: 1
+                        Rectangle {
+                            visible: root.vm && root.vm.indents[index] > 0
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+                            anchors.rightMargin: 4
+                            width: 1
+                            color: "gray"
+                            opacity: 0.25
+                        }
                     }
 
                     // Completion toggle. We return the *current* check
