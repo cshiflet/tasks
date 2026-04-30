@@ -21,6 +21,14 @@ env:
   # Opt JS-based actions into Node 24 ahead of the 2026-06-02 default
   # flip. See desktop-native-release.yml for the full rationale.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Qt version pinned across every job so the per-push CI matches
+  # the binaries the release workflow produces. apt's distro Qt is
+  # 6.4.2 on ubuntu-latest, which silently accepts removed-in-6.6
+  # property assignments (e.g. `month`/`year` on `DayOfWeekRow`)
+  # and lets buggy QML through; install-qt-action gives us the
+  # same 6.6.3 every release ships, so a regression that breaks on
+  # Windows / macOS now fails Linux CI too.
+  QT_VERSION: '6.6.3'
 
 jobs:
   # Linux job runs fmt + clippy + the schema-hash guard in addition to
@@ -33,16 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Install Qt 6 development packages
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            qt6-base-dev qt6-declarative-dev qt6-tools-dev \
-            qml6-module-qtquick qml6-module-qtquick-controls \
-            qml6-module-qtquick-layouts qml6-module-qtquick-window \
-            qml6-module-qtquick-templates qml6-module-qtquick-dialogs \
-            qml6-module-qt-labs-platform qml6-module-qtqml-workerscript \
-            libqt6svg6-dev pkg-config xvfb
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
@@ -111,7 +114,7 @@ jobs:
       - name: Install Qt 6
         uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
         with:
-          version: '6.6.3'
+          version: ${{ env.QT_VERSION }}
           cache: true
 
       - name: Install Rust toolchain
@@ -159,7 +162,7 @@ jobs:
       - name: Install Qt 6
         uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
         with:
-          version: '6.6.3'
+          version: ${{ env.QT_VERSION }}
           cache: true
 
       - name: Install Rust toolchain
@@ -200,16 +203,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Install Qt 6 + tooling
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            qt6-base-dev qt6-declarative-dev qt6-tools-dev \
-            qml6-module-qtquick qml6-module-qtquick-controls \
-            qml6-module-qtquick-layouts qml6-module-qtquick-window \
-            qml6-module-qtquick-templates qml6-module-qtquick-dialogs \
-            qml6-module-qt-labs-platform qml6-module-qtqml-workerscript \
-            libqt6svg6-dev pkg-config
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
@@ -233,7 +231,15 @@ jobs:
           mkdir -p "dist/${OUT}/bin"
           cp target/release/tasks-desktop "dist/${OUT}/bin/"
           cp ../README.md BUILD.md DECISIONS.md "dist/${OUT}/"
-          dpkg -l libqt6core6t64 libqt6qml6 > "dist/${OUT}/QT_VERSIONS.txt" || true
+          # Record the Qt version the binary was linked against.
+          # install-qt-action exports QT_ROOT_DIR; the qmake binary
+          # there reports the version cleanly.
+          if [ -x "${QT_ROOT_DIR:-}/bin/qmake" ]; then
+            "${QT_ROOT_DIR}/bin/qmake" -v > "dist/${OUT}/QT_VERSIONS.txt"
+          else
+            echo "Qt ${QT_VERSION:-unknown} (path: ${QT_ROOT_DIR:-?})" \
+              > "dist/${OUT}/QT_VERSIONS.txt"
+          fi
           tar -C dist -czf "dist/${OUT}.tar.gz" "${OUT}"
           echo "archive=desktop-native/dist/${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "name=${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -260,7 +266,7 @@ jobs:
       - name: Install Qt 6
         uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
         with:
-          version: '6.6.3'
+          version: ${{ env.QT_VERSION }}
           cache: true
 
       - name: Install Rust toolchain
