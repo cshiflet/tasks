@@ -118,10 +118,13 @@ Item {
                 }
             }
 
+            // DayOfWeekRow only needs the locale — it renders the
+            // weekday-name labels (Mon/Tue/…) which don't depend on
+            // a specific month. month/year were on the older
+            // QtQuick.Calendar component and were removed in Qt 6.
             DayOfWeekRow {
                 Layout.fillWidth: true
-                month: root.displayedMonth.getMonth()
-                year: root.displayedMonth.getFullYear()
+                locale: grid.locale
             }
 
             MonthGrid {
