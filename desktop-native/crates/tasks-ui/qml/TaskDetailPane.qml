@@ -13,6 +13,19 @@ Pane {
     padding: 16
     required property QtObject vm
 
+    // Wired to Main.qml's `Edit selected task…` action (F2).
+    // Opens the same dialog the toolbar Edit… button does.
+    function openEditForSelected() {
+        if (!root.vm || root.vm.selectedId === 0) { return; }
+        editButton.clicked();
+    }
+    // Wired to Main.qml's `Delete selected task` action (Delete).
+    // Opens the two-step confirm; the user still has to click OK.
+    function requestDelete() {
+        if (!root.vm || root.vm.selectedId === 0) { return; }
+        confirmDelete.open();
+    }
+
     // Look up a label from a parallel-array (uids, labels) Q_PROPERTY pair.
     // Returns the empty string when not found, so the rendered Label can
     // bind directly to it.
@@ -254,6 +267,7 @@ Pane {
             spacing: 8
             Item { Layout.fillWidth: true }
             Button {
+                id: editButton
                 text: qsTr("Edit…")
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Change title, notes, due/hide dates, or priority")

@@ -20,6 +20,13 @@ Pane {
     padding: 0
     required property QtObject vm
 
+    // Wired to Main.qml's `Focus sidebar` action (Ctrl+F). Brings
+    // keyboard focus to the ListView so arrow keys navigate between
+    // filters.
+    function focusList() {
+        sidebarList.forceActiveFocus();
+    }
+
     // Map a sidebar id prefix to its group key. Unknowns fall under
     // "Other" so a future bridge extension surfaces explicitly.
     function _groupOf(id) {

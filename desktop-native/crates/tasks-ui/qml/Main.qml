@@ -98,6 +98,121 @@ ApplicationWindow {
         return s;
     }
 
+    // ---------- M-13: menu bar ----------
+    //
+    // Native top menu bar (promoted to the macOS global menu bar
+    // automatically). On Linux/Windows it renders inline above the
+    // toolbar. The Action objects are reused below by the toolbar
+    // buttons + the standalone `Shortcut`s, so the same handler
+    // fires whether the user clicks the button, picks the menu item,
+    // or taps the shortcut.
+    menuBar: MenuBar {
+        Menu {
+            title: qsTr("&File")
+            MenuItem { action: openDifferentAction }
+            MenuItem { action: openDefaultAction }
+            MenuSeparator {}
+            MenuItem { action: importBackupAction }
+            MenuSeparator {}
+            MenuItem {
+                text: qsTr("Quit")
+                shortcut: StandardKey.Quit
+                onTriggered: Qt.quit()
+            }
+        }
+        Menu {
+            title: qsTr("&Edit")
+            MenuItem { action: newTaskAction }
+            MenuItem { action: editSelectedAction }
+            MenuItem { action: deleteSelectedAction }
+        }
+        Menu {
+            title: qsTr("&View")
+            MenuItem { action: focusFilterAction }
+            MenuItem { action: openSettingsAction }
+        }
+        Menu {
+            title: qsTr("&Help")
+            MenuItem {
+                text: qsTr("About Tasks Desktop")
+                onTriggered: aboutDialog.open()
+            }
+        }
+    }
+
+    // ---------- H-1: shared Actions + global shortcuts ----------
+    Action {
+        id: openDifferentAction
+        text: qsTr("Open different…")
+        shortcut: StandardKey.Open
+        onTriggered: openDialog.open()
+    }
+    Action {
+        id: openDefaultAction
+        text: qsTr("Open default database")
+        onTriggered: viewModel.openDefaultDatabase()
+    }
+    Action {
+        id: importBackupAction
+        text: qsTr("Import backup…")
+        onTriggered: importDialog.open()
+    }
+    Action {
+        id: openSettingsAction
+        text: qsTr("Settings…")
+        shortcut: StandardKey.Preferences
+        onTriggered: {
+            settingsWindow.loadFromVm();
+            settingsWindow.visible = true;
+            settingsWindow.raise();
+            settingsWindow.requestActivate();
+        }
+    }
+    Action {
+        id: newTaskAction
+        text: qsTr("New task")
+        // Ctrl+N is the universal "new" gesture; on macOS Qt
+        // auto-translates the modifier to Cmd.
+        shortcut: "Ctrl+N"
+        onTriggered: listPane.focusQuickAdd()
+    }
+    Action {
+        id: editSelectedAction
+        text: qsTr("Edit selected task…")
+        shortcut: "F2"
+        enabled: viewModel.selectedId > 0
+        onTriggered: detailPane.openEditForSelected()
+    }
+    Action {
+        id: deleteSelectedAction
+        text: qsTr("Delete selected task")
+        shortcut: "Delete"
+        enabled: viewModel.selectedId > 0
+        onTriggered: detailPane.requestDelete()
+    }
+    Action {
+        id: focusFilterAction
+        text: qsTr("Focus sidebar")
+        shortcut: "Ctrl+F"
+        onTriggered: sidebar.focusList()
+    }
+
+    // Lightweight About dialog wired from the Help menu.
+    Dialog {
+        id: aboutDialog
+        title: qsTr("About Tasks Desktop")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Close
+        Label {
+            text: qsTr(
+                "Tasks Desktop — native Rust + Qt 6 client for Tasks.org.\n\n"
+              + "Read-only viewer + local writes; sync providers in progress.\n"
+              + "See desktop-native/README.md for build + roadmap.")
+            wrapMode: Text.Wrap
+        }
+    }
+
     header: ToolBar {
         RowLayout {
             anchors.fill: parent
@@ -123,37 +238,28 @@ ApplicationWindow {
                 opacity: 0.7
             }
             Button {
-                text: qsTr("Open different\u2026")
+                action: openDifferentAction
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Browse for a different Tasks.org SQLite database")
-                onClicked: openDialog.open()
             }
             Button {
-                text: qsTr("Import backup")
+                action: importBackupAction
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Import a Tasks.org JSON backup file into the open database")
-                onClicked: importDialog.open()
             }
             Button {
-                text: qsTr("Settings…")
+                action: openSettingsAction
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("List preferences, sync accounts")
-                onClicked: {
-                    settingsWindow.loadFromVm();
-                    settingsWindow.visible = true;
-                    settingsWindow.raise();
-                    settingsWindow.requestActivate();
-                }
             }
             Button {
                 // Renamed from "Reset to default" to defuse the
                 // false impression of a destructive reset (this
                 // just opens the OS-default DB file the desktop
                 // manages itself; nothing is wiped).
-                text: qsTr("Open default database")
+                action: openDefaultAction
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Open the default-located Tasks database for this OS")
-                onClicked: viewModel.openDefaultDatabase()
             }
         }
     }

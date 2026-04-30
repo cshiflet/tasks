@@ -12,6 +12,12 @@ Pane {
     padding: 0
     required property QtObject vm
 
+    // Wired to Main.qml's `New task` shortcut (Ctrl+N) — focuses
+    // the quick-add field so the user can type immediately.
+    function focusQuickAdd() {
+        quickAdd.forceActiveFocus();
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
