@@ -299,6 +299,20 @@ ApplicationWindow {
                 font.pointSize: Qt.application.font.pointSize - 1
                 opacity: 0.7
             }
+            // H-4: free-text substring search across title + notes.
+            // Updates on every keystroke (the bridge debounces by
+            // suppressing reloads when the trimmed text is
+            // unchanged). Clearing the field returns to the active
+            // sidebar filter.
+            TextField {
+                id: searchField
+                Layout.preferredWidth: 220
+                placeholderText: qsTr("Search tasks…")
+                ToolTip.visible: hovered && text.length === 0
+                ToolTip.text: qsTr("Search title + notes (substring match)")
+                onTextChanged: viewModel.setSearchQuery(text)
+                Keys.onEscapePressed: { text = ""; }
+            }
             Button {
                 action: openDifferentAction
                 ToolTip.visible: hovered

@@ -195,6 +195,54 @@ fn run_sql(db: &Database, sql: &str) -> Result<Vec<Task>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// H-4: free-text search across task title + notes. Returns matching
+/// tasks as a flat list (not the recursive parent-grouped tree) —
+/// search results are most useful when every match shows regardless
+/// of where it sits in the subtask hierarchy.
+///
+/// Bound parameters carry the wildcards so SQLite handles all the
+/// quoting; the user's input never crosses into the SQL string. We
+/// still escape LIKE metacharacters (`%`, `_`) via the `ESCAPE`
+/// clause so the user's literal "50%" doesn't act as a wildcard.
+///
+/// Capped at 200 characters of input + 500 result rows so an
+/// adversarial paste can't ruin a session.
+pub fn run_search(
+    db: &Database,
+    query: &str,
+    now_ms: i64,
+    _local_offset_secs: i32,
+    _prefs: &QueryPreferences,
+) -> Result<Vec<Task>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let q = if q.len() > 200 { &q[..200] } else { q };
+    // Escape LIKE metacharacters before binding. `\\` is the
+    // escape character we declare in the ESCAPE clause.
+    let escaped = q
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+    let sql = format!(
+        "SELECT {cols} FROM tasks \
+         WHERE {active} \
+         AND (tasks.title LIKE ?2 ESCAPE '\\' OR tasks.notes LIKE ?2 ESCAPE '\\') \
+         ORDER BY \
+             CASE WHEN tasks.dueDate = 0 THEN 1 ELSE 0 END, \
+             tasks.dueDate, tasks.importance, tasks.created \
+         LIMIT 500",
+        cols = select_columns(),
+        active = active_clause(),
+    );
+    let conn = db.connection();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![now_ms, pattern], Task::from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Compute `(start_utc_ms, end_utc_ms)` anchored at local midnight on the
 /// caller's current day, expressed in UTC milliseconds. `local_offset_secs`
 /// is the POSIX-style "east of UTC is positive" offset that Qt's

@@ -249,6 +249,12 @@ pub mod qobject {
         /// but paranoia is cheap).
         #[qinvokable]
         fn remove_account(self: Pin<&mut TaskListViewModel>, index: i32);
+
+        /// H-4: free-text substring search across task title +
+        /// notes. Empty input restores the currently-active filter.
+        /// Called from the toolbar search field on every text edit.
+        #[qinvokable]
+        fn set_search_query(self: Pin<&mut TaskListViewModel>, query: QString);
     }
 
     // Opt the view model into cxx-qt's Threading surface so the
@@ -274,7 +280,7 @@ use tasks_core::datetime::{
 use tasks_core::db::{default_db_path, Database};
 use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, RepeatFrom, Task};
 use tasks_core::query::{
-    run_by_filter_id, QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
+    run_by_filter_id, run_search, QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
 };
 use tasks_core::recurrence::humanize_rrule;
 use tasks_core::watch::DatabaseWatcher;
@@ -359,6 +365,12 @@ pub struct TaskListViewModelRust {
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
     active_filter_id: QString,
+    // H-4: free-text substring search across title + notes. When
+    // non-empty, `reload_active_filter` runs `run_search` instead
+    // of `run_by_filter_id`. Held on the Rust side only; the QML
+    // search field reads/writes its own `text` and pushes via the
+    // `setSearchQuery` invokable.
+    search_query: String,
     // Accounts state (parallel arrays; see Q_PROPERTY comments above).
     account_labels: QStringList,
     account_kinds: QList<i32>,
@@ -438,6 +450,7 @@ impl Default for TaskListViewModelRust {
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
+            search_query: String::new(),
             account_labels: QStringList::default(),
             account_kinds: QList::default(),
             account_servers: QStringList::default(),
@@ -621,6 +634,21 @@ impl qobject::TaskListViewModel {
         publish_accounts(self.as_mut());
         self.as_mut()
             .set_status(QString::from("Account saved (session-local)."));
+    }
+
+    /// H-4: update the search query and reload. Empty string
+    /// returns to the active filter; non-empty runs `run_search`
+    /// against title + notes. Called on every QML toolbar text
+    /// change so the list updates as the user types.
+    pub fn set_search_query(mut self: Pin<&mut Self>, query: QString) {
+        let s = query.to_string();
+        let trimmed = s.trim();
+        // Avoid unnecessary reloads if nothing meaningful changed.
+        if trimmed == self.search_query {
+            return;
+        }
+        self.as_mut().rust_mut().search_query = trimmed.to_string();
+        self.as_mut().reload_active_filter();
     }
 
     /// Drop the account at `index`. No-op on out-of-range.
@@ -985,7 +1013,10 @@ impl qobject::TaskListViewModel {
     }
 
     /// Re-query the DB using `self.active_filter_id` and publish the
-    /// parallel list arrays.
+    /// parallel list arrays. H-4: when `self.search_query` is non-
+    /// empty, run the substring search instead of the active filter
+    /// — search overrides the filter for the duration of the query
+    /// being typed.
     fn reload_active_filter(mut self: Pin<&mut Self>) {
         if self.db.is_none() {
             self.as_mut().clear_list();
@@ -995,6 +1026,7 @@ impl qobject::TaskListViewModel {
         let now_ms = now_ms();
         let offset = current_local_offset_secs();
         let active_id = self.active_filter_id.to_string();
+        let search = self.search_query.clone();
         let prefs = self.preferences.clone();
         // Borrow `db` immutably for the duration of the query, then drop
         // the borrow before any `rust_mut()` call below. `db` lives on
@@ -1004,7 +1036,11 @@ impl qobject::TaskListViewModel {
             let Some(ref db) = self.db else {
                 unreachable!("db presence checked above");
             };
-            run_by_filter_id(db, &active_id, now_ms, offset, &prefs)
+            if search.is_empty() {
+                run_by_filter_id(db, &active_id, now_ms, offset, &prefs)
+            } else {
+                run_search(db, &search, now_ms, offset, &prefs)
+            }
         };
         let tasks = match query_result {
             Ok(t) => t,

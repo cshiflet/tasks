@@ -184,3 +184,38 @@ fn today_filter_returns_only_tasks_due_in_window() {
         ]
     );
 }
+
+/// H-4: substring search returns matching tasks regardless of due
+/// date / completion / hide-until (we want to find anything by
+/// keyword). Empty search returns no rows; single-quote in the
+/// query escapes safely.
+#[test]
+fn search_matches_title_and_handles_quotes() {
+    let day_start = 1_700_000_000_000i64;
+    let day_end = day_start + 24 * 3_600_000 - 1;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("fixture.db");
+    build_fixture_db(&db_path, PINNED_IDENTITY_HASH, day_start, day_end);
+
+    let db = Database::open_read_only(&db_path).expect("open");
+    let prefs = tasks_core::query::QueryPreferences::default();
+
+    // Plain substring match — finds both "Due today morning" and
+    // "Due today evening" plus "Due tomorrow".
+    let rows = tasks_core::query::run_search(&db, "Due", day_start, 0, &prefs).expect("search");
+    let titles: Vec<_> = rows.iter().filter_map(|t| t.title.clone()).collect();
+    assert!(
+        titles.contains(&"Due today morning".to_string())
+            && titles.contains(&"Due today evening".to_string())
+            && titles.contains(&"Due tomorrow".to_string()),
+        "expected Due-prefixed matches, got {titles:?}"
+    );
+
+    // Empty / whitespace-only query returns no rows.
+    let rows = tasks_core::query::run_search(&db, "   ", day_start, 0, &prefs).expect("empty");
+    assert!(rows.is_empty());
+
+    // Quote in query is safely escaped — no SQL syntax error.
+    let _ = tasks_core::query::run_search(&db, "o'brien", day_start, 0, &prefs)
+        .expect("quote-bearing query must parse");
+}
