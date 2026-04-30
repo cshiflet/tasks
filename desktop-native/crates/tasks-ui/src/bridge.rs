@@ -50,6 +50,14 @@ pub mod qobject {
         #[qproperty(QList_bool, completed_flags)]
         #[qproperty(QStringList, due_labels)]
         #[qproperty(QList_i32, priorities)]
+        // H-7: per-row metadata so list rows can render at parity
+        // with the Android client. `task_tag_summaries[i]` is the
+        // comma-joined display names of tags attached to row `i`,
+        // empty when the task has none. `task_list_colors[i]` is
+        // the i32 ARGB colour of the row's CalDAV list, or 0 when
+        // the task is local-only.
+        #[qproperty(QStringList, task_tag_summaries)]
+        #[qproperty(QList_i32, task_list_colors)]
         // Detail-pane data for the currently-selected task.
         #[qproperty(i64, selected_id)]
         #[qproperty(QString, selected_title)]
@@ -347,6 +355,8 @@ pub struct TaskListViewModelRust {
     completed_flags: QList<bool>,
     due_labels: QStringList,
     priorities: QList<i32>,
+    task_tag_summaries: QStringList,
+    task_list_colors: QList<i32>,
     // Detail state.
     selected_id: i64,
     selected_title: QString,
@@ -431,6 +441,8 @@ impl Default for TaskListViewModelRust {
             completed_flags: QList::default(),
             due_labels: QStringList::default(),
             priorities: QList::default(),
+            task_tag_summaries: QStringList::default(),
+            task_list_colors: QList::default(),
             selected_id: 0,
             selected_title: QString::default(),
             selected_notes: QString::default(),
@@ -1159,6 +1171,8 @@ impl qobject::TaskListViewModel {
         self.as_mut().set_completed_flags(QList::default());
         self.as_mut().set_due_labels(QStringList::default());
         self.as_mut().set_priorities(QList::default());
+        self.as_mut().set_task_tag_summaries(QStringList::default());
+        self.as_mut().set_task_list_colors(QList::default());
         self.as_mut().rust_mut().task_cache.clear();
     }
 }
@@ -1217,6 +1231,34 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     let titles = QStringList::from(&title_list);
     let due_labels = QStringList::from(&due_list);
 
+    // H-7: per-row tag + list metadata. One query per dimension
+    // against the existing DB handle, aggregated to maps keyed by
+    // task id, then walked in row order to produce parallel arrays.
+    // Single-statement bulk fetches (vs N+1) so a 500-row list
+    // costs two extra prepared statements rather than 1000.
+    let row_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+    let (tag_summary_map, list_color_map) = {
+        match &vm.db {
+            Some(db) => (
+                fetch_tag_summaries(db, &row_ids),
+                fetch_list_colors(db, &row_ids),
+            ),
+            None => (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ),
+        }
+    };
+    let mut tag_summary_qlist: QList<QString> = QList::default();
+    let mut list_color_list: QList<i32> = QList::default();
+    for t in &tasks {
+        tag_summary_qlist.append(QString::from(
+            tag_summary_map.get(&t.id).map(String::as_str).unwrap_or(""),
+        ));
+        list_color_list.append(*list_color_map.get(&t.id).unwrap_or(&0));
+    }
+    let tag_summaries = QStringList::from(&tag_summary_qlist);
+
     // Two-phase publish to keep QML delegate bindings out of the
     // stale-array race:
     //
@@ -1240,10 +1282,103 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     vm.as_mut().set_completed_flags(completed_flags);
     vm.as_mut().set_due_labels(due_labels);
     vm.as_mut().set_priorities(priorities);
+    vm.as_mut().set_task_tag_summaries(tag_summaries);
+    vm.as_mut().set_task_list_colors(list_color_list);
     vm.as_mut().set_count(count);
     vm.as_mut()
         .set_status(QString::from(&format!("{count} task(s) in view")));
     vm.as_mut().rust_mut().task_cache = tasks;
+}
+
+/// H-7 helper: bulk-fetch the comma-joined tag-name summary for a
+/// list of task ids. Single SQL statement; missing tagdata rows
+/// fall back to the tag_uid so the UI never shows blanks. Returns
+/// a map from task_id to summary; tasks with no tags are absent
+/// from the map (the caller treats absence as the empty string).
+fn fetch_tag_summaries(db: &Database, task_ids: &[i64]) -> std::collections::HashMap<i64, String> {
+    if task_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    // i64 placeholders are safe to splice (no quoting concern); we
+    // build the IN clause as a comma-joined integer list.
+    let placeholders = task_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT tags.task, COALESCE(tagdata.name, tags.tag_uid) \
+         FROM tags LEFT JOIN tagdata ON tags.tag_uid = tagdata.remoteId \
+         WHERE tags.task IN ({placeholders}) \
+         ORDER BY tags.task, tagdata.name"
+    );
+    let mut out: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    let conn = db.connection();
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("fetch_tag_summaries: prepare failed: {e}");
+            return out;
+        }
+    };
+    let rows = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!("fetch_tag_summaries: query_map failed: {e}");
+            return out;
+        }
+    };
+    for row in rows.flatten() {
+        let entry = out.entry(row.0).or_default();
+        if entry.is_empty() {
+            *entry = row.1;
+        } else {
+            entry.push_str(", ");
+            entry.push_str(&row.1);
+        }
+    }
+    out
+}
+
+/// H-7 helper: bulk-fetch the per-task CalDAV list colour. Tasks
+/// not assigned to a list are absent from the map; the caller
+/// treats absence as 0 (no stripe).
+fn fetch_list_colors(db: &Database, task_ids: &[i64]) -> std::collections::HashMap<i64, i32> {
+    if task_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders = task_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT caldav_tasks.cd_task, caldav_lists.cdl_color \
+         FROM caldav_tasks \
+         INNER JOIN caldav_lists ON caldav_tasks.cd_calendar = caldav_lists.cdl_uuid \
+         WHERE caldav_tasks.cd_task IN ({placeholders}) \
+         AND caldav_tasks.cd_deleted = 0"
+    );
+    let mut out: std::collections::HashMap<i64, i32> = std::collections::HashMap::new();
+    let conn = db.connection();
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("fetch_list_colors: prepare failed: {e}");
+            return out;
+        }
+    };
+    let rows = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?))) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!("fetch_list_colors: query_map failed: {e}");
+            return out;
+        }
+    };
+    for row in rows.flatten() {
+        out.insert(row.0, row.1);
+    }
+    out
 }
 
 /// Enumerate the sidebar entries we surface: built-in filters, every CalDAV
