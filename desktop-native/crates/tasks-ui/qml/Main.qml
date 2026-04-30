@@ -197,6 +197,68 @@ ApplicationWindow {
         onTriggered: sidebar.focusList()
     }
 
+    // ---------- H-5: transient toast surface ----------
+    //
+    // The bottom status-bar Label is easy to miss because the eye
+    // is on the active pane during an action. This Popup mirrors
+    // the latest non-empty status message at the top of the window
+    // for `_toastDurationMs`, then auto-hides. The status bar
+    // continues to carry the latest text persistently for users
+    // who do glance down.
+    //
+    // Heuristic to keep noise down: skip messages that are pure
+    // "N task(s) in view" reload chatter — the UI already shows
+    // the count in the list pane header.
+    readonly property int _toastDurationMs: 4000
+
+    Connections {
+        target: viewModel
+        function onStatusChanged() {
+            const msg = viewModel.status;
+            if (msg.length === 0) { return; }
+            if (/^\d+ task\(s\) in view$/.test(msg)) { return; }
+            toastLabel.text = msg;
+            toastPopup.open();
+            toastTimer.restart();
+        }
+    }
+
+    Popup {
+        id: toastPopup
+        x: (root.width - width) / 2
+        y: 8
+        padding: 10
+        modal: false
+        focus: false
+        closePolicy: Popup.NoAutoClose
+        Material.elevation: 6
+
+        background: Rectangle {
+            color: Material.background
+            radius: 6
+            border.color: Material.foreground
+            border.width: 0
+            opacity: 0.95
+        }
+        contentItem: Label {
+            id: toastLabel
+            wrapMode: Text.Wrap
+            elide: Text.ElideRight
+            maximumLineCount: 3
+        }
+
+        // Fade-in / fade-out via the popup's built-in transitions.
+        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: 180 } }
+        exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: 220 } }
+    }
+
+    Timer {
+        id: toastTimer
+        interval: root._toastDurationMs
+        repeat: false
+        onTriggered: toastPopup.close()
+    }
+
     // Lightweight About dialog wired from the Help menu.
     Dialog {
         id: aboutDialog
