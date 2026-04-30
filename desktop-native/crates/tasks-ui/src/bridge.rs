@@ -146,6 +146,12 @@ pub mod qobject {
         #[qproperty(QList_i32, account_kinds)]
         #[qproperty(QStringList, account_servers)]
         #[qproperty(QStringList, account_usernames)]
+        // H-6: id of the last task soft-deleted in this session,
+        // valid until the toast countdown expires or the user
+        // restores it. 0 = nothing to undo. The toast Popup
+        // surfaces an Undo button while this is non-zero.
+        #[qproperty(i64, last_deleted_id)]
+        #[qproperty(QString, last_deleted_title)]
         // Status bar text.
         #[qproperty(QString, status)]
         // Absolute path of the currently-open database, surfaced in
@@ -255,6 +261,21 @@ pub mod qobject {
         /// Called from the toolbar search field on every text edit.
         #[qinvokable]
         fn set_search_query(self: Pin<&mut TaskListViewModel>, query: QString);
+
+        /// H-6: undo the most recent delete-from-detail-pane.
+        /// No-op when `last_deleted_id` is 0 (already restored or
+        /// never deleted). The undo toast button calls this on
+        /// click; the toast also calls `clearLastDeleted` when the
+        /// hide-timer fires so a stale id doesn't keep the button
+        /// active forever.
+        #[qinvokable]
+        fn restore_last_deleted(self: Pin<&mut TaskListViewModel>);
+
+        /// Reset the `last_deleted_id` Q_PROPERTY to 0 — called
+        /// from the toast when its hide-timer expires so the Undo
+        /// button disappears at the same time the toast does.
+        #[qinvokable]
+        fn clear_last_deleted(self: Pin<&mut TaskListViewModel>);
     }
 
     // Opt the view model into cxx-qt's Threading surface so the
@@ -379,6 +400,9 @@ pub struct TaskListViewModelRust {
     // Non-Qt account storage: keeps the password alongside the
     // user-facing fields without exposing it to QML. Session-local.
     accounts: Vec<StoredAccount>,
+    // H-6: last-deleted-task pinning for the undo flow.
+    last_deleted_id: i64,
+    last_deleted_title: QString,
     // Status.
     status: QString,
     db_path_display: QString,
@@ -456,6 +480,8 @@ impl Default for TaskListViewModelRust {
             account_servers: QStringList::default(),
             account_usernames: QStringList::default(),
             accounts: Vec::new(),
+            last_deleted_id: 0,
+            last_deleted_title: QString::default(),
             status: QString::default(),
             db_path_display: QString::default(),
             db_path: None,
@@ -739,11 +765,17 @@ impl qobject::TaskListViewModel {
     /// when nothing is selected. After a successful delete the detail
     /// pane clears itself, matching the Android "swipe to delete"
     /// behaviour minus the animation.
+    ///
+    /// H-6: stamp the deleted id + title onto `last_deleted_*` so the
+    /// toast shows an Undo button. The toast clears these via
+    /// `clearLastDeleted` when its timer expires; restoring via
+    /// `restoreLastDeleted` clears them too.
     pub fn delete_selected_task(mut self: Pin<&mut Self>) {
         let id = self.selected_id;
         if id <= 0 {
             return;
         }
+        let title_for_undo = self.selected_title.to_string();
         let Some(path) = self.db_path.clone() else {
             self.as_mut()
                 .set_status(QString::from("No database open; can't delete."));
@@ -753,6 +785,16 @@ impl qobject::TaskListViewModel {
             Ok(true) => {
                 clear_detail_pane(self.as_mut());
                 self.as_mut().reload_active_filter();
+                self.as_mut().set_last_deleted_id(id);
+                self.as_mut()
+                    .set_last_deleted_title(QString::from(&title_for_undo));
+                let display = if title_for_undo.is_empty() {
+                    "task".to_string()
+                } else {
+                    format!("\u{201C}{}\u{201D}", title_for_undo)
+                };
+                self.as_mut()
+                    .set_status(QString::from(&format!("Deleted {display}. Undo?")));
             }
             Ok(false) => {
                 self.as_mut()
@@ -764,6 +806,60 @@ impl qobject::TaskListViewModel {
                 self.as_mut().set_status(QString::from(&msg));
             }
         }
+    }
+
+    /// H-6: restore the most recently soft-deleted task. No-op when
+    /// `last_deleted_id` is 0. On success, reloads the active filter
+    /// and selects the restored row so the user immediately sees it
+    /// back in the list, and clears the undo state.
+    pub fn restore_last_deleted(mut self: Pin<&mut Self>) {
+        let id = self.last_deleted_id;
+        if id <= 0 {
+            return;
+        }
+        let title = self.last_deleted_title.to_string();
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't undo."));
+            return;
+        };
+        match tasks_core::set_task_undeleted(&path, id, now_ms()) {
+            Ok(true) => {
+                self.as_mut().set_last_deleted_id(0);
+                self.as_mut().set_last_deleted_title(QString::default());
+                self.as_mut().reload_active_filter();
+                self.as_mut().select_task(id);
+                let display = if title.is_empty() {
+                    "task".to_string()
+                } else {
+                    format!("\u{201C}{}\u{201D}", title)
+                };
+                self.as_mut()
+                    .set_status(QString::from(&format!("Restored {display}.")));
+            }
+            Ok(false) => {
+                // The row wasn't deleted — clear pinned state so the
+                // undo button hides; nothing to do.
+                self.as_mut().set_last_deleted_id(0);
+                self.as_mut().set_last_deleted_title(QString::default());
+            }
+            Err(e) => {
+                let msg = format!("Couldn't undo delete: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// H-6: drop the pinned undo state. Called from the toast
+    /// when its hide-timer fires, so the Undo button disappears at
+    /// the same time the toast text does.
+    pub fn clear_last_deleted(mut self: Pin<&mut Self>) {
+        if self.last_deleted_id == 0 {
+            return;
+        }
+        self.as_mut().set_last_deleted_id(0);
+        self.as_mut().set_last_deleted_title(QString::default());
     }
 
     pub fn select_task(mut self: Pin<&mut Self>, id: i64) {

@@ -130,6 +130,23 @@ pub fn set_task_deleted(path: &Path, task_id: i64, now_ms: i64) -> Result<bool> 
     Ok(rows > 0)
 }
 
+/// H-6: undo a soft-delete. Flips `tasks.deleted` back to 0 and
+/// bumps `modified` to `now_ms` so the active-list query filter
+/// surfaces the row again. Idempotent — calling on an undeleted
+/// row is a no-op (the WHERE clause matches nothing).
+///
+/// Returns `Ok(true)` when a row was actually flipped from
+/// deleted → not-deleted.
+pub fn set_task_undeleted(path: &Path, task_id: i64, now_ms: i64) -> Result<bool> {
+    let conn = open_rw(path)?;
+    let rows = conn.execute(
+        "UPDATE tasks SET deleted = 0, modified = ?1 \
+         WHERE _id = ?2 AND deleted != 0",
+        params![now_ms, task_id],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Create a new task with the given title.
 ///
 /// `caldav_calendar_uuid` optionally assigns the new task to a

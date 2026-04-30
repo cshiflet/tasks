@@ -240,16 +240,43 @@ ApplicationWindow {
             border.width: 0
             opacity: 0.95
         }
-        contentItem: Label {
-            id: toastLabel
-            wrapMode: Text.Wrap
-            elide: Text.ElideRight
-            maximumLineCount: 3
+        contentItem: RowLayout {
+            spacing: 12
+            Label {
+                id: toastLabel
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                elide: Text.ElideRight
+                maximumLineCount: 3
+            }
+            // H-6: undo button visible only while the bridge has a
+            // pinned last-deleted row. Clicking it both restores
+            // the task and dismisses the toast.
+            Button {
+                visible: viewModel.lastDeletedId > 0
+                text: qsTr("Undo")
+                flat: true
+                highlighted: true
+                onClicked: {
+                    viewModel.restoreLastDeleted();
+                    toastPopup.close();
+                    toastTimer.stop();
+                }
+            }
         }
 
         // Fade-in / fade-out via the popup's built-in transitions.
         enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: 180 } }
         exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: 220 } }
+
+        onClosed: {
+            // When the toast hides, drop any stale undo state so
+            // the button doesn't reappear next time the popup opens
+            // for an unrelated message.
+            if (viewModel.lastDeletedId > 0) {
+                viewModel.clearLastDeleted();
+            }
+        }
     }
 
     Timer {

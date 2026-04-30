@@ -9,7 +9,8 @@
 use rusqlite::params;
 use tasks_core::db::Database;
 use tasks_core::write::{
-    create_task, set_task_completion, set_task_deleted, update_task_fields, GeofenceEdit, TaskEdit,
+    create_task, set_task_completion, set_task_deleted, set_task_undeleted, update_task_fields,
+    GeofenceEdit, TaskEdit,
 };
 
 const NOW: i64 = 1_700_000_000_000;
@@ -291,7 +292,40 @@ fn unknown_id_returns_false_without_error() {
 
     assert!(!set_task_completion(&db_path, 9_999_999, true, NOW).unwrap());
     assert!(!set_task_deleted(&db_path, 9_999_999, NOW).unwrap());
+    assert!(!set_task_undeleted(&db_path, 9_999_999, NOW).unwrap());
     assert!(!update_task_fields(&db_path, 9_999_999, &edit_default("x", "y"), NOW).unwrap());
+}
+
+/// H-6: undo a soft-delete restores `tasks.deleted = 0` and bumps
+/// `modified`. Calling on a not-yet-deleted row is a no-op.
+#[test]
+fn set_task_undeleted_round_trips_with_set_task_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("tasks.db");
+    drop(Database::open_or_create_read_only(&db_path).unwrap());
+    let (a, _b) = seed_two_tasks(&db_path);
+
+    // Before delete, undelete is a no-op.
+    assert!(!set_task_undeleted(&db_path, a, NOW).unwrap());
+
+    // Delete, then undelete.
+    assert!(set_task_deleted(&db_path, a, NOW).unwrap());
+    assert!(set_task_undeleted(&db_path, a, NOW + 1000).unwrap());
+
+    let db = Database::open_read_only(&db_path).unwrap();
+    let (deleted, modified): (i64, i64) = db
+        .connection()
+        .query_row(
+            "SELECT deleted, modified FROM tasks WHERE _id = ?1",
+            params![a],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(deleted, 0, "deleted column reset to 0");
+    assert_eq!(modified, NOW + 1000, "modified bumped to undelete-time");
+
+    // Idempotent: calling on the now-undeleted row returns false.
+    assert!(!set_task_undeleted(&db_path, a, NOW + 2000).unwrap());
 }
 
 #[test]
