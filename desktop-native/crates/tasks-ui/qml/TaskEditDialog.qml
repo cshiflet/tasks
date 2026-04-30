@@ -68,6 +68,19 @@ ApplicationWindow {
         close();
     }
 
+    // H-2: keyboard shortcuts. Window-level Shortcut blocks rather
+    // than per-control Keys handlers so they fire regardless of
+    // which TextField has focus. ApplicationModal ensures these
+    // only trigger when this window is active.
+    Shortcut {
+        sequence: "Escape"
+        onActivated: dialog.reject()
+    }
+    Shortcut {
+        sequences: ["Ctrl+Return", "Ctrl+Enter"]
+        onActivated: dialog.accept()
+    }
+
     // View model handle, passed in from TaskDetailPane.
     required property QtObject vm
 
@@ -85,6 +98,11 @@ ApplicationWindow {
     // this array (pre-check); the array is mutated as the user
     // toggles so the selection can be read back on save.
     property var selectedTagUids: []
+    // M-12: live tag filter. Bound to the filter TextField above
+    // the Tags Flow; CheckBoxes hide themselves when their label
+    // doesn't contain the substring (case-insensitive).
+    property string tagFilter: ""
+
     // Working copy of the task's alarm list. Each entry is
     // `{time: Number, type: Number, label: String}`. `label` is
     // rendered in the UI; `time`+`type` are sent to the bridge on
@@ -345,6 +363,16 @@ ApplicationWindow {
             columnSpacing: 12
             rowSpacing: 8
 
+            // ---------- Section: WHEN ----------
+            Label {
+                Layout.columnSpan: 2
+                Layout.topMargin: 4
+                text: qsTr("When")
+                font.bold: true
+                font.pointSize: Qt.application.font.pointSize - 1
+                opacity: 0.55
+            }
+
             Label {
                 text: qsTr("Due")
                 opacity: 0.7
@@ -376,208 +404,6 @@ ApplicationWindow {
                 }
                 DatePickerButton {
                     target: hideField
-                }
-            }
-
-            Label {
-                text: qsTr("Priority")
-                opacity: 0.7
-            }
-            ComboBox {
-                id: priorityBox
-                Layout.fillWidth: true
-                // Index → tasks_core::models::Priority integer:
-                //   0 = HIGH, 1 = MEDIUM, 2 = LOW, 3 = NONE
-                model: [qsTr("High"), qsTr("Medium"), qsTr("Low"), qsTr("None")]
-            }
-
-            Label {
-                text: qsTr("Estimate")
-                opacity: 0.7
-            }
-            TextField {
-                id: estimateField
-                Layout.fillWidth: true
-                placeholderText: qsTr("H:MM (e.g. 0:30, 1:15)")
-            }
-
-            Label {
-                text: qsTr("Elapsed")
-                opacity: 0.7
-            }
-            TextField {
-                id: elapsedField
-                Layout.fillWidth: true
-                placeholderText: qsTr("H:MM")
-            }
-
-            Label {
-                text: qsTr("Parent task")
-                opacity: 0.7
-            }
-            ComboBox {
-                id: parentBox
-                Layout.fillWidth: true
-                // Index 0 = top-level (no parent); 1..N map onto
-                // parentCandidateIds.
-                model: {
-                    const labels = dialog.vm ? dialog.vm.parentCandidateLabels : [];
-                    const out = [qsTr("(none — top-level)")];
-                    for (let i = 0; i < labels.length; i++) {
-                        out.push(labels[i] || qsTr("(untitled task)"));
-                    }
-                    return out;
-                }
-            }
-
-            Label {
-                text: qsTr("List")
-                opacity: 0.7
-            }
-            ComboBox {
-                id: calendarBox
-                Layout.fillWidth: true
-                // Index 0 is the synthetic "(no CalDAV list)" entry
-                // (represents both "local task" and "don't change").
-                // Indices 1..N map to vm.caldavCalendarUuids[i-1].
-                model: {
-                    const labels = dialog.vm ? dialog.vm.caldavCalendarLabels : [];
-                    const out = [qsTr("Local task — no CalDAV list")];
-                    for (let i = 0; i < labels.length; i++) {
-                        out.push(labels[i]);
-                    }
-                    return out;
-                }
-                // If the DB has no CalDAV calendars, the picker is
-                // still functional (single "(no list)" entry) but
-                // offers no real choice — hide it to reduce clutter.
-                enabled: dialog.vm && dialog.vm.caldavCalendarLabels.length > 0
-            }
-
-            Label {
-                text: qsTr("Tags")
-                opacity: 0.7
-                Layout.alignment: Qt.AlignTop
-            }
-            // Scrollable flow of per-tag CheckBoxes. Each CheckBox's
-            // checked state mirrors membership in selectedTagUids;
-            // toggling mutates the array via toggleTag() so save
-            // reads the final set straight out.
-            ScrollView {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 90
-                clip: true
-
-                Flow {
-                    width: parent.width
-                    spacing: 8
-
-                    Repeater {
-                        model: dialog.vm ? dialog.vm.tagUids.length : 0
-                        CheckBox {
-                            required property int index
-                            text: dialog.vm ? dialog.vm.tagLabels[index] : ""
-                            checked: dialog.selectedTagUids.indexOf(
-                                dialog.vm.tagUids[index]) >= 0
-                            onToggled: dialog.toggleTag(
-                                dialog.vm.tagUids[index], checked)
-                        }
-                    }
-                }
-            }
-
-            Label {
-                text: qsTr("Location")
-                opacity: 0.7
-                Layout.alignment: Qt.AlignTop
-            }
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 4
-                ComboBox {
-                    id: placeBox
-                    Layout.fillWidth: true
-                    model: {
-                        const labels = dialog.vm ? dialog.vm.placeLabels : [];
-                        const out = [qsTr("(no location)")];
-                        for (let i = 0; i < labels.length; i++) {
-                            out.push(labels[i]);
-                        }
-                        return out;
-                    }
-                }
-                RowLayout {
-                    enabled: placeBox.currentIndex > 0
-                    spacing: 16
-                    CheckBox {
-                        id: arrivalBox
-                        text: qsTr("Arrival")
-                    }
-                    CheckBox {
-                        id: departureBox
-                        text: qsTr("Departure")
-                    }
-                }
-            }
-
-            Label {
-                text: qsTr("Reminders")
-                opacity: 0.7
-                Layout.alignment: Qt.AlignTop
-            }
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 4
-
-                Repeater {
-                    model: dialog.workingAlarms.length
-                    RowLayout {
-                        required property int index
-                        Layout.fillWidth: true
-                        spacing: 8
-                        Label {
-                            Layout.fillWidth: true
-                            text: dialog.workingAlarms[index].label
-                            elide: Text.ElideRight
-                        }
-                        Button {
-                            text: qsTr("Remove")
-                            flat: true
-                            onClicked: dialog.removeAlarmAt(index)
-                        }
-                    }
-                }
-
-                // Quick-add row. Tasks.org's full picker covers every
-                // alarm type (relative/absolute/random/snooze) — the
-                // desktop dialog starts with the most common case
-                // (minutes before due) and grows from there.
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-                    Label {
-                        text: qsTr("Add:")
-                        opacity: 0.6
-                    }
-                    TextField {
-                        id: addReminderField
-                        Layout.fillWidth: true
-                        placeholderText: qsTr("minutes before due")
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        onAccepted: {
-                            if (dialog.addBeforeDueMinutes(text)) {
-                                text = "";
-                            }
-                        }
-                    }
-                    Button {
-                        text: qsTr("Add")
-                        onClicked: {
-                            if (dialog.addBeforeDueMinutes(addReminderField.text)) {
-                                addReminderField.text = "";
-                            }
-                        }
-                    }
                 }
             }
 
@@ -653,24 +479,273 @@ ApplicationWindow {
 
                 // Only show when the incoming rule actually carries
                 // a COUNT or UNTIL that this editor would silently
-                // strip on save. Generic handwave caption is worse
-                // than no caption at all when there's nothing to
-                // lose.
+                // strip on save.
                 Label {
                     visible: freqBox.currentIndex > 0
                              && /(^|;)(COUNT|UNTIL)=/.test(
                                  dialog.initialRecurrenceRaw)
                     text: qsTr("Note: saving will drop the COUNT / UNTIL on the existing rule.")
-                    // Use Material's theme-aware red rather than
-                    // `Qt.darker("red", 0.8)` — a dark red on a
-                    // dark background was unreadable. Material.Red
-                    // resolves to #EF5350 in dark mode and #F44336
-                    // in light.
                     color: Material.color(Material.Red)
                     opacity: 0.9
                     font.pointSize: Qt.application.font.pointSize - 1
                     wrapMode: Text.Wrap
                 }
+            }
+
+            // ---------- Section: WHAT ----------
+            Label {
+                Layout.columnSpan: 2
+                Layout.topMargin: 12
+                text: qsTr("What")
+                font.bold: true
+                font.pointSize: Qt.application.font.pointSize - 1
+                opacity: 0.55
+            }
+
+            Label {
+                text: qsTr("Priority")
+                opacity: 0.7
+            }
+            ComboBox {
+                id: priorityBox
+                Layout.fillWidth: true
+                // Index → tasks_core::models::Priority integer:
+                //   0 = HIGH, 1 = MEDIUM, 2 = LOW, 3 = NONE
+                model: [qsTr("High"), qsTr("Medium"), qsTr("Low"), qsTr("None")]
+            }
+
+            Label {
+                text: qsTr("List")
+                opacity: 0.7
+            }
+            ComboBox {
+                id: calendarBox
+                Layout.fillWidth: true
+                // Index 0 is the synthetic "Local task" entry
+                // (represents both "local task" and "don't change").
+                // Indices 1..N map to vm.caldavCalendarUuids[i-1].
+                model: {
+                    const labels = dialog.vm ? dialog.vm.caldavCalendarLabels : [];
+                    const out = [qsTr("Local task — no CalDAV list")];
+                    for (let i = 0; i < labels.length; i++) {
+                        out.push(labels[i]);
+                    }
+                    return out;
+                }
+                enabled: dialog.vm && dialog.vm.caldavCalendarLabels.length > 0
+            }
+
+            Label {
+                text: qsTr("Tags")
+                opacity: 0.7
+                Layout.alignment: Qt.AlignTop
+            }
+            // Tags column: a small filter TextField above a
+            // scrollable Flow of CheckBoxes (M-12 — large tag lists
+            // were previously a treasure hunt in a 90 px scroll).
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 4
+
+                TextField {
+                    id: tagFilterField
+                    Layout.fillWidth: true
+                    placeholderText: qsTr("Filter tags…")
+                    visible: dialog.vm && dialog.vm.tagUids.length > 6
+                    onTextChanged: dialog.tagFilter = text
+                }
+                ScrollView {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 140
+                    clip: true
+
+                    Flow {
+                        width: parent.width
+                        spacing: 8
+
+                        Repeater {
+                            model: dialog.vm ? dialog.vm.tagUids.length : 0
+                            CheckBox {
+                                required property int index
+                                text: dialog.vm ? dialog.vm.tagLabels[index] : ""
+                                checked: dialog.selectedTagUids.indexOf(
+                                    dialog.vm.tagUids[index]) >= 0
+                                onToggled: dialog.toggleTag(
+                                    dialog.vm.tagUids[index], checked)
+                                visible: {
+                                    if (dialog.tagFilter.length === 0) { return true; }
+                                    const t = (dialog.vm
+                                        ? dialog.vm.tagLabels[index]
+                                        : "").toLowerCase();
+                                    return t.indexOf(dialog.tagFilter.toLowerCase()) >= 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Label {
+                text: qsTr("Parent task")
+                opacity: 0.7
+            }
+            ComboBox {
+                id: parentBox
+                Layout.fillWidth: true
+                // Index 0 = top-level (no parent); 1..N map onto
+                // parentCandidateIds.
+                model: {
+                    const labels = dialog.vm ? dialog.vm.parentCandidateLabels : [];
+                    const out = [qsTr("(none — top-level)")];
+                    for (let i = 0; i < labels.length; i++) {
+                        out.push(labels[i] || qsTr("(untitled task)"));
+                    }
+                    return out;
+                }
+            }
+
+            // ---------- Section: ALERTS ----------
+            Label {
+                Layout.columnSpan: 2
+                Layout.topMargin: 12
+                text: qsTr("Alerts")
+                font.bold: true
+                font.pointSize: Qt.application.font.pointSize - 1
+                opacity: 0.55
+            }
+
+            Label {
+                text: qsTr("Reminders")
+                opacity: 0.7
+                Layout.alignment: Qt.AlignTop
+            }
+            // M-5: reminders are minutes-relative-to-due; without a
+            // due date there's nothing to count from. Disable the
+            // whole section + show a hint.
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                enabled: dueField.text.trim().length > 0
+
+                Label {
+                    visible: dueField.text.trim().length === 0
+                    text: qsTr("Set a due date to add reminders.")
+                    opacity: 0.55
+                    font.pointSize: Qt.application.font.pointSize - 1
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                }
+
+                Repeater {
+                    model: dialog.workingAlarms.length
+                    RowLayout {
+                        required property int index
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Label {
+                            Layout.fillWidth: true
+                            text: dialog.workingAlarms[index].label
+                            elide: Text.ElideRight
+                        }
+                        Button {
+                            text: qsTr("Remove")
+                            flat: true
+                            onClicked: dialog.removeAlarmAt(index)
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label {
+                        text: qsTr("Add:")
+                        opacity: 0.6
+                    }
+                    TextField {
+                        id: addReminderField
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("minutes before due")
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        onAccepted: {
+                            if (dialog.addBeforeDueMinutes(text)) {
+                                text = "";
+                            }
+                        }
+                    }
+                    Button {
+                        text: qsTr("Add")
+                        onClicked: {
+                            if (dialog.addBeforeDueMinutes(addReminderField.text)) {
+                                addReminderField.text = "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            Label {
+                text: qsTr("Location")
+                opacity: 0.7
+                Layout.alignment: Qt.AlignTop
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                ComboBox {
+                    id: placeBox
+                    Layout.fillWidth: true
+                    model: {
+                        const labels = dialog.vm ? dialog.vm.placeLabels : [];
+                        const out = [qsTr("(no location)")];
+                        for (let i = 0; i < labels.length; i++) {
+                            out.push(labels[i]);
+                        }
+                        return out;
+                    }
+                }
+                RowLayout {
+                    enabled: placeBox.currentIndex > 0
+                    spacing: 16
+                    CheckBox {
+                        id: arrivalBox
+                        text: qsTr("Arrival")
+                    }
+                    CheckBox {
+                        id: departureBox
+                        text: qsTr("Departure")
+                    }
+                }
+            }
+
+            // ---------- Section: TRACKING ----------
+            Label {
+                Layout.columnSpan: 2
+                Layout.topMargin: 12
+                text: qsTr("Tracking")
+                font.bold: true
+                font.pointSize: Qt.application.font.pointSize - 1
+                opacity: 0.55
+            }
+
+            Label {
+                text: qsTr("Estimate")
+                opacity: 0.7
+            }
+            TextField {
+                id: estimateField
+                Layout.fillWidth: true
+                placeholderText: qsTr("H:MM (e.g. 0:30, 1:15)")
+            }
+
+            Label {
+                text: qsTr("Elapsed")
+                opacity: 0.7
+            }
+            TextField {
+                id: elapsedField
+                Layout.fillWidth: true
+                placeholderText: qsTr("H:MM")
             }
                 // Closes the inner GridLayout that started near the
                 // top of the form (the one that holds Due / Hide /

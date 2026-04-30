@@ -60,7 +60,11 @@ Item {
         id: button
         anchors.fill: parent
         flat: true
-        text: "📅"
+        // Plain text label rather than 📅 — emoji is inconsistent
+        // with everything else in the Material chrome and renders
+        // at a different baseline. Ellipsis hints at "open a picker".
+        text: "…"
+        font.bold: true
         padding: 4
         ToolTip.visible: hovered
         ToolTip.text: qsTr("Pick a date")
