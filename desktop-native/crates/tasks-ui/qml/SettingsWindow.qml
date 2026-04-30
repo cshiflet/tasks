@@ -41,7 +41,11 @@ ApplicationWindow {
 
     header: TabBar {
         id: tabs
-        TabButton { text: qsTr("List") }
+        // "View" reads more clearly than "List" — the prefs in this
+        // tab control how the task list is sorted and which rows
+        // appear, which is a view concern. The pane file kept the
+        // ListSettingsPane name to avoid churn in the bridge.
+        TabButton { text: qsTr("View") }
         TabButton { text: qsTr("Accounts") }
     }
 
@@ -61,12 +65,6 @@ ApplicationWindow {
         }
     }
 
-    footer: DialogButtonBox {
-        standardButtons: DialogButtonBox.Close
-        onRejected: settingsWindow.visible = false
-        // The Close button fires `rejected` — not `accepted` — because
-        // Settings doesn't have an overall "apply" action. List
-        // preferences persist on their own Save button; Accounts
-        // persist on add/remove. Close just hides the window.
-    }
+    // Drop the heavy footer ToolBar previously holding only a Close
+    // button — the window has a native close X already.
 }

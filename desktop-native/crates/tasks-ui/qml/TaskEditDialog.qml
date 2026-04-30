@@ -442,7 +442,7 @@ ApplicationWindow {
                 // Indices 1..N map to vm.caldavCalendarUuids[i-1].
                 model: {
                     const labels = dialog.vm ? dialog.vm.caldavCalendarLabels : [];
-                    const out = [qsTr("(no CalDAV list)")];
+                    const out = [qsTr("Local task — no CalDAV list")];
                     for (let i = 0; i < labels.length; i++) {
                         out.push(labels[i]);
                     }
@@ -627,13 +627,13 @@ ApplicationWindow {
                         model: 7
                         CheckBox {
                             required property int index
-                            // Standard English weekday abbrev; the
-                            // RRULE always emits MO,TU,WE,... so the
-                            // mapping is stable even if the label is
-                            // translated.
-                            text: [qsTr("M"), qsTr("T"), qsTr("W"),
-                                   qsTr("T"), qsTr("F"), qsTr("S"),
-                                   qsTr("S")][index]
+                            // Two-letter abbreviations so Mon/Tue
+                            // and Sat/Sun aren't visually identical
+                            // (was M/T/W/T/F/S/S — ambiguous). RRULE
+                            // emission stays MO,TU,WE,... regardless.
+                            text: [qsTr("Mo"), qsTr("Tu"), qsTr("We"),
+                                   qsTr("Th"), qsTr("Fr"), qsTr("Sa"),
+                                   qsTr("Su")][index]
                         }
                     }
                 }

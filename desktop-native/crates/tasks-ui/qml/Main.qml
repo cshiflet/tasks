@@ -108,17 +108,24 @@ ApplicationWindow {
             // Read-only display of the current DB. Users who want to
             // point the viewer at a different file (e.g. an Android
             // export) use the Open… button.
+            // DB path. Compact: smaller font, regular face (not
+            // monospace — that ate the toolbar on narrow windows
+            // and looked out of place against the rest of the
+            // chrome). Path elides; the window title carries the
+            // unelided form for users who want to verify.
             Label {
                 Layout.fillWidth: true
                 text: viewModel.dbPathDisplay.length > 0
                       ? viewModel.dbPathDisplay
                       : qsTr("(no database open)")
                 elide: Text.ElideMiddle
-                font.family: "monospace"
-                opacity: 0.75
+                font.pointSize: Qt.application.font.pointSize - 1
+                opacity: 0.7
             }
             Button {
                 text: qsTr("Open different\u2026")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Browse for a different Tasks.org SQLite database")
                 onClicked: openDialog.open()
             }
             Button {
@@ -139,7 +146,13 @@ ApplicationWindow {
                 }
             }
             Button {
-                text: qsTr("Reset to default")
+                // Renamed from "Reset to default" to defuse the
+                // false impression of a destructive reset (this
+                // just opens the OS-default DB file the desktop
+                // manages itself; nothing is wiped).
+                text: qsTr("Open default database")
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Open the default-located Tasks database for this OS")
                 onClicked: viewModel.openDefaultDatabase()
             }
         }
@@ -155,6 +168,9 @@ ApplicationWindow {
     }
 
     footer: ToolBar {
+        // Pin the status bar height so a long error string can't
+        // grow the bar and shove the SplitView upward.
+        implicitHeight: 28
         Label {
             anchors.fill: parent
             anchors.leftMargin: 8

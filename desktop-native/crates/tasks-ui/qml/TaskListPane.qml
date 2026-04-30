@@ -27,33 +27,19 @@ Pane {
 
         // Quick-add row. Enter-to-submit creates a new task under
         // the currently-active filter (CalDAV list if selected,
-        // otherwise local).
-        RowLayout {
+        // otherwise local). The previous flanking "Add" button was
+        // redundant with Enter and ate horizontal space — dropped.
+        TextField {
+            id: quickAdd
             Layout.fillWidth: true
             Layout.leftMargin: 8
             Layout.rightMargin: 8
             Layout.bottomMargin: 4
-            spacing: 8
-
-            TextField {
-                id: quickAdd
-                Layout.fillWidth: true
-                placeholderText: qsTr("Add a task… (press Enter to create)")
-                onAccepted: {
-                    if (root.vm && text.trim().length > 0) {
-                        root.vm.addNewTask(text);
-                        text = "";
-                    }
-                }
-            }
-            Button {
-                text: qsTr("Add")
-                enabled: quickAdd.text.trim().length > 0
-                onClicked: {
-                    if (root.vm) {
-                        root.vm.addNewTask(quickAdd.text);
-                        quickAdd.text = "";
-                    }
+            placeholderText: qsTr("Add a task… (press Enter to create)")
+            onAccepted: {
+                if (root.vm && text.trim().length > 0) {
+                    root.vm.addNewTask(text);
+                    text = "";
                 }
             }
         }

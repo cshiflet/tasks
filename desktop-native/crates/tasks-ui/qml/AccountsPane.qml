@@ -28,28 +28,26 @@ ColumnLayout {
     // `tasks_sync::ProviderKind` + the `KIND_*` constants in
     // bridge.rs. Order of entries in this array is the ComboBox
     // index and the value passed to `add_password_account`.
+    // M-6: provider labels stay clean ("Google Tasks", not
+    // "Google Tasks (coming soon)") — the disabled state of the
+    // Sign-in button + the description below already convey the
+    // gating; baking the suffix into the dropdown label was visual
+    // noise.
     readonly property var providerKinds: [
         { index: 0, label: qsTr("CalDAV"), requiresOAuth: false,
           description: qsTr("Radicale, Nextcloud, Fastmail, iCloud, any RFC 4791 server.") },
-        { index: 1, label: qsTr("Google Tasks (coming soon)"), requiresOAuth: true,
-          description: qsTr("Browser-based OAuth sign-in; wiring is pending.") },
-        { index: 2, label: qsTr("Microsoft To Do (coming soon)"), requiresOAuth: true,
-          description: qsTr("Browser-based OAuth sign-in; wiring is pending.") },
+        { index: 1, label: qsTr("Google Tasks"), requiresOAuth: true,
+          description: qsTr("Browser-based sign-in for Google Tasks will land in a future release.") },
+        { index: 2, label: qsTr("Microsoft To Do"), requiresOAuth: true,
+          description: qsTr("Browser-based sign-in for Microsoft To Do will land in a future release.") },
         { index: 3, label: qsTr("EteSync"), requiresOAuth: false,
           description: qsTr("End-to-end encrypted sync. Use your EteSync server + login password.") },
     ]
 
     function kindDisplayName(kind) {
-        // Map stored integer back to the display label. Defensive:
-        // an unknown value shouldn't render as blank.
         for (let i = 0; i < providerKinds.length; i++) {
             if (providerKinds[i].index === kind) {
-                // Strip the "(coming soon)" suffix when rendering a
-                // stored row — we only store kinds that don't need
-                // OAuth, so a stored OAuth kind shouldn't happen,
-                // but if it ever does the user should see the bare
-                // provider name.
-                return providerKinds[i].label.replace(" (coming soon)", "");
+                return providerKinds[i].label;
             }
         }
         return qsTr("Unknown (%1)").arg(kind);
@@ -175,50 +173,53 @@ ColumnLayout {
             placeholderText: qsTr("Display name (e.g. \"Fastmail / alice\")")
         }
 
+        // Credential fields collapse entirely for OAuth providers
+        // (M-7); GridLayout skips invisible cells, so the form
+        // shrinks rather than dimming-out a column of dead inputs.
         Label {
             text: qsTr("Server URL")
             opacity: 0.7
-            enabled: !kindBox.currentValue || !pane.providerKinds[kindBox.currentIndex].requiresOAuth
+            visible: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
         }
         TextField {
             id: serverField
             Layout.fillWidth: true
-            enabled: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
+            visible: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
             placeholderText: {
                 const kind = pane.providerKinds[kindBox.currentIndex].index;
                 if (kind === 0) { return qsTr("https://dav.example.com/dav/"); }
                 if (kind === 3) { return qsTr("https://api.etebase.com"); }
-                return qsTr("(not required for this provider)");
+                return "";
             }
         }
 
         Label {
             text: qsTr("Username")
             opacity: 0.7
-            enabled: serverField.enabled
+            visible: serverField.visible
         }
         TextField {
             id: userField
             Layout.fillWidth: true
-            enabled: serverField.enabled
+            visible: serverField.visible
             placeholderText: qsTr("username or email")
         }
 
         Label {
             text: qsTr("Password")
             opacity: 0.7
-            enabled: serverField.enabled
+            visible: serverField.visible
         }
         TextField {
             id: passwordField
             Layout.fillWidth: true
-            enabled: serverField.enabled
+            visible: serverField.visible
             echoMode: TextInput.Password
             placeholderText: {
                 const kind = pane.providerKinds[kindBox.currentIndex].index;
                 if (kind === 0) { return qsTr("server password or app-specific password"); }
                 if (kind === 3) { return qsTr("your EteSync password (used to derive keys)"); }
-                return qsTr("(OAuth sign-in will replace this field)");
+                return "";
             }
         }
     }
@@ -242,7 +243,7 @@ ColumnLayout {
             highlighted: true
             enabled: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
             ToolTip.visible: hovered && !enabled
-            ToolTip.text: qsTr("Browser-based sign-in is pending — see PLAN_UPDATES §11.")
+            ToolTip.text: qsTr("Browser-based sign-in for this provider is pending and will land in a future release.")
             onClicked: {
                 if (!pane.vm) { return; }
                 const kind = pane.providerKinds[kindBox.currentIndex].index;
