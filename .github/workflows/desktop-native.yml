@@ -282,7 +282,13 @@ jobs:
 
       # Mirrors desktop-native-release.yml's Windows packaging; see the
       # top-of-file comment on why these jobs are temporary.
-      - name: Assemble ZIP with windeployqt
+      #
+      # Don't pre-zip with `Compress-Archive` — `actions/upload-artifact`
+      # always wraps its `path` in a `.zip` before storing it, so a
+      # pre-zipped payload arrives as a zip-inside-a-zip on download.
+      # Hand it the staging directory's contents instead and let GitHub
+      # produce a single archive named after `name:` below.
+      - name: Stage Windows payload with windeployqt
         id: pkg
         run: |
           $Sha = (git rev-parse --short HEAD).Trim()
@@ -292,14 +298,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
           Copy-Item target/release/tasks-desktop.exe $StageDir/
           windeployqt --qmldir crates/tasks-ui/qml $StageDir/tasks-desktop.exe
-          $Archive = "dist/$Out.zip"
-          Compress-Archive -Path "$StageDir/*" -DestinationPath $Archive -Force
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "archive=desktop-native/$Archive"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$Out.zip"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "stage=desktop-native/$StageDir"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$Out"
 
       - name: Upload artefact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
         with:
           name: ${{ steps.pkg.outputs.name }}
-          path: ${{ steps.pkg.outputs.archive }}
+          path: ${{ steps.pkg.outputs.stage }}/*
           retention-days: 14
