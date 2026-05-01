@@ -157,9 +157,11 @@ pub mod qobject {
         // H-6: id of the last task soft-deleted in this session,
         // valid until the toast countdown expires or the user
         // restores it. 0 = nothing to undo. The toast Popup
-        // surfaces an Undo button while this is non-zero.
+        // surfaces an Undo button while this is non-zero. The
+        // deleted task's title is held only on the Rust side
+        // (used to format the status-line message); QML doesn't
+        // need it directly.
         #[qproperty(i64, last_deleted_id)]
-        #[qproperty(QString, last_deleted_title)]
         // Status bar text.
         #[qproperty(QString, status)]
         // Absolute path of the currently-open database, surfaced in
@@ -410,9 +412,12 @@ pub struct TaskListViewModelRust {
     // Non-Qt account storage: keeps the password alongside the
     // user-facing fields without exposing it to QML. Session-local.
     accounts: Vec<StoredAccount>,
-    // H-6: last-deleted-task pinning for the undo flow.
+    // H-6: last-deleted-task pinning for the undo flow. The id
+    // crosses FFI as a Q_PROPERTY (so QML can show / hide the
+    // Undo button); the title stays Rust-side because nothing in
+    // QML needs the raw string.
     last_deleted_id: i64,
-    last_deleted_title: QString,
+    last_deleted_title: String,
     // Status.
     status: QString,
     db_path_display: QString,
@@ -493,7 +498,7 @@ impl Default for TaskListViewModelRust {
             account_usernames: QStringList::default(),
             accounts: Vec::new(),
             last_deleted_id: 0,
-            last_deleted_title: QString::default(),
+            last_deleted_title: String::new(),
             status: QString::default(),
             db_path_display: QString::default(),
             db_path: None,
@@ -798,8 +803,7 @@ impl qobject::TaskListViewModel {
                 clear_detail_pane(self.as_mut());
                 self.as_mut().reload_active_filter();
                 self.as_mut().set_last_deleted_id(id);
-                self.as_mut()
-                    .set_last_deleted_title(QString::from(&title_for_undo));
+                self.as_mut().rust_mut().last_deleted_title = title_for_undo.clone();
                 let display = if title_for_undo.is_empty() {
                     "task".to_string()
                 } else {
@@ -829,7 +833,7 @@ impl qobject::TaskListViewModel {
         if id <= 0 {
             return;
         }
-        let title = self.last_deleted_title.to_string();
+        let title = self.last_deleted_title.clone();
         let Some(path) = self.db_path.clone() else {
             self.as_mut()
                 .set_status(QString::from("No database open; can't undo."));
@@ -838,7 +842,7 @@ impl qobject::TaskListViewModel {
         match tasks_core::set_task_undeleted(&path, id, now_ms()) {
             Ok(true) => {
                 self.as_mut().set_last_deleted_id(0);
-                self.as_mut().set_last_deleted_title(QString::default());
+                self.as_mut().rust_mut().last_deleted_title.clear();
                 self.as_mut().reload_active_filter();
                 self.as_mut().select_task(id);
                 let display = if title.is_empty() {
@@ -853,7 +857,7 @@ impl qobject::TaskListViewModel {
                 // The row wasn't deleted — clear pinned state so the
                 // undo button hides; nothing to do.
                 self.as_mut().set_last_deleted_id(0);
-                self.as_mut().set_last_deleted_title(QString::default());
+                self.as_mut().rust_mut().last_deleted_title.clear();
             }
             Err(e) => {
                 let msg = format!("Couldn't undo delete: {e}");
@@ -871,7 +875,7 @@ impl qobject::TaskListViewModel {
             return;
         }
         self.as_mut().set_last_deleted_id(0);
-        self.as_mut().set_last_deleted_title(QString::default());
+        self.as_mut().rust_mut().last_deleted_title.clear();
     }
 
     pub fn select_task(mut self: Pin<&mut Self>, id: i64) {

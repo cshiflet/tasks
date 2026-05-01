@@ -218,7 +218,16 @@ pub fn run_search(
     if q.is_empty() {
         return Ok(Vec::new());
     }
-    let q = if q.len() > 200 { &q[..200] } else { q };
+    // Cap at 200 *characters* (not bytes) so a UTF-8 multi-byte
+    // codepoint at the boundary doesn't panic on the slice. Real
+    // user input rarely exceeds this; the cap is purely a defence
+    // against pathological pastes.
+    let truncated: String = if q.chars().count() > 200 {
+        q.chars().take(200).collect()
+    } else {
+        q.to_string()
+    };
+    let q = truncated.as_str();
     // Escape LIKE metacharacters before binding. `\\` is the
     // escape character we declare in the ESCAPE clause.
     let escaped = q
