@@ -34,28 +34,11 @@ ApplicationWindow {
         id: viewModel
     }
 
-    // On first launch the default DB doesn't exist yet; openDefaultDatabase
-    // creates it at the OS-appropriate data path (see
-    // tasks_core::db::default_db_path) and loads it read-only.
+    // The desktop manages its own database exclusively at the
+    // OS-default data path. There's no UI to point at a different
+    // file — `openDefaultDatabase` creates the file on first launch
+    // and reopens it on every subsequent run.
     Component.onCompleted: viewModel.openDefaultDatabase()
-
-    FileDialog {
-        id: openDialog
-        title: qsTr("Open a Tasks database")
-        // SQLite databases have no registered MIME type, so accept
-        // all files and let `Database::open_read_only` verify the
-        // Room identity hash before committing to anything.
-        nameFilters: [
-            qsTr("SQLite database (*.db *.sqlite *.sqlite3)"),
-            qsTr("All files (*)")
-        ]
-        fileMode: FileDialog.OpenFile
-
-        onAccepted: {
-            let path = urlToLocalFile(selectedFile);
-            viewModel.openDatabase(path);
-        }
-    }
 
     FileDialog {
         id: importDialog
@@ -72,8 +55,7 @@ ApplicationWindow {
     }
 
     // Turn a QML FileDialog.selectedFile (a `file://` URL) into a
-    // native absolute path the Rust side can hand straight to
-    // std::fs::open(). Three platform wrinkles:
+    // native absolute path. Three platform wrinkles:
     //
     //   1. URL encoding — spaces and other characters come back as
     //      `%20` etc. decodeURIComponent undoes that.
@@ -82,10 +64,8 @@ ApplicationWindow {
     //      slash intact.
     //   3. Windows: "file:///C:/Users/foo" → "C:/Users/foo".
     //      After stripping "file://" we're left with "/C:/...", but
-    //      Windows path APIs reject the leading slash ("os error 123:
-    //      filename, directory name, or volume label syntax is
-    //      incorrect"), so drop it when a drive letter follows.
-    //      Rust handles forward-slash-separated Windows paths fine.
+    //      Windows path APIs reject the leading slash, so drop it
+    //      when a drive letter follows.
     function urlToLocalFile(url) {
         let s = url.toString();
         if (!s.startsWith("file://")) {
@@ -114,9 +94,6 @@ ApplicationWindow {
     menuBar: MenuBar {
         Menu {
             title: qsTr("&File")
-            MenuItem { action: openDifferentAction }
-            MenuItem { action: openDefaultAction }
-            MenuSeparator {}
             MenuItem { action: importBackupAction }
             MenuSeparator {}
             MenuItem { action: quitAction }
@@ -139,17 +116,6 @@ ApplicationWindow {
     }
 
     // ---------- H-1: shared Actions + global shortcuts ----------
-    Action {
-        id: openDifferentAction
-        text: qsTr("Open different…")
-        shortcut: StandardKey.Open
-        onTriggered: openDialog.open()
-    }
-    Action {
-        id: openDefaultAction
-        text: qsTr("Open default database")
-        onTriggered: viewModel.openDefaultDatabase()
-    }
     Action {
         id: importBackupAction
         text: qsTr("Import backup…")
@@ -311,67 +277,60 @@ ApplicationWindow {
         }
     }
 
+    // Single command-bar row in the Win11 / Edge / Files style.
+    // The DB path is in the window title where it belongs; the
+    // toolbar holds only the actions a user reaches for during a
+    // session. Search is the prominent left-side affordance;
+    // Import + Settings are right-aligned icon-only buttons with
+    // tooltips. Rare File / Edit / View actions live in the menu
+    // bar above and behind their keyboard shortcuts.
     header: ToolBar {
+        implicitHeight: 44
         RowLayout {
             anchors.fill: parent
-            anchors.leftMargin: 8
+            anchors.leftMargin: 12
             anchors.rightMargin: 8
-            spacing: 8
+            spacing: 6
 
-            // Read-only display of the current DB. Users who want to
-            // point the viewer at a different file (e.g. an Android
-            // export) use the Open… button.
-            // DB path. Compact: smaller font, regular face (not
-            // monospace — that ate the toolbar on narrow windows
-            // and looked out of place against the rest of the
-            // chrome). Path elides; the window title carries the
-            // unelided form for users who want to verify.
-            Label {
-                Layout.fillWidth: true
-                text: viewModel.dbPathDisplay.length > 0
-                      ? viewModel.dbPathDisplay
-                      : qsTr("(no database open)")
-                elide: Text.ElideMiddle
-                font.pointSize: Qt.application.font.pointSize - 1
-                opacity: 0.7
-            }
-            // H-4: free-text substring search across title + notes.
-            // Updates on every keystroke (the bridge debounces by
-            // suppressing reloads when the trimmed text is
-            // unchanged). Clearing the field returns to the active
-            // sidebar filter.
+            // Search field. Magnifier glyph rendered as an inline
+            // prefix via leftPadding + an anchored Label so we
+            // don't need an icon font. Esc clears the field, which
+            // restores the active sidebar filter via the bridge's
+            // empty-query branch.
             TextField {
                 id: searchField
-                Layout.preferredWidth: 220
+                Layout.fillWidth: true
+                Layout.maximumWidth: 480
+                leftPadding: 32
                 placeholderText: qsTr("Search tasks…")
-                ToolTip.visible: hovered && text.length === 0
-                ToolTip.text: qsTr("Search title + notes (substring match)")
                 onTextChanged: viewModel.setSearchQuery(text)
                 Keys.onEscapePressed: { text = ""; }
+                Label {
+                    text: "\u{1F50D}"  // magnifier
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    opacity: 0.55
+                }
             }
-            Button {
-                action: openDifferentAction
-                ToolTip.visible: hovered
-                ToolTip.text: qsTr("Browse for a different Tasks.org SQLite database")
-            }
-            Button {
+
+            Item { Layout.fillWidth: true }   // flexible spacer
+
+            ToolButton {
                 action: importBackupAction
+                display: AbstractButton.IconOnly
+                text: "\u{1F4E5}"             // 📥 inbox tray
+                font.pointSize: Qt.application.font.pointSize + 2
                 ToolTip.visible: hovered
-                ToolTip.text: qsTr("Import a Tasks.org JSON backup file into the open database")
+                ToolTip.text: qsTr("Import a Tasks.org JSON backup")
             }
-            Button {
+            ToolButton {
                 action: openSettingsAction
+                display: AbstractButton.IconOnly
+                text: "\u{2699}"              // ⚙ gear
+                font.pointSize: Qt.application.font.pointSize + 4
                 ToolTip.visible: hovered
-                ToolTip.text: qsTr("List preferences, sync accounts")
-            }
-            Button {
-                // Renamed from "Reset to default" to defuse the
-                // false impression of a destructive reset (this
-                // just opens the OS-default DB file the desktop
-                // manages itself; nothing is wiped).
-                action: openDefaultAction
-                ToolTip.visible: hovered
-                ToolTip.text: qsTr("Open the default-located Tasks database for this OS")
+                ToolTip.text: qsTr("Settings")
             }
         }
     }
