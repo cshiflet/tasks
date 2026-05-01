@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tasks-core",
+    "crates/tasks-sync",
+    "crates/tasks-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tasks/tasks"
+
+[workspace.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+notify = "6"
+notify-debouncer-full = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cxx = "1"
+cxx-qt = "0.7"
+cxx-qt-lib = { version = "0.7", features = ["qt_gui", "qt_qml"] }
+cxx-qt-build = { version = "0.7", features = ["link_qt_object_files"] }
+# Zeroize-backed wrapper for secret strings (OAuth tokens, CalDAV /
+# EteSync passwords). `SecretString: Clone` + serde support matches
+# the ergonomics of `String` at the field level; call sites expose
+# the inner value at the single spot it crosses into the HTTP header
+# or the FFI boundary via `.expose_secret()`.
+secrecy = { version = "0.10", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

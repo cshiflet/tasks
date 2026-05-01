@@ -1,0 +1,309 @@
+name: desktop-native
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop-native/**'
+      - 'data/schemas/**'
+      - '.github/workflows/desktop-native.yml'
+  pull_request:
+    paths:
+      - 'desktop-native/**'
+      - 'data/schemas/**'
+      - '.github/workflows/desktop-native.yml'
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Opt JS-based actions into Node 24 ahead of the 2026-06-02 default
+  # flip. See desktop-native-release.yml for the full rationale.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Qt version pinned across every job so the per-push CI matches
+  # the binaries the release workflow produces. apt's distro Qt is
+  # 6.4.2 on ubuntu-latest, which silently accepts removed-in-6.6
+  # property assignments (e.g. `month`/`year` on `DayOfWeekRow`)
+  # and lets buggy QML through; install-qt-action gives us the
+  # same 6.6.3 every release ships, so a regression that breaks on
+  # Windows / macOS now fails Linux CI too.
+  QT_VERSION: '6.6.3'
+
+jobs:
+  # Linux job runs fmt + clippy + the schema-hash guard in addition to
+  # `cargo test`, since those checks only need to run once per commit.
+  check-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test (includes schema-hash guard)
+        run: cargo test --workspace --no-fail-fast
+
+      - name: GUI smoke test (offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          # Bump QML binding warnings into stderr so the grep below can
+          # catch regressions. Without this, `Unable to assign [undefined]`
+          # et al. only show up at the default QtWarningMsg level.
+          QT_LOGGING_RULES: "qt.qml.binding*.warning=true"
+        run: |
+          cargo build --workspace
+          # Launch the binary for 3 seconds under offscreen Qt; any QML
+          # import error or crash surfaces as a non-SIGTERM exit code.
+          # stderr is tee'd so the grep below can catch QML warnings
+          # the process emits without exiting.
+          set +e
+          timeout 3 ./target/debug/tasks-desktop 2> smoke-stderr.log
+          rc=$?
+          set -e
+          # timeout returns 124 on expiry or 143 when the child was
+          # SIGTERMed — either means the process ran without crashing.
+          if [ "$rc" != "124" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
+            echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            cat smoke-stderr.log >&2 || true
+            exit $rc
+          fi
+          # Fail the job if the engine logged any known-bad patterns:
+          #   * binding loops (always a symptom of a real dep cycle)
+          #   * `Unable to assign [undefined]` — usually a stale-array
+          #     access after a model-change race
+          #   * `TypeError:` from QML — unresolved property on a VM
+          #   * `file::…qml:…:` unknown-component / import errors
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:" smoke-stderr.log; then
+            echo "QML smoke test found warnings — see matches above" >&2
+            exit 1
+          fi
+
+  # macOS and Windows jobs only run build + test — fmt/clippy/schema-hash
+  # are deterministic across OSes and would just burn CI time.
+  check-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: GUI smoke test (offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_LOGGING_RULES: "qt.qml.binding*.warning=true"
+        run: |
+          cargo build --workspace
+          set +e
+          # macOS `timeout` isn't BSD-default; use perl as a portable
+          # fallback.
+          perl -e 'alarm 3; exec @ARGV' -- ./target/debug/tasks-desktop \
+            2> smoke-stderr.log
+          rc=$?
+          set -e
+          if [ "$rc" != "142" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
+            echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            cat smoke-stderr.log >&2 || true
+            exit $rc
+          fi
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:" smoke-stderr.log; then
+            echo "QML smoke test found warnings — see matches above" >&2
+            exit 1
+          fi
+
+  check-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      # Skipping the GUI smoke step on Windows for now — `QT_QPA_PLATFORM
+      # =offscreen` works, but invoking a short-lived process via PowerShell
+      # requires platform-specific plumbing that's not worth the coverage.
+      # Revisit once the Qt front-end has feature tests worth running on
+      # Windows specifically.
+
+  # ---------------------------------------------------------------------------
+  # TEMPORARY: per-push packaging jobs for Linux + Windows.
+  #
+  # Remove these two jobs once the native-client PR merges (or once we stop
+  # needing ad-hoc binaries off feature branches). The canonical release
+  # workflow is `desktop-native-release.yml`, which runs on tag pushes and
+  # `workflow_dispatch`. These PR-scoped jobs exist only to shorten the
+  # iterate → download → test loop while the UX is still shifting shape.
+  #
+  # When removing: drop `package-linux` and `package-windows` below and
+  # delete this comment block. The release workflow keeps working as-is.
+  # ---------------------------------------------------------------------------
+  package-linux:
+    needs: check-linux
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      # Mirrors desktop-native-release.yml's Linux packaging. Version stamp
+      # always uses the short SHA here since PR builds don't carry tags.
+      - name: Assemble tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          VERSION="0.0.0-$(git rev-parse --short HEAD)"
+          OUT="tasks-desktop-${VERSION}-linux-x86_64"
+          mkdir -p "dist/${OUT}/bin"
+          cp target/release/tasks-desktop "dist/${OUT}/bin/"
+          cp ../README.md BUILD.md DECISIONS.md "dist/${OUT}/"
+          # Record the Qt version the binary was linked against.
+          # install-qt-action exports QT_ROOT_DIR; the qmake binary
+          # there reports the version cleanly.
+          if [ -x "${QT_ROOT_DIR:-}/bin/qmake" ]; then
+            "${QT_ROOT_DIR}/bin/qmake" -v > "dist/${OUT}/QT_VERSIONS.txt"
+          else
+            echo "Qt ${QT_VERSION:-unknown} (path: ${QT_ROOT_DIR:-?})" \
+              > "dist/${OUT}/QT_VERSIONS.txt"
+          fi
+          tar -C dist -czf "dist/${OUT}.tar.gz" "${OUT}"
+          echo "archive=desktop-native/dist/${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          # Shorter than the default 90 days — PR-scoped builds roll
+          # over quickly and these aren't official release artefacts.
+          retention-days: 14
+
+  package-windows:
+    needs: check-windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      # Mirrors desktop-native-release.yml's Windows packaging; see the
+      # top-of-file comment on why these jobs are temporary.
+      #
+      # Don't pre-zip with `Compress-Archive` — `actions/upload-artifact`
+      # always wraps its `path` in a `.zip` before storing it, so a
+      # pre-zipped payload arrives as a zip-inside-a-zip on download.
+      # Hand it the staging directory's contents instead and let GitHub
+      # produce a single archive named after `name:` below.
+      - name: Stage Windows payload with windeployqt
+        id: pkg
+        run: |
+          $Sha = (git rev-parse --short HEAD).Trim()
+          $Version = "0.0.0-$Sha"
+          $Out = "tasks-desktop-$Version-windows-x86_64"
+          $StageDir = "dist/$Out"
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          Copy-Item target/release/tasks-desktop.exe $StageDir/
+          windeployqt --qmldir crates/tasks-ui/qml $StageDir/tasks-desktop.exe
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "stage=desktop-native/$StageDir"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$Out"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.stage }}/*
+          retention-days: 14

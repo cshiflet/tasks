@@ -1,0 +1,32 @@
+[package]
+name = "tasks-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Qt 6 (cxx-qt) front-end for the Tasks.org native desktop client."
+
+[[bin]]
+name = "tasks-desktop"
+path = "src/main.rs"
+
+[dependencies]
+tasks-core = { path = "../tasks-core" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+cxx = { workspace = true }
+cxx-qt = { workspace = true }
+cxx-qt-lib = { workspace = true }
+# Secret-wrapped password on `StoredAccount` so the ViewModel can't
+# stringify / log the raw bytes, and the value zeroes on drop.
+secrecy = { workspace = true }
+
+# The Win32 dark-title-bar shim is implemented with bare
+# `extern "system"` declarations in `src/win_dark_titlebar.rs` —
+# no `windows-sys` dep needed. The four functions + four
+# constants we use are stable Win32 surface and the signatures
+# don't drift, which avoids the breaking-change churn between
+# windows-sys 0.59 / 0.60 / 0.61 we'd otherwise have to track.
+
+[build-dependencies]
+cxx-qt-build = { workspace = true }

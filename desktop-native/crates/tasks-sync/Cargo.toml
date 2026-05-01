@@ -1,0 +1,65 @@
+[package]
+name = "tasks-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sync providers (CalDAV, Google Tasks, Microsoft To Do, EteSync) for the Tasks.org native desktop client."
+
+[dependencies]
+# Async runtime + trait — every provider's I/O is async (HTTP,
+# Etebase's own blocking-but-wrapped API).
+async-trait = "0.1"
+# Error plumbing shared with tasks-core.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Shared data shapes (Task, CaldavCalendar, …) and the SQLite
+# bridge. The engine writes pulled state directly into the
+# desktop's local DB.
+tasks-core = { path = "../tasks-core" }
+rusqlite = { workspace = true }
+# XML parsing for CalDAV PROPFIND / REPORT multi-status
+# responses. Request bodies are small enough to build with
+# string interpolation; parsing nested `<d:response>` trees
+# wants a real pull-parser.
+quick-xml = "0.36"
+# PKCE helper for OAuth2 desktop flow (Google Tasks + Microsoft
+# To Do). Keeps the crypto primitives explicit rather than
+# depending on the full `oauth2` crate (which brings in tokio +
+# reqwest defaults we'd rather pick ourselves).
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
+percent-encoding = "2"
+# JSON parser/serializer for the REST providers (Google Tasks,
+# Microsoft Graph / To Do).
+serde = { workspace = true }
+serde_json = "1"
+# EteSync SDK. First real provider dependency; pulls libetebase
+# and its sodiumoxide transitive dep, which is why per-provider
+# crates stay out of the skeleton until their provider lands.
+# Synchronous API — every call wraps in `tokio::task::spawn_blocking`.
+etebase = "0.5"
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+# HTTP client for CalDAV + Google/Microsoft REST. Etebase already
+# pulls reqwest (blocking); we want the async version with rustls
+# so a user's system OpenSSL issues don't block a sync.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# Needed for `StreamExt::next()` on `reqwest::Response::bytes_stream()`
+# in the capped body reader (M-2). reqwest already pulls
+# futures_util as a transitive, but we name it explicitly so the
+# import path in src/providers/http_util.rs isn't leaning on a
+# transitive re-export.
+futures-util = { version = "0.3", default-features = false }
+# Zeroize-on-drop wrapper around String for passwords + OAuth tokens.
+# See the field-level comments on `AccountCredentials` /
+# `OAuthTokens` for why this matters.
+secrecy = { workspace = true }
+
+# Additional per-provider deps (reqwest, quick-xml, oauth2,
+# libetebase-rs, …) will land when the individual provider
+# skeletons gain actual network code. Keeping the skeleton dep
+# set minimal so the crate compiles cleanly today.
+
+[dev-dependencies]
+tempfile = "3"
