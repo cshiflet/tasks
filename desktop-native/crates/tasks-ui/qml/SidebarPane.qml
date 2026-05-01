@@ -102,8 +102,8 @@ Pane {
                     visible: row._isSectionStart
                     width: row.width
                     height: visible ? implicitHeight : 0
-                    topPadding: 6
-                    bottomPadding: 6
+                    topPadding: 3
+                    bottomPadding: 3
                     leftPadding: 8
                     rightPadding: 8
                     onClicked: root._toggleGroup(row.myGroup)
@@ -120,7 +120,14 @@ Pane {
                             // Right-pointing triangle when collapsed,
                             // down-pointing when expanded. Pure unicode
                             // so it inherits the theme foreground.
-                            text: row._groupCollapsed ? "▸" : "▾"
+                            // U+25B6 / U+25BC — black right- /
+                            // down-pointing triangles. Encoded as
+                            // \u escapes so the file-encoding pipeline
+                            // can't mangle them on Windows (the literal
+                            // small-triangle glyphs we tried first
+                            // rendered as "â¾"-style mojibake through
+                            // whichever font fallback Qt picked).
+                            text: row._groupCollapsed ? "\u25B6" : "\u25BC"
                             font.pointSize: Qt.application.font.pointSize - 1
                             opacity: 0.7
                             Layout.preferredWidth: 14
@@ -140,6 +147,12 @@ Pane {
                     width: row.width
                     visible: !row._groupCollapsed
                     height: visible ? implicitHeight : 0
+                    // Trim Material's default ~12 / 12 vertical padding
+                    // so each row is ~28 px instead of ~48 px — the
+                    // sidebar holds enough entries that the original
+                    // density wastes a lot of vertical real estate.
+                    topPadding: 4
+                    bottomPadding: 4
                     text: root.vm ? root.vm.sidebarLabels[row.index] : ""
                     highlighted: root.vm
                         && root.vm.activeFilterId === root.vm.sidebarIds[row.index]

@@ -357,6 +357,22 @@ ApplicationWindow {
                 placeholderText: qsTr("Search tasks…")
                 onTextChanged: viewModel.setSearchQuery(text)
                 Keys.onEscapePressed: { text = ""; }
+                // See CompactTextField.qml — Material's default
+                // filled container locks to a Light-theme grey on
+                // Windows even when the rest of the window resolves
+                // dark. Override the background outright so it
+                // paints transparently with a themed border in
+                // either theme. (`Material.containerStyle` would do
+                // this cleanly but only landed in Qt 6.5.)
+                background: Rectangle {
+                    color: "transparent"
+                    radius: 2
+                    border.width: searchField.activeFocus ? 2 : 1
+                    border.color: searchField.activeFocus
+                        ? searchField.Material.accentColor
+                        : searchField.Material.foreground
+                    opacity: searchField.activeFocus ? 1.0 : 0.45
+                }
                 Label {
                     text: "\u{1F50D}"  // magnifier
                     anchors.left: parent.left

@@ -29,6 +29,7 @@ fn main() {
                 "qml/DatePickerButton.qml",
                 "qml/CompactTextField.qml",
                 "qml/CompactMenuItem.qml",
+                "qml/CompactComboBox.qml",
             ],
             ..Default::default()
         })

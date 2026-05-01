@@ -178,7 +178,7 @@ ScrollView {
             text: qsTr("Type")
             opacity: 0.7
         }
-        ComboBox {
+        CompactComboBox {
             id: kindBox
             Layout.fillWidth: true
             textRole: "label"

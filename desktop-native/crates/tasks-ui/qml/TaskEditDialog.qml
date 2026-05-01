@@ -506,7 +506,7 @@ Pane {
 
                 RowLayout {
                     spacing: 8
-                    ComboBox {
+                    CompactComboBox {
                         id: freqBox
                         Layout.fillWidth: true
                         model: [
@@ -559,7 +559,7 @@ Pane {
                         text: qsTr("from")
                         opacity: 0.6
                     }
-                    ComboBox {
+                    CompactComboBox {
                         id: fromCompletionBox
                         model: [qsTr("Due date"), qsTr("Completion")]
                     }
@@ -594,7 +594,7 @@ Pane {
                 text: qsTr("Priority")
                 opacity: 0.7
             }
-            ComboBox {
+            CompactComboBox {
                 id: priorityBox
                 Layout.fillWidth: true
                 // Index → tasks_core::models::Priority integer:
@@ -606,7 +606,7 @@ Pane {
                 text: qsTr("List")
                 opacity: 0.7
             }
-            ComboBox {
+            CompactComboBox {
                 id: calendarBox
                 Layout.fillWidth: true
                 // Index 0 is the synthetic "Local task" entry
@@ -677,7 +677,7 @@ Pane {
                 text: qsTr("Parent task")
                 opacity: 0.7
             }
-            ComboBox {
+            CompactComboBox {
                 id: parentBox
                 Layout.fillWidth: true
                 // Index 0 = top-level (no parent); 1..N map onto
@@ -780,7 +780,7 @@ Pane {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 4
-                ComboBox {
+                CompactComboBox {
                     id: placeBox
                     Layout.fillWidth: true
                     model: {

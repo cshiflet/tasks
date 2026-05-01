@@ -58,7 +58,7 @@ ColumnLayout {
             text: qsTr("Sort by")
             opacity: 0.7
         }
-        ComboBox {
+        CompactComboBox {
             id: sortBox
             Layout.fillWidth: true
             model: [
@@ -76,7 +76,7 @@ ColumnLayout {
             text: qsTr("Direction")
             opacity: 0.7
         }
-        ComboBox {
+        CompactComboBox {
             id: directionBox
             Layout.fillWidth: true
             model: [qsTr("Ascending"), qsTr("Descending")]
