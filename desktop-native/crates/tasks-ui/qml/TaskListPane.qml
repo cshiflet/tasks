@@ -68,30 +68,10 @@ Pane {
                 highlighted: root.vm && root.vm.selectedId === root.vm.taskIds[index]
                 onClicked: if (root.vm) root.vm.selectTask(root.vm.taskIds[index])
 
-                // H-7: 3-px CalDAV list-color stripe down the row's
-                // left edge so the user can scan list affiliation
-                // without the picker. Empty (transparent) for local
-                // tasks. Stamped from `task_list_colors[index]`
-                // ARGB; alpha 0 means "no list".
-                Rectangle {
-                    anchors.left: parent.left
-                    anchors.top: parent.top
-                    anchors.bottom: parent.bottom
-                    width: 3
-                    visible: root.vm
-                             && (root.vm.taskListColors[index] >>> 24) !== 0
-                    // QML accepts `Qt.rgba(r,g,b,a)` floats 0..1; the
-                    // i32 ARGB on the wire is unpacked manually.
-                    color: {
-                        if (!root.vm) { return "transparent"; }
-                        const c = root.vm.taskListColors[index] | 0;
-                        const a = ((c >>> 24) & 0xff) / 255.0;
-                        const r = ((c >>> 16) & 0xff) / 255.0;
-                        const g = ((c >>>  8) & 0xff) / 255.0;
-                        const b = ( c         & 0xff) / 255.0;
-                        return Qt.rgba(r, g, b, a);
-                    }
-                }
+                // List affiliation is shown as an inline chip in the
+                // contentItem below, not as a left-edge stripe — keeps
+                // each row's visual chrome consistent with the
+                // metadata strip in the detail pane.
 
                 contentItem: RowLayout {
                     spacing: 8
@@ -112,10 +92,26 @@ Pane {
                         }
                     }
 
+                    // Priority is encoded via the checkbox's tint
+                    // (Material.accent), not a separate dot. Mapping
+                    // matches the Android palette:
+                    //   HIGH   #d32f2f  red
+                    //   MEDIUM #f57c00  orange
+                    //   LOW    #1976d2  blue
+                    //   NONE   default Material accent
                     CheckBox {
                         id: completeBox
                         padding: 0
                         checked: root.vm && root.vm.completedFlags[index]
+                        Material.accent: {
+                            const p = root.vm ? root.vm.priorities[index] : 3;
+                            switch (p) {
+                                case 0: return "#d32f2f";
+                                case 1: return "#f57c00";
+                                case 2: return "#1976d2";
+                                default: return Material.color(Material.Blue);
+                            }
+                        }
                         nextCheckState: function() {
                             if (root.vm) {
                                 root.vm.toggleTaskCompletion(
@@ -126,10 +122,6 @@ Pane {
                                 ? Qt.Checked
                                 : Qt.Unchecked;
                         }
-                    }
-
-                    PriorityDot {
-                        priority: root.vm ? root.vm.priorities[index] : 3
                     }
 
                     // Title + tag summary stack. The tags line only
@@ -155,6 +147,37 @@ Pane {
                             elide: Text.ElideRight
                             opacity: 0.55
                             font.pointSize: Qt.application.font.pointSize - 2
+                        }
+                    }
+
+                    // CalDAV list pill, coloured to match
+                    // `cdl_color` on the list. Hidden for local
+                    // tasks (no list = empty name + colour 0).
+                    Label {
+                        visible: root.vm
+                                 && root.vm.taskListNames[index].length > 0
+                        text: root.vm ? root.vm.taskListNames[index] : ""
+                        color: "white"
+                        font.pointSize: Qt.application.font.pointSize - 2
+                        font.bold: true
+                        leftPadding: 6
+                        rightPadding: 6
+                        topPadding: 1
+                        bottomPadding: 1
+                        elide: Text.ElideRight
+                        Layout.maximumWidth: 120
+                        background: Rectangle {
+                            radius: 4
+                            color: {
+                                if (!root.vm) { return "#9e9e9e"; }
+                                const c = root.vm.taskListColors[index] | 0;
+                                const a = ((c >>> 24) & 0xff) / 255.0;
+                                if (a === 0) { return "#9e9e9e"; }
+                                const r = ((c >>> 16) & 0xff) / 255.0;
+                                const g = ((c >>>  8) & 0xff) / 255.0;
+                                const b = ( c         & 0xff) / 255.0;
+                                return Qt.rgba(r, g, b, 1.0);
+                            }
                         }
                     }
 

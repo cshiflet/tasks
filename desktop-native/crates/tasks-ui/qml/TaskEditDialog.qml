@@ -1,20 +1,15 @@
-// Modal edit form for a single task.
+// Slide-out edit form for a single task. Lives as an overlay
+// child of TaskDetailPane and animates in from the right edge,
+// covering the detail view while the user is editing. Save and
+// Cancel both slide it back out; Esc cancels, Ctrl+Enter saves.
 //
 // The caller (TaskDetailPane) seeds `initialTitle`, `initialNotes`,
-// `initialDueText`, `initialHideUntilText`, and `initialPriority`
-// from the view model's `selected*` properties, then calls `open()`.
-// Saving calls `vm.updateSelectedTask(...)` — the Rust side
-// re-parses the date text, writes the UPDATE, reloads the active
-// filter, and refreshes the detail pane. Cancel discards without
-// touching the DB.
-//
-// Window vs Dialog: this is a top-level ApplicationWindow, not a
-// Controls.Dialog, so the OS window manager supplies native
-// move/resize/close affordances for free. The previous Dialog-based
-// version had a pinned implicitWidth/implicitHeight that cut off
-// the lower half of the form on compact displays; the Window
-// version wraps its content in a ScrollView and sets a reasonable
-// minimum size, so the user can shrink or grow the window to fit.
+// `initialDueText`, `initialHideUntilText`, etc., from the view
+// model's `selected*` properties, then calls `open()`. Saving calls
+// `vm.updateSelectedTask(...)` — the Rust side re-parses the date
+// text, writes the UPDATE, reloads the active filter, and
+// refreshes the detail pane. Cancel discards without touching
+// the DB.
 //
 // Recurrence editing is limited to FREQ / INTERVAL / BYDAY /
 // repeat-from; COUNT / UNTIL round-trip unparsed and surface a
@@ -24,40 +19,40 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 
-ApplicationWindow {
+Pane {
     id: dialog
-    title: qsTr("Edit task")
-    // Sized so the common fields fit without scrolling on a
-    // typical desktop; users can resize, since this is a real
-    // window. Minimums keep the form legible on shrink.
-    width: 620
-    height: 680
-    minimumWidth: 480
-    minimumHeight: 420
-    // Hide-on-close rather than destroy so the TaskDetailPane's
-    // `TaskEditDialog { id: editDialog }` reference stays valid for
-    // the next open.
-    visible: false
-    // Application-modal so the main window is blocked until the
-    // edit finishes. The user can still move/resize this window,
-    // which the old Dialog couldn't do.
-    modality: Qt.ApplicationModal
-    // `Qt.Dialog` + the visibility flags give the window manager
-    // the "this is a dialog" hints (centered on open, no taskbar
-    // entry on some desktops) without locking out move/resize.
-    flags: Qt.Dialog | Qt.WindowTitleHint | Qt.WindowSystemMenuHint
-           | Qt.WindowCloseButtonHint | Qt.WindowMinMaxButtonsHint
-    // Match the main window's theme so a dark-mode desktop doesn't
-    // pop a light edit window.
+    // The slide-out covers its parent fully (the detail pane) so
+    // there's no underlying interactive area while editing.
+    anchors.fill: parent
+    // Pin the Material context so the overlay reliably matches the
+    // host window's theme rather than falling back to a default.
     Material.theme: Material.System
     Material.accent: Material.Blue
+    // Sit above any sibling content in the detail pane.
+    z: 10
 
-    // Compatibility shims so call sites written against the old
-    // Dialog-based API (`editDialog.open()`) continue to work.
+    // Active = visible. The pane lives off-screen to the right
+    // (x = parent.width) when inactive, animates to x = 0 when the
+    // user clicks Edit. `visible` mirrors the boolean so off-
+    // screen state doesn't keep accepting input or rendering;
+    // `Behavior on x` runs the transition.
+    property bool active: false
+    visible: active || x < width
+    x: active ? 0 : width
+    Behavior on x {
+        NumberAnimation {
+            duration: 220
+            easing.type: Easing.OutCubic
+        }
+    }
+
+    // Compatibility shims for the existing call sites
+    // (`editDialog.open()` / `accept()` / `reject()`).
     function open() {
-        show();
-        raise();
-        requestActivate();
+        active = true;
+        // Move keyboard focus into the form so Esc + Ctrl+Enter
+        // shortcuts route to it.
+        forceActiveFocus();
     }
     function accept() {
         if (saveChanges()) {
@@ -67,17 +62,30 @@ ApplicationWindow {
     function reject() {
         close();
     }
+    function close() {
+        active = false;
+        focus = false;
+    }
 
-    // H-2: keyboard shortcuts. Window-level Shortcut blocks rather
-    // than per-control Keys handlers so they fire regardless of
-    // which TextField has focus. ApplicationModal ensures these
-    // only trigger when this window is active.
+    // Block click-through so taps on the underlying detail-pane
+    // chrome don't fire while the editor is open.
+    MouseArea {
+        anchors.fill: parent
+        z: -1               // sits behind the form content
+        onClicked: { /* swallow */ }
+    }
+
+    // Keyboard shortcuts only fire while the pane is active so
+    // pressing Esc on the main window doesn't accidentally close
+    // a not-currently-shown editor.
     Shortcut {
         sequence: "Escape"
+        enabled: dialog.active
         onActivated: dialog.reject()
     }
     Shortcut {
         sequences: ["Ctrl+Return", "Ctrl+Enter"]
+        enabled: dialog.active
         onActivated: dialog.accept()
     }
 
@@ -299,13 +307,33 @@ ApplicationWindow {
         }
     }
 
-    // Outer layout: scroll view for the form + a pinned footer
-    // holding validation + Cancel/Save buttons.
+    // Outer layout: header + scroll view for the form + a pinned
+    // footer holding validation + Cancel/Save buttons.
     ColumnLayout {
         id: outerLayout
         anchors.fill: parent
         anchors.margins: 12
         spacing: 10
+
+        // Header — replaces the old window title bar. Bold so it
+        // reads as a section header while the slide-out is open.
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                text: qsTr("Edit task")
+                font.pointSize: Qt.application.font.pointSize + 2
+                font.bold: true
+            }
+            ToolButton {
+                text: "×"               // ×
+                font.pointSize: Qt.application.font.pointSize + 4
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Cancel (Esc)")
+                onClicked: dialog.reject()
+            }
+        }
 
         ScrollView {
             id: scroll
@@ -866,5 +894,10 @@ ApplicationWindow {
             rule,
             repeatFrom
         );
+        // Returning true tells `accept()` (the caller) to close
+        // the window. The bridge invokable is fire-and-forget;
+        // validation errors surface in the status bar / toast
+        // rather than blocking the dialog.
+        return true;
     }
 }

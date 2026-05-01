@@ -53,10 +53,12 @@ pub mod qobject {
         // H-7: per-row metadata so list rows can render at parity
         // with the Android client. `task_tag_summaries[i]` is the
         // comma-joined display names of tags attached to row `i`,
-        // empty when the task has none. `task_list_colors[i]` is
-        // the i32 ARGB colour of the row's CalDAV list, or 0 when
+        // empty when the task has none. `task_list_names[i]` and
+        // `task_list_colors[i]` are the display name + i32 ARGB
+        // colour of the row's CalDAV list, both empty / 0 when
         // the task is local-only.
         #[qproperty(QStringList, task_tag_summaries)]
+        #[qproperty(QStringList, task_list_names)]
         #[qproperty(QList_i32, task_list_colors)]
         // Detail-pane data for the currently-selected task.
         #[qproperty(i64, selected_id)]
@@ -84,6 +86,10 @@ pub mod qobject {
         // UUID of the selected task's current CalDAV list, or empty
         // when the task has no caldav_tasks row (local-only).
         #[qproperty(QString, selected_caldav_calendar_uuid)]
+        // i32 ARGB colour of the selected task's CalDAV list, or 0
+        // when the task is local-only. Drives the coloured chip in
+        // the detail pane.
+        #[qproperty(i32, selected_caldav_calendar_color)]
         // All tag definitions from `tagdata`, parallel arrays for
         // the edit dialog's multi-select picker. `tag_uids` drives
         // the semantic (writes back via the update invokable);
@@ -358,6 +364,7 @@ pub struct TaskListViewModelRust {
     due_labels: QStringList,
     priorities: QList<i32>,
     task_tag_summaries: QStringList,
+    task_list_names: QStringList,
     task_list_colors: QList<i32>,
     // Detail state.
     selected_id: i64,
@@ -371,6 +378,7 @@ pub struct TaskListViewModelRust {
     caldav_calendar_labels: QStringList,
     caldav_calendar_uuids: QStringList,
     selected_caldav_calendar_uuid: QString,
+    selected_caldav_calendar_color: i32,
     tag_labels: QStringList,
     tag_uids: QStringList,
     selected_tag_uids: QStringList,
@@ -447,6 +455,7 @@ impl Default for TaskListViewModelRust {
             due_labels: QStringList::default(),
             priorities: QList::default(),
             task_tag_summaries: QStringList::default(),
+            task_list_names: QStringList::default(),
             task_list_colors: QList::default(),
             selected_id: 0,
             selected_title: QString::default(),
@@ -459,6 +468,7 @@ impl Default for TaskListViewModelRust {
             caldav_calendar_labels: QStringList::default(),
             caldav_calendar_uuids: QStringList::default(),
             selected_caldav_calendar_uuid: QString::default(),
+            selected_caldav_calendar_color: 0,
             tag_labels: QStringList::default(),
             tag_uids: QStringList::default(),
             selected_tag_uids: QStringList::default(),
@@ -907,12 +917,15 @@ impl qobject::TaskListViewModel {
             .set_selected_recurrence(QString::from(&humanized));
 
         // Current CalDAV list assignment (empty for local tasks).
-        let uuid = match &self.db {
-            Some(db) => current_caldav_uuid_for(db, task.id),
-            None => String::new(),
+        // Pull the colour alongside so the detail pane's list chip
+        // can paint to match `caldav_lists.cdl_color`.
+        let (uuid, color) = match &self.db {
+            Some(db) => current_caldav_meta_for(db, task.id),
+            None => (String::new(), 0),
         };
         self.as_mut()
             .set_selected_caldav_calendar_uuid(QString::from(&uuid));
+        self.as_mut().set_selected_caldav_calendar_color(color);
 
         // Current tag set.
         let task_tag_uids = match &self.db {
@@ -1176,6 +1189,7 @@ impl qobject::TaskListViewModel {
         self.as_mut().set_due_labels(QStringList::default());
         self.as_mut().set_priorities(QList::default());
         self.as_mut().set_task_tag_summaries(QStringList::default());
+        self.as_mut().set_task_list_names(QStringList::default());
         self.as_mut().set_task_list_colors(QList::default());
         self.as_mut().rust_mut().task_cache.clear();
     }
@@ -1241,11 +1255,11 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     // Single-statement bulk fetches (vs N+1) so a 500-row list
     // costs two extra prepared statements rather than 1000.
     let row_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
-    let (tag_summary_map, list_color_map) = {
+    let (tag_summary_map, list_meta_map) = {
         match &vm.db {
             Some(db) => (
                 fetch_tag_summaries(db, &row_ids),
-                fetch_list_colors(db, &row_ids),
+                fetch_list_meta(db, &row_ids),
             ),
             None => (
                 std::collections::HashMap::new(),
@@ -1254,14 +1268,25 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
         }
     };
     let mut tag_summary_qlist: QList<QString> = QList::default();
+    let mut list_name_qlist: QList<QString> = QList::default();
     let mut list_color_list: QList<i32> = QList::default();
     for t in &tasks {
         tag_summary_qlist.append(QString::from(
             tag_summary_map.get(&t.id).map(String::as_str).unwrap_or(""),
         ));
-        list_color_list.append(*list_color_map.get(&t.id).unwrap_or(&0));
+        match list_meta_map.get(&t.id) {
+            Some((name, color)) => {
+                list_name_qlist.append(QString::from(name.as_str()));
+                list_color_list.append(*color);
+            }
+            None => {
+                list_name_qlist.append(QString::default());
+                list_color_list.append(0);
+            }
+        }
     }
     let tag_summaries = QStringList::from(&tag_summary_qlist);
+    let list_names = QStringList::from(&list_name_qlist);
 
     // Two-phase publish to keep QML delegate bindings out of the
     // stale-array race:
@@ -1287,6 +1312,7 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     vm.as_mut().set_due_labels(due_labels);
     vm.as_mut().set_priorities(priorities);
     vm.as_mut().set_task_tag_summaries(tag_summaries);
+    vm.as_mut().set_task_list_names(list_names);
     vm.as_mut().set_task_list_colors(list_color_list);
     vm.as_mut().set_count(count);
     vm.as_mut()
@@ -1344,10 +1370,13 @@ fn fetch_tag_summaries(db: &Database, task_ids: &[i64]) -> std::collections::Has
     out
 }
 
-/// H-7 helper: bulk-fetch the per-task CalDAV list colour. Tasks
-/// not assigned to a list are absent from the map; the caller
-/// treats absence as 0 (no stripe).
-fn fetch_list_colors(db: &Database, task_ids: &[i64]) -> std::collections::HashMap<i64, i32> {
+/// H-7 helper: bulk-fetch the per-task CalDAV list `(name, color)`.
+/// Tasks not assigned to a list are absent from the map; the caller
+/// treats absence as the empty name + colour 0.
+fn fetch_list_meta(
+    db: &Database,
+    task_ids: &[i64],
+) -> std::collections::HashMap<i64, (String, i32)> {
     if task_ids.is_empty() {
         return std::collections::HashMap::new();
     }
@@ -1357,30 +1386,38 @@ fn fetch_list_colors(db: &Database, task_ids: &[i64]) -> std::collections::HashM
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT caldav_tasks.cd_task, caldav_lists.cdl_color \
+        "SELECT caldav_tasks.cd_task, \
+                COALESCE(caldav_lists.cdl_name, ''), \
+                caldav_lists.cdl_color \
          FROM caldav_tasks \
          INNER JOIN caldav_lists ON caldav_tasks.cd_calendar = caldav_lists.cdl_uuid \
          WHERE caldav_tasks.cd_task IN ({placeholders}) \
          AND caldav_tasks.cd_deleted = 0"
     );
-    let mut out: std::collections::HashMap<i64, i32> = std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<i64, (String, i32)> = std::collections::HashMap::new();
     let conn = db.connection();
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("fetch_list_colors: prepare failed: {e}");
+            tracing::warn!("fetch_list_meta: prepare failed: {e}");
             return out;
         }
     };
-    let rows = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?))) {
+    let rows = match stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i32>(2)?,
+        ))
+    }) {
         Ok(it) => it,
         Err(e) => {
-            tracing::warn!("fetch_list_colors: query_map failed: {e}");
+            tracing::warn!("fetch_list_meta: query_map failed: {e}");
             return out;
         }
     };
     for row in rows.flatten() {
-        out.insert(row.0, row.1);
+        out.insert(row.0, (row.1, row.2));
     }
     out
 }
@@ -1645,18 +1682,28 @@ fn list_caldav_calendars(db: &Database) -> (Vec<String>, Vec<String>) {
     (labels, uuids)
 }
 
-/// Look up the CalDAV calendar UUID assigned to `task_id`. Returns
-/// empty when the task has no `caldav_tasks` row (local-only).
-fn current_caldav_uuid_for(db: &Database, task_id: i64) -> String {
-    db.connection()
+/// Look up the CalDAV calendar `(uuid, colour)` assigned to
+/// `task_id`. Returns `("", 0)` when the task has no
+/// `caldav_tasks` row (local-only) or no matching `caldav_lists`
+/// row. The colour is the stored `cdl_color` ARGB i32.
+fn current_caldav_meta_for(db: &Database, task_id: i64) -> (String, i32) {
+    let row: Option<(Option<String>, Option<i32>)> = db
+        .connection()
         .query_row(
-            "SELECT cd_calendar FROM caldav_tasks WHERE cd_task = ?1 LIMIT 1",
+            "SELECT caldav_tasks.cd_calendar, caldav_lists.cdl_color \
+             FROM caldav_tasks \
+             LEFT JOIN caldav_lists \
+                ON caldav_tasks.cd_calendar = caldav_lists.cdl_uuid \
+             WHERE caldav_tasks.cd_task = ?1 \
+             LIMIT 1",
             [task_id],
-            |r| r.get::<_, Option<String>>(0),
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i32>>(1)?)),
         )
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+        .ok();
+    match row {
+        Some((Some(uuid), color)) => (uuid, color.unwrap_or(0)),
+        _ => (String::new(), 0),
+    }
 }
 
 fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
@@ -1816,6 +1863,7 @@ fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     vm.as_mut().set_selected_recurrence(QString::default());
     vm.as_mut()
         .set_selected_caldav_calendar_uuid(QString::default());
+    vm.as_mut().set_selected_caldav_calendar_color(0);
     vm.as_mut().set_selected_tag_uids(QStringList::default());
     vm.as_mut()
         .set_selected_alarm_labels(QStringList::default());

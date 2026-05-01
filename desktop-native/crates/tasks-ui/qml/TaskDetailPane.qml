@@ -91,50 +91,94 @@ Pane {
         spacing: 12
         visible: root.vm && root.vm.selectedId > 0
 
-        RowLayout {
+        Label {
             Layout.fillWidth: true
-            spacing: 8
-
-            PriorityDot {
-                priority: root.vm ? root.vm.selectedPriority : 3
-            }
-            Label {
-                Layout.fillWidth: true
-                text: root.vm ? root.vm.selectedTitle : ""
-                font.pointSize: Qt.application.font.pointSize + 4
-                font.bold: true
-                wrapMode: Text.WordWrap
-                font.strikeout: root.vm && root.vm.selectedCompleted
-            }
+            text: root.vm ? root.vm.selectedTitle : ""
+            font.pointSize: Qt.application.font.pointSize + 4
+            font.bold: true
+            wrapMode: Text.WordWrap
+            font.strikeout: root.vm && root.vm.selectedCompleted
         }
 
-        // Metadata strip: list, parent, location, reminder count.
-        // Each chip-like Label only renders if there's a value, so an
-        // unannotated task collapses cleanly to nothing.
+        // Metadata strip: priority, list, parent, location, reminder
+        // count. Each chip-like Label only renders if there's a value
+        // worth showing, so an unannotated task collapses cleanly to
+        // nothing.
         Flow {
             Layout.fillWidth: true
             spacing: 8
 
-            // CalDAV list pill.
+            // Priority pill, coloured to match the priority. Hidden
+            // when there's no priority (NONE = 3) so the pill clutter
+            // tracks the task's actual data.
             Label {
-                visible: root._selectedListName().length > 0
-                text: qsTr("📋 %1").arg(root._selectedListName())
-                opacity: 0.75
+                visible: root.vm && root.vm.selectedPriority < 3
+                text: {
+                    if (!root.vm) { return ""; }
+                    switch (root.vm.selectedPriority) {
+                        case 0: return qsTr("High");
+                        case 1: return qsTr("Medium");
+                        case 2: return qsTr("Low");
+                        default: return "";
+                    }
+                }
+                opacity: 0.95
+                color: "white"
                 font.pointSize: Qt.application.font.pointSize - 1
-                leftPadding: 6
-                rightPadding: 6
+                font.bold: true
+                leftPadding: 8
+                rightPadding: 8
                 topPadding: 2
                 bottomPadding: 2
                 background: Rectangle {
-                    color: Material.foreground
-                    opacity: 0.08
                     radius: 4
+                    color: {
+                        if (!root.vm) { return "#9e9e9e"; }
+                        switch (root.vm.selectedPriority) {
+                            case 0: return "#d32f2f";  // red
+                            case 1: return "#f57c00";  // orange
+                            case 2: return "#1976d2";  // blue
+                            default: return "#9e9e9e"; // grey
+                        }
+                    }
                 }
             }
-            // Parent task pill.
+
+            // CalDAV list pill — coloured background matching the
+            // list's `cdl_color`. White bold text on top so the
+            // chip reads as the list's identity at a glance. No
+            // leading icon glyph (Windows lacked a font fallback
+            // for the previous 📋 codepoint).
+            Label {
+                visible: root._selectedListName().length > 0
+                text: root._selectedListName()
+                color: "white"
+                font.pointSize: Qt.application.font.pointSize - 1
+                font.bold: true
+                leftPadding: 8
+                rightPadding: 8
+                topPadding: 2
+                bottomPadding: 2
+                background: Rectangle {
+                    radius: 4
+                    color: {
+                        if (!root.vm) { return "#9e9e9e"; }
+                        const c = root.vm.selectedCaldavCalendarColor | 0;
+                        const a = ((c >>> 24) & 0xff) / 255.0;
+                        if (a === 0) { return "#9e9e9e"; }
+                        const r = ((c >>> 16) & 0xff) / 255.0;
+                        const g = ((c >>>  8) & 0xff) / 255.0;
+                        const b = ( c         & 0xff) / 255.0;
+                        return Qt.rgba(r, g, b, 1.0);
+                    }
+                }
+            }
+            // Parent task pill — neutral chip prefixed with a plain
+            // ASCII arrow rather than a Unicode arrow that some
+            // fonts on Windows fall back to a tofu glyph for.
             Label {
                 visible: root._selectedParentTitle().length > 0
-                text: qsTr("↳ %1").arg(root._selectedParentTitle())
+                text: qsTr("Parent: %1").arg(root._selectedParentTitle())
                 opacity: 0.75
                 font.pointSize: Qt.application.font.pointSize - 1
                 leftPadding: 6
@@ -159,7 +203,7 @@ Pane {
                     } else if (root.vm && root.vm.selectedPlaceDeparture) {
                         trig = qsTr(" (departure)");
                     }
-                    return qsTr("📍 %1%2").arg(root._selectedPlaceName()).arg(trig);
+                    return qsTr("Place: %1%2").arg(root._selectedPlaceName()).arg(trig);
                 }
                 opacity: 0.75
                 font.pointSize: Qt.application.font.pointSize - 1
@@ -179,7 +223,8 @@ Pane {
             Label {
                 id: reminderPill
                 visible: root.vm && root.vm.selectedAlarmLabels.length > 0
-                text: qsTr("⏰ %1").arg(root.vm ? root.vm.selectedAlarmLabels.length : 0)
+                text: qsTr("Reminders: %1")
+                          .arg(root.vm ? root.vm.selectedAlarmLabels.length : 0)
                 opacity: 0.75
                 font.pointSize: Qt.application.font.pointSize - 1
                 leftPadding: 6
@@ -322,8 +367,11 @@ Pane {
         }
     }
 
-    // The edit dialog is a top-level ApplicationWindow now, so it
-    // manages its own position + size. No anchor to the pane.
+    // Slide-out edit pane. Anchored to fill the detail pane;
+    // animates `x` from `parent.width` (off-screen right) to 0
+    // when `editDialog.open()` is called from the Edit button.
+    // It sits on top of the rest of the pane via a higher `z`,
+    // so the underlying chrome is hidden while editing.
     TaskEditDialog {
         id: editDialog
         vm: root.vm
