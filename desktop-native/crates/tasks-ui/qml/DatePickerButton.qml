@@ -16,10 +16,13 @@ import QtQuick.Layouts
 Item {
     id: root
 
-    // The TextField this picker writes into. Must expose `.text`
-    // in the `YYYY-MM-DD [HH:MM]` format the Rust `parse_due_input`
-    // accepts; empty string means "no date set".
-    required property TextField target
+    // The text field this picker writes into. Anything exposing a
+    // `text` property in `YYYY-MM-DD [HH:MM]` form works — the
+    // QML type is intentionally `Item`, not `TextField`, because
+    // CompactTextField.qml is a custom subclass of TextField and
+    // QML's strict-type assignment refuses derived-type values
+    // for an explicit `TextField` property declaration.
+    required property Item target
 
     implicitWidth: button.implicitWidth
     implicitHeight: button.implicitHeight
@@ -46,9 +49,10 @@ Item {
     }
 
     function _writeDate(date) {
+        if (!target) { return; }
         // Preserve any " HH:MM" suffix the user already typed so
         // picking a date doesn't clobber the time part.
-        const existing = (target && target.text) ? target.text.trim() : "";
+        const existing = target.text ? target.text.trim() : "";
         const timeMatch = existing.match(/\s+(\d{1,2}:\d{2})\s*$/);
         const datePart = date.getFullYear() + "-"
             + root._pad(date.getMonth() + 1) + "-"
