@@ -21,17 +21,12 @@ cxx-qt-lib = { workspace = true }
 # stringify / log the raw bytes, and the value zeroes on drop.
 secrecy = { workspace = true }
 
-# Windows-only: DwmSetWindowAttribute for forcing the immersive
-# dark title bar regardless of whether `QT_QPA_PLATFORM=windows:
-# darkmode=2` propagated correctly. Qt 6.6's QQuickWindow doesn't
-# always pick the env var up on launch, so we apply it ourselves.
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Dwm",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Threading",
-] }
+# The Win32 dark-title-bar shim is implemented with bare
+# `extern "system"` declarations in `src/win_dark_titlebar.rs` —
+# no `windows-sys` dep needed. The four functions + four
+# constants we use are stable Win32 surface and the signatures
+# don't drift, which avoids the breaking-change churn between
+# windows-sys 0.59 / 0.60 / 0.61 we'd otherwise have to track.
 
 [build-dependencies]
 cxx-qt-build = { workspace = true }
