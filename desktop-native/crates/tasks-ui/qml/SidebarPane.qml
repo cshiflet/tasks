@@ -99,11 +99,19 @@ Pane {
                 // low opacity for the tint so it adapts to both
                 // light and dark themes.
                 ItemDelegate {
+                    id: header
                     visible: row._isSectionStart
                     width: row.width
-                    height: visible ? implicitHeight : 0
-                    topPadding: 3
-                    bottomPadding: 3
+                    // Override Material's 48 px touch-target floor —
+                    // Material.touchTarget pads ItemDelegate to 48 px
+                    // regardless of topPadding, so a header strip at
+                    // "3 + 3 padding" still rendered ~48 px tall.
+                    // Setting implicitHeight directly drives the row
+                    // size and the contentItem fits inside it.
+                    implicitHeight: visible ? 22 : 0
+                    height: implicitHeight
+                    topPadding: 0
+                    bottomPadding: 0
                     leftPadding: 8
                     rightPadding: 8
                     onClicked: root._toggleGroup(row.myGroup)
@@ -116,21 +124,38 @@ Pane {
                     contentItem: RowLayout {
                         spacing: 6
 
-                        Label {
-                            // Right-pointing triangle when collapsed,
-                            // down-pointing when expanded. Pure unicode
-                            // so it inherits the theme foreground.
-                            // U+25B6 / U+25BC — black right- /
-                            // down-pointing triangles. Encoded as
-                            // \u escapes so the file-encoding pipeline
-                            // can't mangle them on Windows (the literal
-                            // small-triangle glyphs we tried first
-                            // rendered as "â¾"-style mojibake through
-                            // whichever font fallback Qt picked).
-                            text: row._groupCollapsed ? "\u25B6" : "\u25BC"
-                            font.pointSize: Qt.application.font.pointSize - 1
-                            opacity: 0.7
-                            Layout.preferredWidth: 14
+                        // Painted chevron — no Unicode triangle in
+                        // sight. The literal triangle glyphs (and the
+                        // ▶ / ▼ escape variants) both showed
+                        // as "â¾"-style mojibake on the user's Windows
+                        // build, presumably because Qt's font-fallback
+                        // picked a typeface without the BMP geometric-
+                        // shapes block. Drawing two line segments via
+                        // Canvas dodges every font-coverage and file-
+                        // encoding question, and a 90° rotation
+                        // animates the expand/collapse transition.
+                        Canvas {
+                            id: chevron
+                            Layout.preferredWidth: 12
+                            Layout.preferredHeight: 12
+                            rotation: row._groupCollapsed ? -90 : 0
+                            opacity: 0.75
+                            Behavior on rotation {
+                                NumberAnimation { duration: 120 }
+                            }
+                            onPaint: {
+                                const ctx = getContext("2d");
+                                ctx.reset();
+                                ctx.lineWidth = 1.6;
+                                ctx.lineCap = "round";
+                                ctx.lineJoin = "round";
+                                ctx.strokeStyle = header.Material.foreground;
+                                ctx.beginPath();
+                                ctx.moveTo(2, 4);
+                                ctx.lineTo(width / 2, height - 4);
+                                ctx.lineTo(width - 2, 4);
+                                ctx.stroke();
+                            }
                         }
                         Label {
                             Layout.fillWidth: true
@@ -146,13 +171,13 @@ Pane {
                 ItemDelegate {
                     width: row.width
                     visible: !row._groupCollapsed
-                    height: visible ? implicitHeight : 0
-                    // Trim Material's default ~12 / 12 vertical padding
-                    // so each row is ~28 px instead of ~48 px — the
-                    // sidebar holds enough entries that the original
-                    // density wastes a lot of vertical real estate.
-                    topPadding: 4
-                    bottomPadding: 4
+                    // Same reasoning as the header — Material would
+                    // otherwise pin every row at the 48 px touch
+                    // target regardless of topPadding.
+                    implicitHeight: visible ? 28 : 0
+                    height: implicitHeight
+                    topPadding: 0
+                    bottomPadding: 0
                     text: root.vm ? root.vm.sidebarLabels[row.index] : ""
                     highlighted: root.vm
                         && root.vm.activeFilterId === root.vm.sidebarIds[row.index]
