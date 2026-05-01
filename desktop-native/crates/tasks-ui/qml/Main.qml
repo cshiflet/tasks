@@ -106,6 +106,11 @@ ApplicationWindow {
     // buttons + the standalone `Shortcut`s, so the same handler
     // fires whether the user clicks the button, picks the menu item,
     // or taps the shortcut.
+    //
+    // `MenuItem` itself has no `shortcut` property in Qt 6.6's
+    // QtQuick.Controls — the shortcut is owned by the bound
+    // `Action`, which the MenuItem renders as a label. So Quit gets
+    // its own Action below alongside the others.
     menuBar: MenuBar {
         Menu {
             title: qsTr("&File")
@@ -114,11 +119,7 @@ ApplicationWindow {
             MenuSeparator {}
             MenuItem { action: importBackupAction }
             MenuSeparator {}
-            MenuItem {
-                text: qsTr("Quit")
-                shortcut: StandardKey.Quit
-                onTriggered: Qt.quit()
-            }
+            MenuItem { action: quitAction }
         }
         Menu {
             title: qsTr("&Edit")
@@ -133,10 +134,7 @@ ApplicationWindow {
         }
         Menu {
             title: qsTr("&Help")
-            MenuItem {
-                text: qsTr("About Tasks Desktop")
-                onTriggered: aboutDialog.open()
-            }
+            MenuItem { action: aboutAction }
         }
     }
 
@@ -195,6 +193,17 @@ ApplicationWindow {
         text: qsTr("Focus sidebar")
         shortcut: "Ctrl+F"
         onTriggered: sidebar.focusList()
+    }
+    Action {
+        id: quitAction
+        text: qsTr("Quit")
+        shortcut: StandardKey.Quit
+        onTriggered: Qt.quit()
+    }
+    Action {
+        id: aboutAction
+        text: qsTr("About Tasks Desktop")
+        onTriggered: aboutDialog.open()
     }
 
     // ---------- H-5: transient toast surface ----------
