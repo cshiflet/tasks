@@ -91,53 +91,43 @@ ApplicationWindow {
     // height below.
     property bool menuVisible: false
 
-    // Shared compact MenuItem template — Material's default
-    // MenuItem wraps each row in ~14px top + bottom padding,
-    // making short menus feel oversized. Trim to 4 + 4 so each
-    // dropdown is ~28px tall per row.
-    Component {
-        id: compactMenuItem
-        MenuItem {
-            topPadding: 4
-            bottomPadding: 4
-        }
-    }
-
     menuBar: MenuBar {
         id: menuBar
         visible: root.menuVisible
         height: visible ? implicitHeight : 0
         delegate: MenuBarItem {
             // Fold the top + bottom padding so the strip fits in
-            // ~28 px instead of ~44 px.
+            // ~28 px instead of ~44 px. Material picks up topPadding
+            // / bottomPadding for both the touch target and the
+            // implicit height, so this drives the row height too.
             topPadding: 4
             bottomPadding: 4
         }
 
+        // Each Menu's `delegate` property only wraps rows added via
+        // the actionsModel / addAction APIs — explicit MenuItem
+        // children bypass it. Use CompactMenuItem.qml instances
+        // directly so the padding override actually lands.
         Menu {
             title: qsTr("&File")
-            delegate: compactMenuItem
-            MenuItem { action: importBackupAction }
+            CompactMenuItem { action: importBackupAction }
             MenuSeparator {}
-            MenuItem { action: quitAction }
+            CompactMenuItem { action: quitAction }
         }
         Menu {
             title: qsTr("&Edit")
-            delegate: compactMenuItem
-            MenuItem { action: newTaskAction }
-            MenuItem { action: editSelectedAction }
-            MenuItem { action: deleteSelectedAction }
+            CompactMenuItem { action: newTaskAction }
+            CompactMenuItem { action: editSelectedAction }
+            CompactMenuItem { action: deleteSelectedAction }
         }
         Menu {
             title: qsTr("&View")
-            delegate: compactMenuItem
-            MenuItem { action: focusFilterAction }
-            MenuItem { action: openSettingsAction }
+            CompactMenuItem { action: focusFilterAction }
+            CompactMenuItem { action: openSettingsAction }
         }
         Menu {
             title: qsTr("&Help")
-            delegate: compactMenuItem
-            MenuItem { action: aboutAction }
+            CompactMenuItem { action: aboutAction }
         }
     }
 
