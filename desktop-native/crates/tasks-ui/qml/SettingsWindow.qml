@@ -49,19 +49,30 @@ ApplicationWindow {
         TabButton { text: qsTr("Accounts") }
     }
 
-    StackLayout {
+    // Pane wrapper anchors the Material attached context so the
+    // tab body has a themed background; without it the StackLayout
+    // sits on whatever Qt happens to default to (white on Windows
+    // with Mica disabled, black with Mica enabled), which doesn't
+    // always match the window-level theme that the panes expect.
+    Pane {
         anchors.fill: parent
-        anchors.margins: 16
-        currentIndex: tabs.currentIndex
+        Material.theme: Material.System
+        Material.accent: Material.Blue
+        padding: 16
 
-        ListSettingsPane {
-            id: listPane
-            vm: settingsWindow.vm
-        }
+        StackLayout {
+            anchors.fill: parent
+            currentIndex: tabs.currentIndex
 
-        AccountsPane {
-            id: accountsPane
-            vm: settingsWindow.vm
+            ListSettingsPane {
+                id: listPane
+                vm: settingsWindow.vm
+            }
+
+            AccountsPane {
+                id: accountsPane
+                vm: settingsWindow.vm
+            }
         }
     }
 

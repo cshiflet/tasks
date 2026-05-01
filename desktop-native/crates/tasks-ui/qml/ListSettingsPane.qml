@@ -10,11 +10,19 @@
 // follow-up (see PLAN_UPDATES §8).
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Material
 import QtQuick.Layouts
 
 ColumnLayout {
     id: pane
     spacing: 16
+    // Pin the Material context so child Labels (which default to
+    // `Material.foreground` for their colour) resolve against the
+    // window's actual colour scheme. Without this anchor a
+    // ColumnLayout's children sometimes fall back to a hard-coded
+    // light-theme black on a dark-themed Settings window.
+    Material.theme: Material.System
+    Material.accent: Material.Blue
 
     required property QtObject vm
 

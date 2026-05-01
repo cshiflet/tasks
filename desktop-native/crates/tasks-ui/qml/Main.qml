@@ -80,18 +80,28 @@ ApplicationWindow {
 
     // ---------- M-13: menu bar ----------
     //
-    // Native top menu bar (promoted to the macOS global menu bar
-    // automatically). On Linux/Windows it renders inline above the
-    // toolbar. The Action objects are reused below by the toolbar
-    // buttons + the standalone `Shortcut`s, so the same handler
-    // fires whether the user clicks the button, picks the menu item,
-    // or taps the shortcut.
+    // Hidden by default; toggled via the hamburger button in the
+    // command bar (`menuVisible`). When promoted to the macOS
+    // global menu bar Qt always shows it regardless of the
+    // visibility flag, which is the right behaviour there.
     //
-    // `MenuItem` itself has no `shortcut` property in Qt 6.6's
-    // QtQuick.Controls — the shortcut is owned by the bound
-    // `Action`, which the MenuItem renders as a label. So Quit gets
-    // its own Action below alongside the others.
+    // The default Material `MenuBarItem` has tall vertical
+    // padding (~14 px top + bottom). Override it on the delegate
+    // so the menu strip is denser — matches the command bar
+    // height below.
+    property bool menuVisible: false
+
     menuBar: MenuBar {
+        id: menuBar
+        visible: root.menuVisible
+        height: visible ? implicitHeight : 0
+        delegate: MenuBarItem {
+            // Fold the top + bottom padding so the strip fits in
+            // ~28 px instead of ~44 px.
+            topPadding: 4
+            bottomPadding: 4
+        }
+
         Menu {
             title: qsTr("&File")
             MenuItem { action: importBackupAction }
@@ -283,24 +293,60 @@ ApplicationWindow {
     // session. Search is the prominent left-side affordance;
     // Import + Settings are right-aligned icon-only buttons with
     // tooltips. Rare File / Edit / View actions live in the menu
-    // bar above and behind their keyboard shortcuts.
+    // bar (toggled via the hamburger button on the left) or
+    // behind their keyboard shortcuts.
     header: ToolBar {
         implicitHeight: 44
+        // Material's ToolBar paints a saturated accent-colour
+        // background by default — too loud against the rest of
+        // the dark chrome. Strip it so the bar inherits the
+        // window's themed background; a thin separator below
+        // prevents the toolbar from blending into the SplitView.
+        Material.background: "transparent"
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            height: 1
+            color: Material.foreground
+            opacity: 0.10
+        }
+
         RowLayout {
             anchors.fill: parent
-            anchors.leftMargin: 12
-            anchors.rightMargin: 8
+            anchors.leftMargin: 6
+            anchors.rightMargin: 6
             spacing: 6
+
+            // Hamburger toggle: hides / reveals the menu bar above.
+            // Standard Win11 sites the menu trigger as the first
+            // command-bar item; the menu starts hidden.
+            ToolButton {
+                Layout.preferredWidth: 36
+                Layout.preferredHeight: 36
+                text: "\u{2630}"                 // ☰ trigram
+                font.pointSize: Qt.application.font.pointSize + 4
+                ToolTip.visible: hovered
+                ToolTip.text: root.menuVisible
+                              ? qsTr("Hide menu")
+                              : qsTr("Show menu")
+                onClicked: root.menuVisible = !root.menuVisible
+            }
 
             // Search field. Magnifier glyph rendered as an inline
             // prefix via leftPadding + an anchored Label so we
             // don't need an icon font. Esc clears the field, which
             // restores the active sidebar filter via the bridge's
-            // empty-query branch.
+            // empty-query branch. Height is pinned a few pixels
+            // shorter than the bar so the rounded edges sit inside
+            // the chrome — the default TextField wants to be 40 px
+            // tall and would clip the bar otherwise.
             TextField {
                 id: searchField
                 Layout.fillWidth: true
                 Layout.maximumWidth: 480
+                Layout.preferredHeight: 32
                 leftPadding: 32
                 placeholderText: qsTr("Search tasks…")
                 onTextChanged: viewModel.setSearchQuery(text)
@@ -316,9 +362,15 @@ ApplicationWindow {
 
             Item { Layout.fillWidth: true }   // flexible spacer
 
+            // ToolButtons render the glyph through the `text`
+            // property when `display` is at its default
+            // `TextOnly` — the previous version used
+            // `display: IconOnly` which strips text rendering, so
+            // the buttons rendered as transparent click targets.
             ToolButton {
                 action: importBackupAction
-                display: AbstractButton.IconOnly
+                Layout.preferredWidth: 36
+                Layout.preferredHeight: 36
                 text: "\u{1F4E5}"             // 📥 inbox tray
                 font.pointSize: Qt.application.font.pointSize + 2
                 ToolTip.visible: hovered
@@ -326,7 +378,8 @@ ApplicationWindow {
             }
             ToolButton {
                 action: openSettingsAction
-                display: AbstractButton.IconOnly
+                Layout.preferredWidth: 36
+                Layout.preferredHeight: 36
                 text: "\u{2699}"              // ⚙ gear
                 font.pointSize: Qt.application.font.pointSize + 4
                 ToolTip.visible: hovered
@@ -347,13 +400,26 @@ ApplicationWindow {
     footer: ToolBar {
         // Pin the status bar height so a long error string can't
         // grow the bar and shove the SplitView upward.
-        implicitHeight: 28
+        implicitHeight: 24
+        // Same color treatment as the header — no Material accent.
+        Material.background: "transparent"
+
+        Rectangle {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            height: 1
+            color: Material.foreground
+            opacity: 0.10
+        }
         Label {
             anchors.fill: parent
             anchors.leftMargin: 8
             verticalAlignment: Text.AlignVCenter
             text: viewModel.status
             elide: Text.ElideRight
+            font.pointSize: Qt.application.font.pointSize - 1
+            opacity: 0.7
         }
     }
 

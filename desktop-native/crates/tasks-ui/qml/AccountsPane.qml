@@ -21,6 +21,10 @@ import QtQuick.Layouts
 ColumnLayout {
     id: pane
     spacing: 12
+    // Pin the Material context so child Labels resolve against the
+    // window's actual colour scheme. See ListSettingsPane.qml.
+    Material.theme: Material.System
+    Material.accent: Material.Blue
 
     required property QtObject vm
 
