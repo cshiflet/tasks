@@ -19,6 +19,9 @@ use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
 
 mod bridge;
 
+#[cfg(target_os = "windows")]
+mod win_dark_titlebar;
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -43,22 +46,14 @@ fn main() -> ExitCode {
         env::set_var("QT_QUICK_CONTROLS_STYLE", "Material");
     }
 
-    // On Windows 11, tell Qt's `windows` QPA plugin to request the
-    // OS "immersive dark mode" on every native title bar when the
-    // system is set to a dark accent colour. Without this, Qt
-    // leaves the title bars white regardless of system theme, and
-    // `QGuiApplication::styleHints()->colorScheme()` stays
-    // `Unknown` — which in turn breaks `Material.theme:
-    // Material.System` propagation into child windows (fixes both
-    // UI#1 "ugly unthemed title bars" and UI#2 "main light, edit
-    // dark" reports on Windows 11).
-    //
-    // Env-var form is the least-invasive plumbing: no QPA plugin
-    // selection, no platform-specific FFI. `darkmode=2` means
-    // both Qt-styled Windows chrome AND native immersive dark
-    // title bars (vs `=1` which only styles the app chrome).
-    // Accept a caller override so power users can force a specific
-    // value for debugging.
+    // Belt-and-braces dark-title-bar handling on Windows. The env
+    // var below tells Qt's `windows` QPA plugin to request immersive
+    // dark mode; experience on Qt 6.6.3 shows that QQuickWindow
+    // sometimes ignores it depending on init ordering, so the
+    // `win_dark_titlebar` module also forcibly applies
+    // DWMWA_USE_IMMERSIVE_DARK_MODE to every top-level window of
+    // our process via Win32 FFI. Either path on its own is enough
+    // when it works; both together cover the cases when one fails.
     #[cfg(target_os = "windows")]
     if env::var_os("QT_QPA_PLATFORM").is_none() {
         env::set_var("QT_QPA_PLATFORM", "windows:darkmode=2");
@@ -70,6 +65,14 @@ fn main() -> ExitCode {
     if let Some(engine) = engine.as_mut() {
         engine.load(&QUrl::from("qrc:/qt/qml/com/tasks/desktop/qml/Main.qml"));
     }
+
+    // Start the Win32 dark-title-bar polling thread *after* the
+    // engine has been told to load the main QML — at this point
+    // the first window is in the process of being constructed.
+    // The thread re-applies the attribute every ~500 ms so any
+    // window opened later (Settings, edit dialog) also picks it up.
+    #[cfg(target_os = "windows")]
+    win_dark_titlebar::start();
 
     match app.as_mut().map(|app| app.exec()) {
         Some(code) => ExitCode::from(code as u8),

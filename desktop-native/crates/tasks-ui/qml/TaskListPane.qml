@@ -5,11 +5,15 @@
 // struck-through. Tapping a row selects it for the detail pane.
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Material
 import QtQuick.Layouts
 
 Pane {
     id: root
     padding: 0
+    // Belt-and-braces theme propagation; see TaskDetailPane.qml.
+    Material.theme: Material.System
+    Material.accent: Material.Blue
     required property QtObject vm
 
     // Wired to Main.qml's `New task` shortcut (Ctrl+N) — focuses

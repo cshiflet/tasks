@@ -11,6 +11,14 @@ import com.tasks.desktop
 Pane {
     id: root
     padding: 16
+    // Belt-and-braces: each pane explicitly follows the OS theme.
+    // The ApplicationWindow at the root sets the same value, but
+    // Pane's own background-resolver sometimes falls back to its
+    // (light) default if the attached-property chain is broken by
+    // an intervening QObject — pin it here so this pane reliably
+    // matches the rest of the window.
+    Material.theme: Material.System
+    Material.accent: Material.Blue
     required property QtObject vm
 
     // Wired to Main.qml's `Edit selected task…` action (F2).

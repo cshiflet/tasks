@@ -18,6 +18,9 @@ import QtQuick.Layouts
 Pane {
     id: root
     padding: 0
+    // Belt-and-braces theme propagation; see TaskDetailPane.qml.
+    Material.theme: Material.System
+    Material.accent: Material.Blue
     required property QtObject vm
 
     // Wired to Main.qml's `Focus sidebar` action (Ctrl+F). Brings
