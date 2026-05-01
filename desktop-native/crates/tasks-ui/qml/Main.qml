@@ -91,6 +91,18 @@ ApplicationWindow {
     // height below.
     property bool menuVisible: false
 
+    // Shared compact MenuItem template — Material's default
+    // MenuItem wraps each row in ~14px top + bottom padding,
+    // making short menus feel oversized. Trim to 4 + 4 so each
+    // dropdown is ~28px tall per row.
+    Component {
+        id: compactMenuItem
+        MenuItem {
+            topPadding: 4
+            bottomPadding: 4
+        }
+    }
+
     menuBar: MenuBar {
         id: menuBar
         visible: root.menuVisible
@@ -104,23 +116,27 @@ ApplicationWindow {
 
         Menu {
             title: qsTr("&File")
+            delegate: compactMenuItem
             MenuItem { action: importBackupAction }
             MenuSeparator {}
             MenuItem { action: quitAction }
         }
         Menu {
             title: qsTr("&Edit")
+            delegate: compactMenuItem
             MenuItem { action: newTaskAction }
             MenuItem { action: editSelectedAction }
             MenuItem { action: deleteSelectedAction }
         }
         Menu {
             title: qsTr("&View")
+            delegate: compactMenuItem
             MenuItem { action: focusFilterAction }
             MenuItem { action: openSettingsAction }
         }
         Menu {
             title: qsTr("&Help")
+            delegate: compactMenuItem
             MenuItem { action: aboutAction }
         }
     }

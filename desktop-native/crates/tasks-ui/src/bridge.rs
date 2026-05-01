@@ -58,6 +58,12 @@ pub mod qobject {
         // colour of the row's CalDAV list, both empty / 0 when
         // the task is local-only.
         #[qproperty(QStringList, task_tag_summaries)]
+        // Per-task comma-joined tag UIDs, parallel to `task_ids`.
+        // The list view splits on `,` and looks each UID up in the
+        // global `tag_uids` / `tag_labels` / `tag_colors` arrays to
+        // render coloured chips under each row's title. Empty when
+        // the task has no tags.
+        #[qproperty(QStringList, task_tag_uid_lists)]
         #[qproperty(QStringList, task_list_names)]
         #[qproperty(QList_i32, task_list_colors)]
         // Detail-pane data for the currently-selected task.
@@ -96,6 +102,11 @@ pub mod qobject {
         // `tag_labels` is the human-readable name.
         #[qproperty(QStringList, tag_labels)]
         #[qproperty(QStringList, tag_uids)]
+        // i32 ARGB colour per tag, parallel to `tag_uids`. Drives
+        // the coloured chip backgrounds in the detail pane's tag
+        // strip; 0 means "no colour", which the QML side falls back
+        // to a neutral grey for.
+        #[qproperty(QList_i32, tag_colors)]
         // Tag UIDs currently attached to the selected task. Used
         // to pre-check the dialog's checkboxes on open.
         #[qproperty(QStringList, selected_tag_uids)]
@@ -364,6 +375,7 @@ pub struct TaskListViewModelRust {
     due_labels: QStringList,
     priorities: QList<i32>,
     task_tag_summaries: QStringList,
+    task_tag_uid_lists: QStringList,
     task_list_names: QStringList,
     task_list_colors: QList<i32>,
     // Detail state.
@@ -381,6 +393,7 @@ pub struct TaskListViewModelRust {
     selected_caldav_calendar_color: i32,
     tag_labels: QStringList,
     tag_uids: QStringList,
+    tag_colors: QList<i32>,
     selected_tag_uids: QStringList,
     selected_alarm_labels: QStringList,
     selected_alarm_times: QList<i64>,
@@ -455,6 +468,7 @@ impl Default for TaskListViewModelRust {
             due_labels: QStringList::default(),
             priorities: QList::default(),
             task_tag_summaries: QStringList::default(),
+            task_tag_uid_lists: QStringList::default(),
             task_list_names: QStringList::default(),
             task_list_colors: QList::default(),
             selected_id: 0,
@@ -471,6 +485,7 @@ impl Default for TaskListViewModelRust {
             selected_caldav_calendar_color: 0,
             tag_labels: QStringList::default(),
             tag_uids: QStringList::default(),
+            tag_colors: QList::default(),
             selected_tag_uids: QStringList::default(),
             selected_alarm_labels: QStringList::default(),
             selected_alarm_times: QList::default(),
@@ -1189,6 +1204,7 @@ impl qobject::TaskListViewModel {
         self.as_mut().set_due_labels(QStringList::default());
         self.as_mut().set_priorities(QList::default());
         self.as_mut().set_task_tag_summaries(QStringList::default());
+        self.as_mut().set_task_tag_uid_lists(QStringList::default());
         self.as_mut().set_task_list_names(QStringList::default());
         self.as_mut().set_task_list_colors(QList::default());
         self.as_mut().rust_mut().task_cache.clear();
@@ -1268,12 +1284,20 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
         }
     };
     let mut tag_summary_qlist: QList<QString> = QList::default();
+    let mut tag_uid_qlist: QList<QString> = QList::default();
     let mut list_name_qlist: QList<QString> = QList::default();
     let mut list_color_list: QList<i32> = QList::default();
     for t in &tasks {
-        tag_summary_qlist.append(QString::from(
-            tag_summary_map.get(&t.id).map(String::as_str).unwrap_or(""),
-        ));
+        match tag_summary_map.get(&t.id) {
+            Some((names, uids)) => {
+                tag_summary_qlist.append(QString::from(names.as_str()));
+                tag_uid_qlist.append(QString::from(uids.as_str()));
+            }
+            None => {
+                tag_summary_qlist.append(QString::default());
+                tag_uid_qlist.append(QString::default());
+            }
+        }
         match list_meta_map.get(&t.id) {
             Some((name, color)) => {
                 list_name_qlist.append(QString::from(name.as_str()));
@@ -1286,6 +1310,7 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
         }
     }
     let tag_summaries = QStringList::from(&tag_summary_qlist);
+    let tag_uid_lists = QStringList::from(&tag_uid_qlist);
     let list_names = QStringList::from(&list_name_qlist);
 
     // Two-phase publish to keep QML delegate bindings out of the
@@ -1312,6 +1337,7 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     vm.as_mut().set_due_labels(due_labels);
     vm.as_mut().set_priorities(priorities);
     vm.as_mut().set_task_tag_summaries(tag_summaries);
+    vm.as_mut().set_task_tag_uid_lists(tag_uid_lists);
     vm.as_mut().set_task_list_names(list_names);
     vm.as_mut().set_task_list_colors(list_color_list);
     vm.as_mut().set_count(count);
@@ -1320,12 +1346,18 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     vm.as_mut().rust_mut().task_cache = tasks;
 }
 
-/// H-7 helper: bulk-fetch the comma-joined tag-name summary for a
-/// list of task ids. Single SQL statement; missing tagdata rows
-/// fall back to the tag_uid so the UI never shows blanks. Returns
-/// a map from task_id to summary; tasks with no tags are absent
-/// from the map (the caller treats absence as the empty string).
-fn fetch_tag_summaries(db: &Database, task_ids: &[i64]) -> std::collections::HashMap<i64, String> {
+/// H-7 helper: bulk-fetch the per-task tag info — both the
+/// comma-joined display-name summary (used as a tooltip / fallback
+/// label) and a comma-joined UID list (used by the list view to look
+/// up per-tag colours via the global `tag_uids` / `tag_colors`
+/// arrays). Missing tagdata rows fall back to the raw tag_uid for
+/// the name so the UI never shows blanks. Tasks with no tags are
+/// absent from the map; the caller treats absence as the empty
+/// string for both fields.
+fn fetch_tag_summaries(
+    db: &Database,
+    task_ids: &[i64],
+) -> std::collections::HashMap<i64, (String, String)> {
     if task_ids.is_empty() {
         return std::collections::HashMap::new();
     }
@@ -1337,12 +1369,13 @@ fn fetch_tag_summaries(db: &Database, task_ids: &[i64]) -> std::collections::Has
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT tags.task, COALESCE(tagdata.name, tags.tag_uid) \
+        "SELECT tags.task, COALESCE(tagdata.name, tags.tag_uid), tags.tag_uid \
          FROM tags LEFT JOIN tagdata ON tags.tag_uid = tagdata.remoteId \
          WHERE tags.task IN ({placeholders}) \
          ORDER BY tags.task, tagdata.name"
     );
-    let mut out: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<i64, (String, String)> =
+        std::collections::HashMap::new();
     let conn = db.connection();
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -1351,20 +1384,29 @@ fn fetch_tag_summaries(db: &Database, task_ids: &[i64]) -> std::collections::Has
             return out;
         }
     };
-    let rows = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+    let rows = match stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    }) {
         Ok(it) => it,
         Err(e) => {
             tracing::warn!("fetch_tag_summaries: query_map failed: {e}");
             return out;
         }
     };
-    for row in rows.flatten() {
-        let entry = out.entry(row.0).or_default();
-        if entry.is_empty() {
-            *entry = row.1;
+    for (task_id, name, uid) in rows.flatten() {
+        let entry = out.entry(task_id).or_default();
+        if entry.0.is_empty() {
+            entry.0 = name;
+            entry.1 = uid;
         } else {
-            entry.push_str(", ");
-            entry.push_str(&row.1);
+            entry.0.push_str(", ");
+            entry.0.push_str(&name);
+            entry.1.push(',');
+            entry.1.push_str(&uid);
         }
     }
     out
@@ -1469,12 +1511,19 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             vm.as_mut().set_caldav_calendar_uuids(string_list_from_iter(
                 cal_uuids.iter().map(String::as_str),
             ));
-            let (tag_names, tag_uid_list) = list_all_tags(&db);
+            let (tag_names, tag_uid_list, tag_color_list) = list_all_tags(&db);
             vm.as_mut()
                 .set_tag_labels(string_list_from_iter(tag_names.iter().map(String::as_str)));
             vm.as_mut().set_tag_uids(string_list_from_iter(
                 tag_uid_list.iter().map(String::as_str),
             ));
+            {
+                let mut colors: QList<i32> = QList::default();
+                for c in &tag_color_list {
+                    colors.append(*c);
+                }
+                vm.as_mut().set_tag_colors(colors);
+            }
             let (place_names, place_uids) = list_all_places(&db);
             vm.as_mut().set_place_labels(string_list_from_iter(
                 place_names.iter().map(String::as_str),
@@ -1508,6 +1557,7 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             clear_detail_pane(vm.as_mut());
             vm.as_mut().set_tag_labels(QStringList::default());
             vm.as_mut().set_tag_uids(QStringList::default());
+            vm.as_mut().set_tag_colors(QList::default());
             vm.as_mut().set_place_labels(QStringList::default());
             vm.as_mut().set_place_uids(QStringList::default());
             vm.as_mut()
@@ -1526,24 +1576,32 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
 
 /// Return parallel `(labels, uids)` for every tagdata row. Used by
 /// the edit dialog's multi-select tag picker.
-fn list_all_tags(db: &Database) -> (Vec<String>, Vec<String>) {
+fn list_all_tags(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
     let mut labels = Vec::new();
     let mut uids = Vec::new();
+    let mut colors = Vec::new();
     let Ok(mut stmt) = db.connection().prepare(
-        "SELECT remoteId, name FROM tagdata \
+        "SELECT remoteId, name, COALESCE(color, 0) FROM tagdata \
          WHERE remoteId IS NOT NULL AND name IS NOT NULL \
          ORDER BY td_order, name",
     ) else {
-        return (labels, uids);
+        return (labels, uids, colors);
     };
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i32>(2)?,
+        ))
+    });
     if let Ok(rows) = rows {
-        for (uid, name) in rows.flatten() {
+        for (uid, name, color) in rows.flatten() {
             uids.push(uid);
             labels.push(name);
+            colors.push(color);
         }
     }
-    (labels, uids)
+    (labels, uids, colors)
 }
 
 /// Return parallel `(labels, ids)` for every non-deleted task,

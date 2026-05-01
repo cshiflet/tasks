@@ -69,16 +69,32 @@ Pane {
         }
         return "";
     }
+    // Pick a readable text colour for a chip background. See
+    // TaskListPane.qml::chipTextFor — copy of the same Rec. 601
+    // luminance threshold so pale list colours stay legible.
+    function chipTextFor(argb) {
+        const c = argb | 0;
+        const r = (c >>> 16) & 0xff;
+        const g = (c >>>  8) & 0xff;
+        const b =  c         & 0xff;
+        const lum = (r * 0.299) + (g * 0.587) + (b * 0.114);
+        return lum > 150 ? "black" : "white";
+    }
+
     function _selectedTagNames() {
         if (!root.vm) { return []; }
         const out = [];
         const uids = root.vm.tagUids;
         const labels = root.vm.tagLabels;
+        const colors = root.vm.tagColors;
         for (let i = 0; i < root.vm.selectedTagUids.length; i++) {
             const u = root.vm.selectedTagUids[i];
             for (let j = 0; j < uids.length; j++) {
                 if (uids[j] === u) {
-                    out.push(labels[j] || u);
+                    out.push({
+                        name: labels[j] || u,
+                        color: (colors && j < colors.length) ? (colors[j] | 0) : 0,
+                    });
                     break;
                 }
             }
@@ -123,7 +139,24 @@ Pane {
                     }
                 }
                 opacity: 0.95
-                color: "white"
+                // White text is fine on red / blue but borderline
+                // on the medium-orange + grey palette swatches.
+                // Run them through the same luminance helper so
+                // the pill stays readable on every value.
+                property color bgColor: {
+                    if (!root.vm) { return "#9e9e9e"; }
+                    switch (root.vm.selectedPriority) {
+                        case 0: return "#d32f2f";  // red
+                        case 1: return "#f57c00";  // orange
+                        case 2: return "#1976d2";  // blue
+                        default: return "#9e9e9e"; // grey
+                    }
+                }
+                color: {
+                    const c = bgColor;
+                    const lum = (c.r * 0.299 + c.g * 0.587 + c.b * 0.114) * 255;
+                    return lum > 150 ? "black" : "white";
+                }
                 font.pointSize: Qt.application.font.pointSize - 1
                 font.bold: true
                 leftPadding: 8
@@ -132,27 +165,21 @@ Pane {
                 bottomPadding: 2
                 background: Rectangle {
                     radius: 4
-                    color: {
-                        if (!root.vm) { return "#9e9e9e"; }
-                        switch (root.vm.selectedPriority) {
-                            case 0: return "#d32f2f";  // red
-                            case 1: return "#f57c00";  // orange
-                            case 2: return "#1976d2";  // blue
-                            default: return "#9e9e9e"; // grey
-                        }
-                    }
+                    color: parent.bgColor
                 }
             }
 
             // CalDAV list pill — coloured background matching the
-            // list's `cdl_color`. White bold text on top so the
-            // chip reads as the list's identity at a glance. No
-            // leading icon glyph (Windows lacked a font fallback
-            // for the previous 📋 codepoint).
+            // list's `cdl_color`. Text colour follows the bg's
+            // perceived luminance so pale list palettes stay
+            // readable. No leading icon glyph (Windows lacked a
+            // font fallback for the previous 📋 codepoint).
             Label {
                 visible: root._selectedListName().length > 0
                 text: root._selectedListName()
-                color: "white"
+                color: root.vm
+                    ? root.chipTextFor(root.vm.selectedCaldavCalendarColor | 0)
+                    : "white"
                 font.pointSize: Qt.application.font.pointSize - 1
                 font.bold: true
                 leftPadding: 8
@@ -253,17 +280,42 @@ Pane {
             Repeater {
                 model: root._selectedTagNames()
                 Label {
-                    required property string modelData
-                    text: modelData
+                    required property var modelData
+                    text: modelData.name
                     font.pointSize: Qt.application.font.pointSize - 1
                     leftPadding: 6
                     rightPadding: 6
                     topPadding: 2
                     bottomPadding: 2
+                    color: {
+                        const c = modelData.color | 0;
+                        const a = (c >>> 24) & 0xff;
+                        if (a === 0) {
+                            // Untinted tag — keep theme foreground.
+                            return Material.foreground;
+                        }
+                        return root.chipTextFor(c);
+                    }
                     background: Rectangle {
-                        color: Material.color(Material.Blue, Material.Shade400)
-                        opacity: 0.18
                         radius: 8
+                        color: {
+                            const c = modelData.color | 0;
+                            const a = ((c >>> 24) & 0xff) / 255.0;
+                            if (a === 0) {
+                                // No assigned colour — keep the prior
+                                // faint Blue badge so the chip is still
+                                // visible against the pane background.
+                                return Material.color(Material.Blue, Material.Shade400);
+                            }
+                            const r = ((c >>> 16) & 0xff) / 255.0;
+                            const g = ((c >>>  8) & 0xff) / 255.0;
+                            const b = ( c         & 0xff) / 255.0;
+                            return Qt.rgba(r, g, b, 1.0);
+                        }
+                        opacity: {
+                            const c = modelData.color | 0;
+                            return ((c >>> 24) & 0xff) === 0 ? 0.18 : 1.0;
+                        }
                     }
                 }
             }

@@ -18,13 +18,22 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 
-ColumnLayout {
+ScrollView {
     id: pane
-    spacing: 12
     // Pin the Material context so child Labels resolve against the
     // window's actual colour scheme. See ListSettingsPane.qml.
     Material.theme: Material.System
     Material.accent: Material.Blue
+    // Pin the content's horizontal extent to the viewport so the
+    // inner ColumnLayout doesn't blow out and produce a phantom
+    // horizontal scrollbar.
+    contentWidth: availableWidth
+    clip: true
+    // Always show the vertical scrollbar so it reserves its width
+    // inside `availableWidth`; otherwise the overlay scrollbar
+    // sits on top of the form on the right edge.
+    ScrollBar.vertical.policy: ScrollBar.AlwaysOn
+    ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
     required property QtObject vm
 
@@ -57,11 +66,21 @@ ColumnLayout {
         return qsTr("Unknown (%1)").arg(kind);
     }
 
-    Label {
-        text: qsTr("Sync accounts")
-        font.bold: true
-        font.pointSize: Qt.application.font.pointSize + 1
-    }
+    // Inner column lays out the form vertically and is what
+    // actually scrolls when the content exceeds the ScrollView's
+    // viewport. Pinning `width` to `pane.availableWidth` keeps
+    // children sized to fit horizontally without producing a
+    // horizontal scrollbar.
+    ColumnLayout {
+        id: column
+        width: pane.availableWidth
+        spacing: 12
+
+        Label {
+            text: qsTr("Sync accounts")
+            font.bold: true
+            font.pointSize: Qt.application.font.pointSize + 1
+        }
 
     // Empty-state hint + the live list of configured accounts.
     Label {
@@ -171,7 +190,7 @@ ColumnLayout {
             text: qsTr("Label")
             opacity: 0.7
         }
-        TextField {
+        CompactTextField {
             id: labelField
             Layout.fillWidth: true
             placeholderText: qsTr("Display name (e.g. \"Fastmail / alice\")")
@@ -185,7 +204,7 @@ ColumnLayout {
             opacity: 0.7
             visible: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
         }
-        TextField {
+        CompactTextField {
             id: serverField
             Layout.fillWidth: true
             visible: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
@@ -202,7 +221,7 @@ ColumnLayout {
             opacity: 0.7
             visible: serverField.visible
         }
-        TextField {
+        CompactTextField {
             id: userField
             Layout.fillWidth: true
             visible: serverField.visible
@@ -214,7 +233,7 @@ ColumnLayout {
             opacity: 0.7
             visible: serverField.visible
         }
-        TextField {
+        CompactTextField {
             id: passwordField
             Layout.fillWidth: true
             visible: serverField.visible
@@ -273,8 +292,5 @@ ColumnLayout {
             }
         }
     }
-
-    // Soak up any remaining vertical space so the form sits near
-    // the top when the pane is tall.
-    Item { Layout.fillHeight: true }
-}
+    }   // close inner ColumnLayout
+}       // close ScrollView

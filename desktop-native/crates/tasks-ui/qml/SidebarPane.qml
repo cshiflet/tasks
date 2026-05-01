@@ -48,6 +48,20 @@ Pane {
         }
     }
 
+    // Per-group collapsed flags. Defaults to expanded; toggling
+    // reassigns the whole object so the bindings on each row re-evaluate.
+    property var collapsedGroups: ({})
+
+    function _isCollapsed(group) {
+        return collapsedGroups[group] === true;
+    }
+
+    function _toggleGroup(group) {
+        const next = Object.assign({}, collapsedGroups);
+        next[group] = !next[group];
+        collapsedGroups = next;
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -68,29 +82,64 @@ Pane {
 
                 // Section header when the group switches (or for the
                 // very first row).
+                property string myGroup: root.vm
+                    ? root._groupOf(root.vm.sidebarIds[row.index])
+                    : ""
                 property bool _isSectionStart: {
                     if (!root.vm) { return false; }
-                    const myId = root.vm.sidebarIds[row.index];
                     if (row.index === 0) { return true; }
                     const prevId = root.vm.sidebarIds[row.index - 1];
-                    return root._groupOf(prevId) !== root._groupOf(myId);
+                    return root._groupOf(prevId) !== row.myGroup;
                 }
+                property bool _groupCollapsed: root._isCollapsed(row.myGroup)
 
-                Label {
+                // Tinted, clickable section header. The chevron on
+                // the left rotates to indicate collapsed/expanded;
+                // the whole row toggles. Uses Material.foreground at
+                // low opacity for the tint so it adapts to both
+                // light and dark themes.
+                ItemDelegate {
                     visible: row._isSectionStart
-                    text: root.vm
-                        ? root._groupLabel(root._groupOf(root.vm.sidebarIds[row.index]))
-                        : ""
-                    leftPadding: 12
-                    topPadding: row.index === 0 ? 8 : 12
-                    bottomPadding: 4
-                    font.bold: true
-                    font.pointSize: Qt.application.font.pointSize - 1
-                    opacity: 0.55
+                    width: row.width
+                    height: visible ? implicitHeight : 0
+                    topPadding: 6
+                    bottomPadding: 6
+                    leftPadding: 8
+                    rightPadding: 8
+                    onClicked: root._toggleGroup(row.myGroup)
+
+                    background: Rectangle {
+                        color: Material.foreground
+                        opacity: 0.08
+                    }
+
+                    contentItem: RowLayout {
+                        spacing: 6
+
+                        Label {
+                            // Right-pointing triangle when collapsed,
+                            // down-pointing when expanded. Pure unicode
+                            // so it inherits the theme foreground.
+                            text: row._groupCollapsed ? "▸" : "▾"
+                            font.pointSize: Qt.application.font.pointSize - 1
+                            opacity: 0.7
+                            Layout.preferredWidth: 14
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: root.vm ? root._groupLabel(row.myGroup) : ""
+                            font.bold: true
+                            font.pointSize: Qt.application.font.pointSize - 1
+                            opacity: 0.75
+                            elide: Text.ElideRight
+                        }
+                    }
                 }
 
                 ItemDelegate {
                     width: row.width
+                    visible: !row._groupCollapsed
+                    height: visible ? implicitHeight : 0
                     text: root.vm ? root.vm.sidebarLabels[row.index] : ""
                     highlighted: root.vm
                         && root.vm.activeFilterId === root.vm.sidebarIds[row.index]

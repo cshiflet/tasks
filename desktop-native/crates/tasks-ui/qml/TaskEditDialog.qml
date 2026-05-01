@@ -21,9 +21,17 @@ import QtQuick.Layouts
 
 Pane {
     id: dialog
-    // The slide-out covers its parent fully (the detail pane) so
-    // there's no underlying interactive area while editing.
-    anchors.fill: parent
+    // Slide-out covers the parent fully when active. Sized
+    // explicitly via property bindings (not anchors.fill) so the
+    // states below can set `x` to slide the pane in / out without
+    // fighting an anchor that pins x to zero.
+    width: parent ? parent.width : 0
+    height: parent ? parent.height : 0
+    // Drop the Pane's default 12px padding — the inner
+    // `outerLayout` already sets its own margins. With both, the
+    // form had ~24px of empty space on every edge, making the
+    // dialog feel oversized.
+    padding: 0
     // Pin the Material context so the overlay reliably matches the
     // host window's theme rather than falling back to a default.
     Material.theme: Material.System
@@ -31,20 +39,68 @@ Pane {
     // Sit above any sibling content in the detail pane.
     z: 10
 
-    // Active = visible. The pane lives off-screen to the right
-    // (x = parent.width) when inactive, animates to x = 0 when the
-    // user clicks Edit. `visible` mirrors the boolean so off-
-    // screen state doesn't keep accepting input or rendering;
-    // `Behavior on x` runs the transition.
+    // Active = visible. State machine below drives the slide-in /
+    // slide-out animation and the visibility flip; using States +
+    // Transitions instead of bare bindings means the initial
+    // (parent.width still 0) frame doesn't accidentally render the
+    // pane on-screen before the first layout pass settles.
     property bool active: false
-    visible: active || x < width
-    x: active ? 0 : width
-    Behavior on x {
-        NumberAnimation {
-            duration: 220
-            easing.type: Easing.OutCubic
+
+    states: [
+        State {
+            name: "hidden"
+            when: !dialog.active
+            PropertyChanges {
+                target: dialog
+                x: dialog.width
+                visible: false
+            }
+        },
+        State {
+            name: "visible"
+            when: dialog.active
+            PropertyChanges {
+                target: dialog
+                x: 0
+                visible: true
+            }
         }
-    }
+    ]
+    transitions: [
+        Transition {
+            from: "hidden"
+            to: "visible"
+            // Show first, *then* animate x in. Without the
+            // PropertyAction, `visible` would flip true at the end
+            // of the slide and the pane would pop instead of
+            // sliding.
+            SequentialAnimation {
+                PropertyAction { target: dialog; property: "visible"; value: true }
+                NumberAnimation {
+                    target: dialog
+                    property: "x"
+                    duration: 220
+                    easing.type: Easing.OutCubic
+                }
+            }
+        },
+        Transition {
+            from: "visible"
+            to: "hidden"
+            // Animate x out, *then* hide. Same shape as above but
+            // mirrored, so the user sees the pane slide off-screen
+            // before it disappears.
+            SequentialAnimation {
+                NumberAnimation {
+                    target: dialog
+                    property: "x"
+                    duration: 220
+                    easing.type: Easing.OutCubic
+                }
+                PropertyAction { target: dialog; property: "visible"; value: false }
+            }
+        }
+    ]
 
     // Compatibility shims for the existing call sites
     // (`editDialog.open()` / `accept()` / `reject()`).
@@ -312,8 +368,8 @@ Pane {
     ColumnLayout {
         id: outerLayout
         anchors.fill: parent
-        anchors.margins: 12
-        spacing: 10
+        anchors.margins: 10
+        spacing: 8
 
         // Header — replaces the old window title bar. Bold so it
         // reads as a section header while the slide-out is open.
@@ -345,24 +401,28 @@ Pane {
             // a phantom horizontal scrollbar alongside the vertical
             // one.
             contentWidth: availableWidth
-            // Keep the vertical scrollbar pinned so it reserves its
-            // width inside `availableWidth` — with the default
-            // `AsNeeded` policy the bar is an overlay and sits on
-            // top of the form, hiding the right edge of fields (the
-            // UI#4 report). Horizontal bar stays off; we never want
-            // that one.
-            ScrollBar.vertical.policy: ScrollBar.AlwaysOn
+            // Keep the vertical scrollbar pinned + give it a
+            // consistent 12 px footprint so `availableWidth` always
+            // reserves room for it; the previous default-thin
+            // (~8px, transient) bar would shrink and the form
+            // fields would slide under it on overflow.
+            ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AlwaysOn
+                implicitWidth: 12
+            }
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: scroll.availableWidth
-                spacing: 10
+                // Trail an extra 8px on the right so the rightmost
+                // field doesn't kiss the scrollbar's left edge.
+                width: scroll.availableWidth - 8
+                spacing: 8
 
         Label {
             text: qsTr("Title")
             opacity: 0.7
         }
-        TextField {
+        CompactTextField {
             id: titleField
             Layout.fillWidth: true
             placeholderText: qsTr("Task title")
@@ -408,7 +468,7 @@ Pane {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 4
-                TextField {
+                CompactTextField {
                     id: dueField
                     Layout.fillWidth: true
                     placeholderText: qsTr("YYYY-MM-DD or YYYY-MM-DD HH:MM")
@@ -425,7 +485,7 @@ Pane {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 4
-                TextField {
+                CompactTextField {
                     id: hideField
                     Layout.fillWidth: true
                     placeholderText: qsTr("Same format as Due; blank = visible now")
@@ -462,7 +522,7 @@ Pane {
                         opacity: 0.6
                         visible: freqBox.currentIndex > 0
                     }
-                    TextField {
+                    CompactTextField {
                         id: intervalField
                         visible: freqBox.currentIndex > 0
                         implicitWidth: 60
@@ -575,7 +635,7 @@ Pane {
                 Layout.fillWidth: true
                 spacing: 4
 
-                TextField {
+                CompactTextField {
                     id: tagFilterField
                     Layout.fillWidth: true
                     placeholderText: qsTr("Filter tags…")
@@ -690,7 +750,7 @@ Pane {
                         text: qsTr("Add:")
                         opacity: 0.6
                     }
-                    TextField {
+                    CompactTextField {
                         id: addReminderField
                         Layout.fillWidth: true
                         placeholderText: qsTr("minutes before due")
@@ -760,7 +820,7 @@ Pane {
                 text: qsTr("Estimate")
                 opacity: 0.7
             }
-            TextField {
+            CompactTextField {
                 id: estimateField
                 Layout.fillWidth: true
                 placeholderText: qsTr("H:MM (e.g. 0:30, 1:15)")
@@ -770,7 +830,7 @@ Pane {
                 text: qsTr("Elapsed")
                 opacity: 0.7
             }
-            TextField {
+            CompactTextField {
                 id: elapsedField
                 Layout.fillWidth: true
                 placeholderText: qsTr("H:MM")
