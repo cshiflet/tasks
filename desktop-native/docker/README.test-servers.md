@@ -21,10 +21,44 @@ which Django's runserver needs. Override with
 
 The compose stack uses two services on dedicated localhost ports:
 
-| Service  | Port  | Wire-up                                                                  |
-|----------|-------|--------------------------------------------------------------------------|
-| Etebase  | 3735  | `http://127.0.0.1:3735` — Django admin `admin / changeme`                |
-| Radicale | 5232  | `http://127.0.0.1:5232/` — user `test / test`                            |
+| Service  | Port  | URL                          | Desktop-client account | Web admin              |
+|----------|-------|------------------------------|------------------------|------------------------|
+| Etebase  | 3735  | `http://127.0.0.1:3735`      | `alice / alicepw`      | `admin / changeme`     |
+| Radicale | 5232  | `http://127.0.0.1:5232/test/`| `test / test`          | `http://127.0.0.1:5232/.web/` |
+
+Both desktop-client accounts are pre-provisioned on first start
+of their containers — no `docker compose exec` step is required.
+
+## Verify the stack is reachable
+
+```sh
+# Etebase — any HTTP response means the Django app is up.
+curl -sSI http://127.0.0.1:3735/ | head -1
+# Radicale — same idea.
+curl -sSI http://127.0.0.1:5232/ | head -1
+```
+
+If either returns "connection refused" or hangs, check:
+
+```sh
+docker compose -f docker-compose.test-servers.yml ps
+docker compose -f docker-compose.test-servers.yml logs etebase
+docker compose -f docker-compose.test-servers.yml logs radicale
+```
+
+## Connecting from the desktop client
+
+1. Launch the client (`cargo run -p tasks-ui` from `desktop-native/`).
+2. Open **Settings → Accounts → Add account**.
+3. Fill the row using the credentials in the table above.
+4. Click **Add account**.
+5. Click **Sync now** on the row that appears.
+
+A successful sync flips the row's badge from `Idle` →
+`Syncing…` → `Synced (N↓ / 0↑)`, and pulled calendars / tasks
+land in the sidebar + list pane. Errors surface in the
+bottom-right status bar; check the running tracing log on stderr
+for the full message.
 
 Tear-down (wipe state):
 
@@ -40,28 +74,31 @@ docker compose -f docker-compose.test-servers.yml down
 
 ## Etebase setup notes
 
-The compose file pre-provisions two accounts on first container
-start:
+The entrypoint script provisions two accounts on first start:
 
-- **Django superuser** `admin / changeme` — for the `/admin/` web
-  UI only. Not the account the desktop client signs in as.
-- **Etebase test user** `alice / alicepw` — what the desktop
-  client uses on the Accounts pane. Override via the
-  `ETEBASE_TEST_USER` / `ETEBASE_TEST_PASSWORD` env vars in the
-  compose file.
+- **Django superuser** (`admin / changeme`) — for the `/admin/`
+  web UI only. Not the account the desktop client signs in as.
+  Driven by the `DJANGO_SUPERUSER_*` env vars in the compose
+  file.
+- **Etebase test user** (`alice / alicepw`) — what the desktop
+  client uses on the Accounts pane. Driven by
+  `ETEBASE_TEST_USER` / `ETEBASE_TEST_PASSWORD` /
+  `ETEBASE_TEST_EMAIL` in the compose file. Override either set
+  by editing the values there and re-running
+  `docker compose up -d --build`; first-time provisioning is
+  idempotent so existing usernames are left untouched.
 
 The legacy `manage.py etebase-server create-user` command isn't
-shipped in v0.13.0; the entrypoint creates the test user via
-`manage.py shell` instead. The Etebase signup flow on first
-client connect attaches the user-info / pubkey rows it needs
-around it.
+shipped in v0.13.0 (it landed in a later upstream rev), so the
+entrypoint creates the underlying Django auth user directly via
+`manage.py shell`. The Etebase signup flow on the client's first
+connect attaches the per-user info / pubkey rows around it.
 
-Point the desktop client's Accounts pane at:
-
-- **Type**:        EteSync
-- **Server URL**:  `http://127.0.0.1:3735`
-- **Username**:    `alice`
-- **Password**:    `alicepw`
+The image also includes a stand-in `etebase_server/wsgi.py` —
+v0.13.0's `WSGI_APPLICATION = 'etebase_server.wsgi.application'`
+setting is left dangling by the upstream tarball, so the
+entrypoint synthesizes a minimal Django boilerplate WSGI module
+on start if one isn't already on disk.
 
 ## Radicale setup notes
 
