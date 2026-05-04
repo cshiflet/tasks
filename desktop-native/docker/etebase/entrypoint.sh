@@ -11,6 +11,31 @@ set -eu
 
 cd /app
 
+# 0. WSGI shim. Multiple upstream `etesync/server` tags ship with
+#    `settings.WSGI_APPLICATION = 'etebase_server.wsgi.application'`
+#    but no `etebase_server/wsgi.py`, leaving Django's runserver
+#    bailing out with `ModuleNotFoundError: No module named
+#    'etebase_server.wsgi'`. Detect the project package via the
+#    DJANGO_SETTINGS_MODULE that manage.py exports and synthesize a
+#    minimal WSGI module if it's missing.
+PKG=$(grep -oE "DJANGO_SETTINGS_MODULE['\"]?,[[:space:]]*['\"][^'\"]+['\"]" manage.py 2>/dev/null \
+        | head -1 \
+        | sed -E "s/.*['\"]([^'\"]+)\.settings['\"].*/\1/")
+if [ -z "${PKG:-}" ] || [ ! -d "$PKG" ]; then
+    # Fall back to the historical default; covers the case where
+    # manage.py is shaped slightly differently across tags.
+    PKG=etebase_server
+fi
+if [ -d "$PKG" ] && [ ! -f "$PKG/wsgi.py" ]; then
+    cat > "$PKG/wsgi.py" <<EOF
+import os
+from django.core.wsgi import get_wsgi_application
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', '${PKG}.settings')
+application = get_wsgi_application()
+EOF
+    echo "entrypoint: synthesized $PKG/wsgi.py shim"
+fi
+
 # 1. Apply the latest migrations. No-op once the DB is current.
 ./manage.py migrate --noinput
 
