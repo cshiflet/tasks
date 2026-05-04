@@ -2591,7 +2591,13 @@ fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
     out
 }
 
-fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<String>, Vec<i32>) {
+/// Output bundle for `build_sidebar`. Aliased so the function
+/// signature doesn't trip `clippy::type_complexity`; the five
+/// vectors are the same five Q_PROPERTYs the QML side reads:
+/// labels / ids / account_kinds / groups / colors.
+type SidebarRows = (Vec<String>, Vec<String>, Vec<i32>, Vec<String>, Vec<i32>);
+
+fn build_sidebar(db: &Database) -> SidebarRows {
     let mut labels = vec![
         "All active".to_string(),
         "Today".to_string(),
