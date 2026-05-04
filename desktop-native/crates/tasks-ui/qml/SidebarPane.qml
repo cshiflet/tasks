@@ -1,15 +1,18 @@
-// Sidebar listing built-in filters, CalDAV calendars, and custom filters.
-// Rows come from the view model's parallel `sidebarLabels` / `sidebarIds`
-// properties. Selecting a row calls `selectFilter(id)`, which re-queries
-// the DB and refreshes the task list + detail panes.
+// Sidebar listing built-in filters, every configured account, and
+// custom filters.
 //
-// The bridge serves entries grouped by kind via the `sidebarIds` prefix:
-//   `__…__`     — built-in filters (All / Today / Recent)
-//   `caldav:…`  — CalDAV calendars
-//   `filter:…`  — saved custom filters
-// A small section header is injected above the first row of each
-// group so the user can see at a glance what they're choosing
-// between (C-2 fix — was previously one flat list).
+// Rows come from the bridge's parallel `sidebarLabels`/`sidebarIds`
+// /`sidebarGroups`/`sidebarAccountKinds` arrays. The id prefix
+// determines how each row is rendered:
+//   `__…__`            — built-in filter (All / Today / Recent)
+//   `account:<uuid>`   — account section header (collapse target)
+//   `caldav:<uuid>`    — list under an account
+//   `filter:<id>`      — saved custom filter
+// `sidebarGroups[i]` is the group key the collapse logic uses —
+// "filters_builtin", "saved", or `account:<uuid>` (so each
+// account's own header + its lists share one collapse state).
+// Right-clicking an account header opens a menu with New list /
+// Sync now / Edit / Remove.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -29,77 +32,29 @@ Pane {
         sidebarList.forceActiveFocus();
     }
 
-    // Map a sidebar entry to its group key. Built-in / saved filters
-    // are decided by the id prefix; list rows (`caldav:*`) consult
-    // the parallel `sidebarAccountKinds` array to split LOCAL from
-    // real CalDAV from Google Tasks / Microsoft To Do / Etebase /
-    // etc. — every list lives in the `caldav_lists` table so the id
-    // prefix is uniform, but the visual grouping should match the
-    // account type the import / sync layer recorded.
+    // Read the bridge-emitted group key for a row. Each row's group
+    // is one of "filters_builtin", "saved", or `account:<uuid>`.
     function _groupOfIndex(idx) {
-        if (!root.vm) { return "other"; }
-        const id = root.vm.sidebarIds[idx];
-        if (!id) { return "other"; }
-        if (id.startsWith("__")) { return "filters_builtin"; }
-        if (id.startsWith("filter:")) { return "saved"; }
-        if (id.startsWith("caldav:")) {
-            const kinds = root.vm.sidebarAccountKinds;
-            const k = (kinds && idx < kinds.length) ? (kinds[idx] | 0) : 0;
-            // Mirrors `tasks_core::models::caldav::AccountType`.
-            switch (k) {
-                case 0:  return "caldav";        // CALDAV
-                case 2:  return "local";         // LOCAL
-                case 3:  return "opentasks";     // OPENTASKS
-                case 4:  return "tasksorg";      // TASKS_ORG
-                case 5:  return "etebase";       // ETEBASE
-                case 6:  return "mstodo";        // MICROSOFT
-                case 7:  return "gtasks";        // GOOGLE_TASKS
-                default: return "caldav";
-            }
-        }
-        return "other";
+        if (!root.vm) { return ""; }
+        const groups = root.vm.sidebarGroups;
+        return (groups && idx < groups.length) ? groups[idx] : "";
     }
+    // Static label for the well-known section keys. Account-keyed
+    // groups use the row's own label as the header text — see the
+    // delegate below.
     function _groupLabel(group) {
-        switch (group) {
-            case "filters_builtin": return qsTr("Quick filters");
-            case "caldav":          return qsTr("CalDAV lists");
-            case "local":           return qsTr("Local lists");
-            case "gtasks":          return qsTr("Google Tasks");
-            case "mstodo":          return qsTr("Microsoft To Do");
-            case "etebase":         return qsTr("Etebase");
-            case "tasksorg":        return qsTr("Tasks.org");
-            case "opentasks":       return qsTr("OpenTasks");
-            case "saved":           return qsTr("Saved filters");
-            default:                return qsTr("Other");
-        }
+        if (group === "filters_builtin") { return qsTr("Quick filters"); }
+        if (group === "saved")           { return qsTr("Saved filters"); }
+        return "";
     }
-    // Whether the named group is backed by a working sync engine in
-    // this build. Everything except "local" + the built-in / saved
-    // filters represents an external sync provider whose `tasks-sync`
-    // path isn't wired into the bridge yet (PLAN_UPDATES §11), so
-    // their lists are read-only views of the imported data. The
-    // sidebar surfaces a "(not connected)" suffix on the section
-    // header + lower opacity on each row so the user can tell at a
-    // glance which lists won't refresh from a server.
-    function _groupIsSync(group) {
-        switch (group) {
-            case "caldav":
-            case "gtasks":
-            case "mstodo":
-            case "etebase":
-            case "tasksorg":
-            case "opentasks":
-                return true;
-            default:
-                return false;
+    // Strip the `account:` prefix off a group key to recover the
+    // owning `caldav_accounts.cda_uuid`. Returns "" for non-account
+    // groups; callers gate the right-click menu on the result.
+    function _accountUuidOf(group) {
+        if (group && group.startsWith("account:")) {
+            return group.slice("account:".length);
         }
-    }
-    function _groupConnected(group) {
-        // Sync isn't wired yet for any provider — every external
-        // group is "not connected" in this build. When the sync
-        // bridge lands, swap this for a check against the running
-        // SyncEngine's account status.
-        return !_groupIsSync(group) ? true : false;
+        return "";
     }
 
     // Per-group collapsed flags. Defaults to expanded; toggling
@@ -114,6 +69,56 @@ Pane {
         const next = Object.assign({}, collapsedGroups);
         next[group] = !next[group];
         collapsedGroups = next;
+    }
+
+    // Inline "New list" dialog reused by every account header's
+    // right-click → New list... action. Lives at the pane root so
+    // the per-row TapHandler can openFor() into it.
+    Dialog {
+        id: newListInline
+        modal: true
+        title: qsTr("Create list")
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        property string accountUuid: ""
+        property string accountLabel: ""
+
+        function openFor(label, uuid) {
+            newListInline.accountLabel = label;
+            newListInline.accountUuid = uuid;
+            newListField.text = "";
+            open();
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 8
+            implicitWidth: 320
+            Label {
+                Layout.fillWidth: true
+                opacity: 0.7
+                wrapMode: Text.Wrap
+                text: newListInline.accountLabel.length > 0
+                      ? qsTr("Create a list on \"%1\".").arg(newListInline.accountLabel)
+                      : qsTr("Create a list.")
+            }
+            CompactTextField {
+                id: newListField
+                Layout.fillWidth: true
+                placeholderText: qsTr("List name (e.g. \"Inbox\" or \"Groceries\")")
+            }
+        }
+
+        onAccepted: {
+            if (!root.vm
+                || newListInline.accountUuid.length === 0
+                || newListField.text.trim().length === 0) {
+                return;
+            }
+            root.vm.createAccountCalendar(
+                newListInline.accountUuid,
+                newListField.text,
+                0);
+        }
     }
 
     ColumnLayout {
@@ -134,33 +139,32 @@ Pane {
                 required property int index
                 width: sidebarList.width
 
-                // Section header when the group switches (or for the
-                // very first row).
-                property string myGroup: root.vm
-                    ? root._groupOfIndex(row.index)
-                    : ""
-                property bool _isSectionStart: {
-                    if (!root.vm) { return false; }
+                property string myGroup: root.vm ? root._groupOfIndex(row.index) : ""
+                property string myId: root.vm ? root.vm.sidebarIds[row.index] : ""
+                property string myLabel: root.vm ? root.vm.sidebarLabels[row.index] : ""
+                // True when the row is itself an account-section
+                // header (id `account:<uuid>`). These render as a
+                // tinted strip and toggle their group's collapse
+                // state on click; right-click pops the per-account
+                // context menu (New list / Sync now / Edit / Remove).
+                property bool _isAccountHeader: row.myId.startsWith("account:")
+                // True for built-in / saved-filter rows that need
+                // their well-known section header injected above
+                // them whenever the previous row was in a different
+                // group.
+                property bool _isStaticSectionStart: {
+                    if (!row.myGroup || row._isAccountHeader) { return false; }
                     if (row.index === 0) { return true; }
                     return root._groupOfIndex(row.index - 1) !== row.myGroup;
                 }
                 property bool _groupCollapsed: root._isCollapsed(row.myGroup)
 
-                // Tinted, clickable section header. The chevron on
-                // the left rotates to indicate collapsed/expanded;
-                // the whole row toggles. Uses Material.foreground at
-                // low opacity for the tint so it adapts to both
-                // light and dark themes.
+                // Static section header (Quick filters / Saved
+                // filters). Account groups don't need this — the
+                // account-header row IS the strip.
                 ItemDelegate {
-                    id: header
-                    visible: row._isSectionStart
+                    visible: row._isStaticSectionStart
                     width: row.width
-                    // Override Material's 48 px touch-target floor —
-                    // Material.touchTarget pads ItemDelegate to 48 px
-                    // regardless of topPadding, so a header strip at
-                    // "3 + 3 padding" still rendered ~48 px tall.
-                    // Setting implicitHeight directly drives the row
-                    // size and the contentItem fits inside it.
                     implicitHeight: visible ? 22 : 0
                     height: implicitHeight
                     topPadding: 0
@@ -168,27 +172,13 @@ Pane {
                     leftPadding: 8
                     rightPadding: 8
                     onClicked: root._toggleGroup(row.myGroup)
-
                     background: Rectangle {
                         color: Material.foreground
                         opacity: 0.08
                     }
-
                     contentItem: RowLayout {
                         spacing: 6
-
-                        // Painted chevron — no Unicode triangle in
-                        // sight. The literal triangle glyphs (and the
-                        // ▶ / ▼ escape variants) both showed
-                        // as "â¾"-style mojibake on the user's Windows
-                        // build, presumably because Qt's font-fallback
-                        // picked a typeface without the BMP geometric-
-                        // shapes block. Drawing two line segments via
-                        // Canvas dodges every font-coverage and file-
-                        // encoding question, and a 90° rotation
-                        // animates the expand/collapse transition.
                         Canvas {
-                            id: chevron
                             Layout.preferredWidth: 12
                             Layout.preferredHeight: 12
                             rotation: row._groupCollapsed ? -90 : 0
@@ -202,7 +192,7 @@ Pane {
                                 ctx.lineWidth = 1.6;
                                 ctx.lineCap = "round";
                                 ctx.lineJoin = "round";
-                                ctx.strokeStyle = header.Material.foreground;
+                                ctx.strokeStyle = Material.foreground;
                                 ctx.beginPath();
                                 ctx.moveTo(2, 4);
                                 ctx.lineTo(width / 2, height - 4);
@@ -212,46 +202,122 @@ Pane {
                         }
                         Label {
                             Layout.fillWidth: true
-                            text: root.vm ? root._groupLabel(row.myGroup) : ""
+                            text: root._groupLabel(row.myGroup)
                             font.bold: true
                             font.pointSize: Qt.application.font.pointSize - 1
                             opacity: 0.75
                             elide: Text.ElideRight
                         }
-                        // "(not connected)" suffix for sync providers
-                        // whose engine isn't running. Same hint shows
-                        // up in the section header so a glance at
-                        // either the header or a list row tells the
-                        // user "this is offline/imported data".
+                    }
+                }
+
+                // Account-section header. Displays the account's own
+                // label as the strip text and supports right-click
+                // → New list / Sync now / Edit / Remove.
+                ItemDelegate {
+                    id: accountHeader
+                    visible: row._isAccountHeader
+                    width: row.width
+                    implicitHeight: visible ? 26 : 0
+                    height: implicitHeight
+                    topPadding: 0
+                    bottomPadding: 0
+                    leftPadding: 8
+                    rightPadding: 8
+                    onClicked: root._toggleGroup(row.myGroup)
+                    background: Rectangle {
+                        color: Material.foreground
+                        opacity: 0.10
+                    }
+                    contentItem: RowLayout {
+                        spacing: 6
+                        Canvas {
+                            Layout.preferredWidth: 12
+                            Layout.preferredHeight: 12
+                            rotation: row._groupCollapsed ? -90 : 0
+                            opacity: 0.75
+                            Behavior on rotation {
+                                NumberAnimation { duration: 120 }
+                            }
+                            onPaint: {
+                                const ctx = getContext("2d");
+                                ctx.reset();
+                                ctx.lineWidth = 1.6;
+                                ctx.lineCap = "round";
+                                ctx.lineJoin = "round";
+                                ctx.strokeStyle = Material.foreground;
+                                ctx.beginPath();
+                                ctx.moveTo(2, 4);
+                                ctx.lineTo(width / 2, height - 4);
+                                ctx.lineTo(width - 2, 4);
+                                ctx.stroke();
+                            }
+                        }
                         Label {
-                            visible: !root._groupConnected(row.myGroup)
-                            text: qsTr("(not connected)")
-                            font.italic: true
-                            font.pointSize: Qt.application.font.pointSize - 2
-                            opacity: 0.55
+                            Layout.fillWidth: true
+                            text: row.myLabel
+                            font.bold: true
+                            font.pointSize: Qt.application.font.pointSize - 1
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    // Right-click context menu. Wired to the same
+                    // bridge invokables the Accounts pane uses.
+                    TapHandler {
+                        acceptedButtons: Qt.RightButton
+                        onTapped: accountMenu.popup()
+                    }
+                    Menu {
+                        id: accountMenu
+                        MenuItem {
+                            text: qsTr("New list…")
+                            onTriggered: newListInline.openFor(row.myLabel,
+                                                              root._accountUuidOf(row.myGroup))
+                        }
+                        MenuItem {
+                            text: qsTr("Sync now")
+                            onTriggered: {
+                                if (!root.vm) { return; }
+                                root.vm.syncAccount(root._accountUuidOf(row.myGroup));
+                            }
+                        }
+                        MenuSeparator {}
+                        MenuItem {
+                            text: qsTr("Remove account…")
+                            onTriggered: {
+                                if (!root.vm) { return; }
+                                // Find the account index by uuid;
+                                // removeAccount takes an index.
+                                const target = root._accountUuidOf(row.myGroup);
+                                const uuids = root.vm.accountUuids;
+                                for (let i = 0; i < uuids.length; i++) {
+                                    if (uuids[i] === target) {
+                                        root.vm.removeAccount(i);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
+                // Selectable list / filter row. Skipped for account-
+                // header indexes (the header IS that index's only
+                // visible content).
                 ItemDelegate {
                     width: row.width
-                    visible: !row._groupCollapsed
-                    // Same reasoning as the header — Material would
-                    // otherwise pin every row at the 48 px touch
-                    // target regardless of topPadding.
+                    visible: !row._groupCollapsed && !row._isAccountHeader
                     implicitHeight: visible ? 28 : 0
                     height: implicitHeight
                     topPadding: 0
                     bottomPadding: 0
-                    text: root.vm ? root.vm.sidebarLabels[row.index] : ""
-                    // Dim rows whose owning provider has no live sync
-                    // backing them — the data is whatever the import
-                    // captured and won't refresh until the sync engine
-                    // is wired up.
-                    opacity: root._groupConnected(row.myGroup) ? 1.0 : 0.55
-                    highlighted: root.vm
-                        && root.vm.activeFilterId === root.vm.sidebarIds[row.index]
-                    onClicked: if (root.vm) root.vm.selectFilter(root.vm.sidebarIds[row.index])
+                    // Indent list rows so they read as children of
+                    // their account header.
+                    leftPadding: row.myGroup.startsWith("account:") ? 24 : 16
+                    text: row.myLabel
+                    highlighted: root.vm && root.vm.activeFilterId === row.myId
+                    onClicked: if (root.vm) root.vm.selectFilter(row.myId)
                 }
             }
         }

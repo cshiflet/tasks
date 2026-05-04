@@ -291,10 +291,20 @@ fn caldav_parent_query(calendar_uuid: &str) -> String {
 /// colons into the UID) without admitting quote/space/semicolon
 /// chars that have no business in a canonical UUID.
 fn is_plausible_caldav_uuid(s: &str) -> bool {
+    // The CalDAV provider in `tasks-sync` stores the full calendar
+    // URL as `cdl_uuid` (it doubles as the FK from
+    // `caldav_tasks.cd_calendar` and as the URL the next REPORT /
+    // PUT call resolves against). That URL can be ~120 chars on
+    // iCloud / Fastmail, so the cap goes to 256, and `/` is added
+    // to the allow-list. The single-quote escape immediately below
+    // is the actual SQL-injection guard; this character check is
+    // belt-and-braces against future write paths that drop URLs of
+    // a less-trusted shape.
     !s.is_empty()
-        && s.len() <= 64
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'@'))
+        && s.len() <= 256
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'@' | b'/')
+        })
 }
 
 #[cfg(test)]
@@ -323,8 +333,10 @@ mod caldav_uuid_tests {
         assert!(!is_plausible_caldav_uuid("foo;drop"));
         // Empty.
         assert!(!is_plausible_caldav_uuid(""));
-        // Too long.
-        assert!(!is_plausible_caldav_uuid(&"a".repeat(65)));
+        // Too long. Cap was bumped to 256 (was 64) to fit the
+        // full calendar URL the CalDAV provider stores as
+        // cdl_uuid; anything longer than that is rejected.
+        assert!(!is_plausible_caldav_uuid(&"a".repeat(257)));
     }
 
     #[test]

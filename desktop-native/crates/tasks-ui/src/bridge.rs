@@ -179,6 +179,14 @@ pub mod qobject {
         // prefix stays uniform because every row lives in
         // `caldav_lists`; the kind is purely a display concern.
         #[qproperty(QList_i32, sidebar_account_kinds)]
+        // Parallel to `sidebar_ids` — the group key the QML uses
+        // for collapsible-section logic. "filters_builtin" for the
+        // top three built-ins, "saved" for `filter:*` rows, and
+        // `account:<cda_uuid>` for an account header AND every
+        // `caldav:` list row that hangs off it. Letting the bridge
+        // emit the group key directly is simpler than re-deriving
+        // it in QML by walking back over earlier indexes.
+        #[qproperty(QStringList, sidebar_groups)]
         #[qproperty(QString, active_filter_id)]
         // Configured sync accounts, parallel arrays for the Settings
         // → Accounts pane. `account_kinds` is the integer tag
@@ -518,6 +526,7 @@ pub struct TaskListViewModelRust {
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
     sidebar_account_kinds: QList<i32>,
+    sidebar_groups: QStringList,
     active_filter_id: QString,
     // H-4: free-text substring search across title + notes. When
     // non-empty, `reload_active_filter` runs `run_search` instead
@@ -636,6 +645,7 @@ impl Default for TaskListViewModelRust {
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             sidebar_account_kinds: QList::default(),
+            sidebar_groups: QStringList::default(),
             active_filter_id: QString::from(FILTER_ALL),
             search_query: String::new(),
             account_labels: QStringList::default(),
@@ -941,7 +951,7 @@ impl qobject::TaskListViewModel {
         publish_accounts(self.as_mut());
         // Refresh sidebar so the removed account's lists disappear.
         if let Some(db) = &self.db {
-            let (labels, ids, kinds) = build_sidebar(db);
+            let (labels, ids, kinds, groups) = build_sidebar(db);
             self.as_mut()
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
             self.as_mut()
@@ -951,6 +961,8 @@ impl qobject::TaskListViewModel {
                 kl.append(*k);
             }
             self.as_mut().set_sidebar_account_kinds(kl);
+            self.as_mut()
+                .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
         }
         self.as_mut().reload_active_filter();
         self.as_mut()
@@ -1211,9 +1223,10 @@ impl qobject::TaskListViewModel {
                 // calendars + tasks land in the UI without forcing
                 // the user to reopen the DB.
                 if let Some(db) = &self.db {
-                    let (labels, ids, kinds) = build_sidebar(db);
+                    let (labels, ids, kinds, groups) = build_sidebar(db);
                     let labels_qsl = string_list_from_iter(labels.iter().map(String::as_str));
                     let ids_qsl = string_list_from_iter(ids.iter().map(String::as_str));
+                    let groups_qsl = string_list_from_iter(groups.iter().map(String::as_str));
                     let mut kl: QList<i32> = QList::default();
                     for k in &kinds {
                         kl.append(*k);
@@ -1221,6 +1234,7 @@ impl qobject::TaskListViewModel {
                     self.as_mut().set_sidebar_labels(labels_qsl);
                     self.as_mut().set_sidebar_ids(ids_qsl);
                     self.as_mut().set_sidebar_account_kinds(kl);
+                    self.as_mut().set_sidebar_groups(groups_qsl);
                 }
                 self.as_mut().reload_active_filter();
             }
@@ -2139,7 +2153,7 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
 
     match result {
         Ok(db) => {
-            let (labels, ids, kinds) = build_sidebar(&db);
+            let (labels, ids, kinds, groups) = build_sidebar(&db);
             vm.as_mut()
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
             vm.as_mut()
@@ -2151,6 +2165,8 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
                 }
                 vm.as_mut().set_sidebar_account_kinds(kl);
             }
+            vm.as_mut()
+                .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
             // Edit dialog's CalDAV list picker uses the calendars
             // directly (no built-in filters prepended, no
             // "caldav:" prefix on the UUID).
@@ -2486,7 +2502,7 @@ fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
     out
 }
 
-fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
+fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<String>) {
     let mut labels = vec![
         "All active".to_string(),
         "Today".to_string(),
@@ -2497,49 +2513,102 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
         FILTER_TODAY.to_string(),
         FILTER_RECENT.to_string(),
     ];
-    // Parallel array — built-in filters and saved filters get -1.
-    // For caldav_lists rows we record `cda_account_type` so the
-    // QML side can put local-only lists ("Local lists"), Google
-    // Tasks ("Google Tasks"), Microsoft To Do ("Microsoft To Do"),
-    // Etebase ("Etebase"), etc. under their own headings instead
-    // of lumping them all under "CalDAV lists". The id prefix
-    // stays `caldav:<uuid>` because every list lives in the same
-    // `caldav_lists` table and `run_by_filter_id` only needs the
-    // uuid — the kind is purely a display concern.
+    // Group key for each row, parallel to `ids`. Built-ins share
+    // "filters_builtin"; saved filters share "saved"; account
+    // header + the lists hanging off it share `account:<uuid>`.
+    let mut groups: Vec<String> = vec![
+        "filters_builtin".to_string(),
+        "filters_builtin".to_string(),
+        "filters_builtin".to_string(),
+    ];
+    // `kinds[i]` carries:
+    //   -1 for built-in / saved filters
+    //   `cda_account_type` (0/2/3/4/5/6/7) for `caldav:` rows AND
+    //   for the synthetic `account:<uuid>` headers emitted below
+    // The QML side looks at the id prefix to decide whether the row
+    // is a section header (no selection / right-click menu) or a
+    // selectable list filter.
     let mut kinds: Vec<i32> = vec![-1, -1, -1];
 
-    // Pull cda_account_type alongside the list rows in one query so
-    // we don't N+1 against the accounts table.
-    let sql = "SELECT caldav_lists.*, \
-                      COALESCE(caldav_accounts.cda_account_type, 0) AS cda_account_type \
-               FROM caldav_lists \
-               LEFT JOIN caldav_accounts \
-                    ON caldav_lists.cdl_account = caldav_accounts.cda_uuid \
-               ORDER BY cda_account_type, cdl_order, cdl_name";
-    match db.connection().prepare(sql) {
-        Ok(mut stmt) => match stmt.query_map([], |r| {
+    // Walk caldav_accounts once, then for each emit a synthetic
+    // header followed by every cdl row whose cdl_account matches.
+    // Empty accounts still produce a header so the user can right-
+    // click "New list" on them. `cda_collapsed` is honoured by the
+    // QML side via the existing `collapsedGroups` map (keyed by
+    // account uuid); we just provide the rows.
+    let mut accounts: Vec<(String, String, i32)> = Vec::new(); // (uuid, label, type)
+    if let Ok(mut stmt) = db.connection().prepare(
+        "SELECT cda_uuid, cda_name, cda_account_type \
+         FROM caldav_accounts \
+         WHERE cda_uuid IS NOT NULL \
+         ORDER BY cda_account_type, cda_name",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
             Ok((
-                CaldavCalendar::from_row(r)?,
-                r.get::<_, i32>("cda_account_type")?,
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i32>(2)?,
             ))
         }) {
-            Ok(rows) => {
-                for row in rows {
-                    match row {
-                        Ok((cal, account_type)) => {
-                            if let (Some(name), Some(uuid)) = (cal.name, cal.uuid) {
-                                labels.push(name);
-                                ids.push(format!("caldav:{uuid}"));
-                                kinds.push(account_type);
-                            }
-                        }
-                        Err(e) => tracing::warn!("caldav_lists row decode failed: {e}"),
-                    }
+            for row in rows.flatten() {
+                if let (Some(uuid), name) = (row.0, row.1) {
+                    accounts.push((uuid, name.unwrap_or_default(), row.2));
                 }
             }
-            Err(e) => tracing::warn!("caldav_lists query_map failed: {e}"),
-        },
-        Err(e) => tracing::warn!("caldav_lists prepare failed: {e}"),
+        }
+    }
+    // Lookup table: cdl_account → list of (cdl_uuid, cdl_name).
+    let mut lists_by_account: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    if let Ok(mut stmt) = db.connection().prepare(
+        "SELECT cdl_uuid, cdl_name, cdl_account \
+         FROM caldav_lists \
+         WHERE cdl_account IS NOT NULL AND cdl_uuid IS NOT NULL \
+         ORDER BY cdl_order, cdl_name",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                if let (Some(uuid), name, Some(account)) = (row.0, row.1, row.2) {
+                    lists_by_account
+                        .entry(account)
+                        .or_default()
+                        .push((uuid, name.unwrap_or_default()));
+                }
+            }
+        }
+    }
+    for (account_uuid, account_name, account_type) in &accounts {
+        let account_group = format!("account:{account_uuid}");
+        // Header row. The id prefix `account:` is what tells the QML
+        // "this is a section header — render with the account label,
+        // toggle collapse on click, show a right-click menu."
+        labels.push(if account_name.is_empty() {
+            "(unnamed account)".to_string()
+        } else {
+            account_name.clone()
+        });
+        ids.push(account_group.clone());
+        kinds.push(*account_type);
+        groups.push(account_group.clone());
+        // Lists belonging to this account.
+        if let Some(rows) = lists_by_account.get(account_uuid) {
+            for (cdl_uuid, cdl_name) in rows {
+                labels.push(if cdl_name.is_empty() {
+                    cdl_uuid.clone()
+                } else {
+                    cdl_name.clone()
+                });
+                ids.push(format!("caldav:{cdl_uuid}"));
+                kinds.push(*account_type);
+                groups.push(account_group.clone());
+            }
+        }
     }
 
     match db
@@ -2555,6 +2624,7 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
                                 labels.push(title);
                                 ids.push(format!("filter:{}", f.id));
                                 kinds.push(-1);
+                                groups.push("saved".to_string());
                             }
                         }
                         Err(e) => tracing::warn!("filters row decode failed: {e}"),
@@ -2566,7 +2636,7 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
         Err(e) => tracing::warn!("filters prepare failed: {e}"),
     }
 
-    (labels, ids, kinds)
+    (labels, ids, kinds, groups)
 }
 
 /// Snapshot the persistable subset of the view model and write it
