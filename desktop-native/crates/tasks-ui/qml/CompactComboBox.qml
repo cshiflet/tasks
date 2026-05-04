@@ -16,8 +16,8 @@ ComboBox {
     // Outer padding is slightly more generous than the compact
     // text fields so the closed box visually pairs with the
     // adjacent Label rows in Settings instead of looking shorter.
-    topPadding: 6
-    bottomPadding: 6
+    topPadding: 7
+    bottomPadding: 7
     leftPadding: 10
     rightPadding: control.indicator ? control.indicator.width + 4 : 24
 

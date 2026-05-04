@@ -75,10 +75,10 @@ ScrollView {
         // Subtract the Material ScrollBar's typical visible width
         // (its `implicitWidth` plus a few px of breathing room) so
         // the inner controls never tuck under the always-on
-        // vertical bar. Empirically 20 px is needed — a flat 12 px
-        // margin still left the right-edge of the password field +
-        // the Sign-in button overlapping the scrollbar.
-        width: pane.availableWidth - 20
+        // vertical bar. 23 px clears the bar plus a small visual
+        // gap; tighter values had the scrollbar resting right
+        // against the password field's border.
+        width: pane.availableWidth - 23
         spacing: 12
 
         Label {

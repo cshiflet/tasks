@@ -22,6 +22,12 @@ TextField {
     id: control
     topPadding: 6
     bottomPadding: 6
+    // Inset placeholder + entered text from the bordered edge so
+    // characters don't run flush against the rectangle. Matches the
+    // CompactComboBox's leftPadding so adjacent rows on a settings
+    // form line up at the same text gutter.
+    leftPadding: 10
+    rightPadding: 10
     background: Rectangle {
         color: "transparent"
         radius: 2
