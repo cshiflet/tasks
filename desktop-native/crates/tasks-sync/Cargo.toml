@@ -23,6 +23,8 @@ rusqlite = { workspace = true }
 # string interpolation; parsing nested `<d:response>` trees
 # wants a real pull-parser.
 quick-xml = "0.36"
+# UUID v4 for fresh CalDAV calendar paths on MKCALENDAR.
+uuid = { version = "1", features = ["v4"] }
 # PKCE helper for OAuth2 desktop flow (Google Tasks + Microsoft
 # To Do). Keeps the crypto primitives explicit rather than
 # depending on the full `oauth2` crate (which brings in tokio +

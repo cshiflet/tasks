@@ -227,6 +227,23 @@ pub trait Provider: Send + Sync {
     /// Delete a task remotely.
     async fn delete_task(&mut self, calendar_remote_id: &str, remote_id: &str) -> SyncResult<()>;
 
+    /// Create a fresh calendar / task list on the server. Returns
+    /// the metadata the engine needs to upsert into `caldav_lists`
+    /// — most importantly its `remote_id`, which is the URL the
+    /// next push_task / list_tasks call expects. Default impl
+    /// returns `NotYetImplemented` so providers can opt in
+    /// individually as the wire-up lands.
+    async fn create_calendar(
+        &mut self,
+        _name: &str,
+        _color: Option<i32>,
+    ) -> SyncResult<RemoteCalendar> {
+        Err(SyncError::NotYetImplemented {
+            provider: "?",
+            method: "create_calendar",
+        })
+    }
+
     /// Run a full sync cycle (pull changes, push local deltas,
     /// reconcile). The exact algorithm is provider-specific;
     /// callers just want the summary.

@@ -393,6 +393,106 @@ impl Provider for CalDavProvider {
             method: "sync_once (use SyncEngine::sync_now)",
         })
     }
+
+    async fn create_calendar(
+        &mut self,
+        name: &str,
+        color: Option<i32>,
+    ) -> SyncResult<RemoteCalendar> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        // Mint a fresh UUID-shaped path segment under the user's
+        // calendar home. Radicale, Nextcloud, Fastmail, iCloud and
+        // any RFC 4791 server let MKCALENDAR's request URI choose
+        // the resource path; collisions on a UUID v4 are vanishingly
+        // unlikely so retry-on-409 isn't worth the code yet.
+        let collection_id = uuid::Uuid::new_v4().to_string();
+        let target = s
+            .calendar_home
+            .join(&format!("{collection_id}/"))
+            .map_err(|e| SyncError::Protocol(format!("bad mkcalendar url: {e}")))?;
+        s.trusted_origin.check(&target)?;
+        // Minimal MKCALENDAR body: display name + (optional) Apple-
+        // style colour + restrict the calendar to VTODO so the
+        // server doesn't bind it to VEVENT and refuse our task PUTs.
+        let mut body = String::new();
+        body.push_str(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <c:mkcalendar xmlns:d=\"DAV:\" \
+                           xmlns:c=\"urn:ietf:params:xml:ns:caldav\" \
+                           xmlns:i=\"http://apple.com/ns/ical/\">\
+               <d:set><d:prop>",
+        );
+        body.push_str("<d:displayname>");
+        body.push_str(&xml_escape(name));
+        body.push_str("</d:displayname>");
+        if let Some(c) = color {
+            // Apple's calendar-color is a 32-bit ARGB stringified
+            // as `#RRGGBBAA`. Tasks.org stores ARGB so we shuffle
+            // bytes to RGBA before serialising.
+            let alpha = ((c as u32 >> 24) & 0xff) as u8;
+            let red = ((c as u32 >> 16) & 0xff) as u8;
+            let green = ((c as u32 >> 8) & 0xff) as u8;
+            let blue = (c as u32 & 0xff) as u8;
+            body.push_str(&format!(
+                "<i:calendar-color>#{red:02X}{green:02X}{blue:02X}{alpha:02X}</i:calendar-color>",
+            ));
+        }
+        body.push_str(
+            "<c:supported-calendar-component-set>\
+                <c:comp name=\"VTODO\"/>\
+              </c:supported-calendar-component-set>\
+            </d:prop></d:set></c:mkcalendar>",
+        );
+        let method = Method::from_bytes(b"MKCALENDAR")
+            .map_err(|e| SyncError::Other(format!("bad method: {e}")))?;
+        let resp = s
+            .http
+            .request(method, target.clone())
+            .header(AUTHORIZATION, s.auth.clone())
+            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| SyncError::Network(format!("MKCALENDAR: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let snippet = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            return Err(SyncError::Protocol(format!(
+                "MKCALENDAR returned {status}: {}",
+                snippet.chars().take(200).collect::<String>()
+            )));
+        }
+        Ok(RemoteCalendar {
+            remote_id: target.as_str().to_string(),
+            name: name.to_string(),
+            url: Some(target.as_str().to_string()),
+            color,
+            change_tag: None,
+            read_only: false,
+        })
+    }
+}
+
+/// Minimal XML-text escape for displayname / other element text.
+/// Five entities cover everything XML 1.0 forbids in CDATA.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 // ---------- HTTP helpers ----------

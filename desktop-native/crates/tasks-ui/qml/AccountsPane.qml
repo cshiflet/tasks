@@ -181,6 +181,19 @@ ScrollView {
                     }
                 }
 
+                // CalDAV / EteSync rows get a "New list" button that
+                // pops a dialog asking for a name + creates the
+                // calendar on the server. Hidden for OAuth providers
+                // until their sign-in flow lands.
+                Button {
+                    text: qsTr("New list")
+                    flat: true
+                    visible: pane.vm
+                             && (pane.vm.accountKinds[row.index] === 0
+                                 || pane.vm.accountKinds[row.index] === 3)
+                    onClicked: if (pane.vm) newListDialog.openFor(row.index)
+                }
+
                 Button {
                     text: qsTr("Edit")
                     flat: true
@@ -415,6 +428,60 @@ ScrollView {
                 editServer.text,
                 editUser.text,
                 editPassword.text);
+        }
+    }
+
+    // New-list dialog. Asks for a display name; creates the
+    // calendar on the account's server then triggers a sync so the
+    // row lands in caldav_lists and the sidebar refreshes.
+    Dialog {
+        id: newListDialog
+        modal: true
+        title: qsTr("Create list")
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        property string targetUuid: ""
+        property string targetLabel: ""
+
+        function openFor(idx) {
+            if (!pane.vm) { return; }
+            newListDialog.targetUuid = pane.vm.accountUuids[idx] ?? "";
+            newListDialog.targetLabel = pane.vm.accountLabels[idx] ?? "";
+            newListField.text = "";
+            open();
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 8
+            implicitWidth: 320
+
+            Label {
+                Layout.fillWidth: true
+                text: newListDialog.targetLabel.length > 0
+                      ? qsTr("Create a new list on \"%1\".").arg(newListDialog.targetLabel)
+                      : qsTr("Create a new list.")
+                opacity: 0.7
+                wrapMode: Text.Wrap
+            }
+            CompactTextField {
+                id: newListField
+                Layout.fillWidth: true
+                placeholderText: qsTr("List name (e.g. \"Inbox\" or \"Groceries\")")
+            }
+        }
+
+        onAccepted: {
+            if (!pane.vm
+                || newListDialog.targetUuid.length === 0
+                || newListField.text.trim().length === 0) {
+                return;
+            }
+            // 0 = no colour (bridge converts to None for the
+            // provider). A future revision can pop a colour swatch.
+            pane.vm.createAccountCalendar(
+                newListDialog.targetUuid,
+                newListField.text,
+                0);
         }
     }
     }   // close inner ColumnLayout

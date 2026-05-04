@@ -354,6 +354,18 @@ pub mod qobject {
         #[qinvokable]
         fn sync_account(self: Pin<&mut TaskListViewModel>, cda_uuid: QString);
 
+        /// Create a calendar / task list on `cda_uuid`'s server with
+        /// the given display name and (optional) i32 ARGB colour.
+        /// On success, runs a sync against that account so the new
+        /// list lands in `caldav_lists` and the sidebar repopulates.
+        #[qinvokable]
+        fn create_account_calendar(
+            self: Pin<&mut TaskListViewModel>,
+            cda_uuid: QString,
+            name: QString,
+            color: i32,
+        );
+
         /// H-4: free-text substring search across task title +
         /// notes. Empty input restores the currently-active filter.
         /// Called from the toolbar search field on every text edit.
@@ -1207,6 +1219,100 @@ impl qobject::TaskListViewModel {
                 let msg = format!("Sync of {} failed: {e}", stored.label);
                 tracing::warn!("{msg}");
                 set_account_state(self.as_mut(), &uuid, &format!("Failed: {e}"));
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// Create a new calendar on the given account's server, then
+    /// run a sync so the local DB picks the row up. The sync also
+    /// refreshes the sidebar + reloads the active filter.
+    pub fn create_account_calendar(
+        mut self: Pin<&mut Self>,
+        cda_uuid: QString,
+        name: QString,
+        color: i32,
+    ) {
+        let uuid = cda_uuid.to_string();
+        let name_s = name.to_string().trim().to_string();
+        if name_s.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Calendar name is required."));
+            return;
+        }
+        let Some(stored) = self.accounts.iter().find(|a| a.uuid == uuid).cloned() else {
+            self.as_mut()
+                .set_status(QString::from(&format!("No account with uuid {uuid}.")));
+            return;
+        };
+        let Some(_) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database first."));
+            return;
+        };
+
+        if self.runtime.is_none() {
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("tasks-sync")
+                .build()
+            {
+                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
+                Err(e) => {
+                    self.as_mut()
+                        .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
+                    return;
+                }
+            }
+        }
+
+        let creds = AccountCredentials::new_password(
+            &stored.server,
+            &stored.username,
+            secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+        );
+        let mut provider: Box<dyn Provider> = match stored.kind {
+            KIND_CALDAV => Box::new(CalDavProvider::new(creds, stored.label.clone())),
+            KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, stored.label.clone())),
+            _ => {
+                self.as_mut().set_status(QString::from(
+                    "Creating lists on this provider isn't supported yet.",
+                ));
+                return;
+            }
+        };
+
+        self.as_mut().set_status(QString::from(&format!(
+            "Creating list \"{}\" on {}…",
+            name_s, stored.label
+        )));
+
+        let create_result = self
+            .as_mut()
+            .rust_mut()
+            .runtime
+            .as_ref()
+            .expect("runtime constructed above")
+            .block_on(async move {
+                provider.connect().await?;
+                let color_arg = if color == 0 { None } else { Some(color) };
+                provider.create_calendar(&name_s, color_arg).await
+            });
+
+        match create_result {
+            Ok(_cal) => {
+                self.as_mut().set_status(QString::from(&format!(
+                    "Created list on {}; pulling…",
+                    stored.label
+                )));
+                // Run a sync so the new calendar lands in
+                // caldav_lists and the sidebar refreshes.
+                self.as_mut().sync_account(QString::from(&uuid));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't create list: {e}");
+                tracing::warn!("{msg}");
                 self.as_mut().set_status(QString::from(&msg));
             }
         }
