@@ -249,6 +249,43 @@ mod tests {
     use super::*;
     use std::net::TcpStream;
 
+    /// Read from `stream` until EOF or `timeout`, returning everything
+    /// the client received as a single `Vec<u8>`. The test threads
+    /// previously called `read(&mut buf)` once and asserted on the
+    /// resulting buffer, which raced on macOS — `read` would return
+    /// `Ok(0)` before the server's response landed in the loopback
+    /// receive buffer (Linux + Windows happened to deliver before the
+    /// first read returned). Looping until graceful EOF is the
+    /// portable shape; a 2-second wall-clock guards against a stuck
+    /// connection holding the test thread forever.
+    fn read_response(stream: &mut TcpStream) -> Vec<u8> {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    if !out.is_empty() {
+                        break;
+                    }
+                    // macOS occasionally hands back Ok(0) on a fresh
+                    // loopback stream before the server's writes have
+                    // been flushed through. Yield once and retry; the
+                    // outer read_timeout still bounds total wait.
+                    std::thread::sleep(Duration::from_millis(20));
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => out.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
     #[test]
     fn bind_returns_a_usable_port() {
         let r = LoopbackReceiver::bind().unwrap();
@@ -325,10 +362,7 @@ mod tests {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
             let req = format!("GET /admin HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
             s.write_all(req.as_bytes()).unwrap();
-            let mut buf = [0u8; 512];
-            let _ = s.read(&mut buf);
-            // Read should show a 400 response.
-            let response = String::from_utf8_lossy(&buf).to_string();
+            let response = String::from_utf8_lossy(&read_response(&mut s)).to_string();
             assert!(response.contains("400"), "response: {response}");
         });
         // Receiver stays up until timeout — there's no valid /cb hit.
@@ -351,9 +385,7 @@ mod tests {
             // A DNS-rebinding-style request claiming a public host.
             let req = b"GET /cb?code=abc&state=ok HTTP/1.1\r\nHost: attacker.example.com\r\n\r\n";
             s.write_all(req).unwrap();
-            let mut buf = [0u8; 512];
-            let _ = s.read(&mut buf);
-            let response = String::from_utf8_lossy(&buf).to_string();
+            let response = String::from_utf8_lossy(&read_response(&mut s)).to_string();
             assert!(response.contains("400"), "response: {response}");
         });
         let err = receiver
