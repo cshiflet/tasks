@@ -40,27 +40,28 @@ docker compose -f docker-compose.test-servers.yml down
 
 ## Etebase setup notes
 
-The Django superuser (`admin`) is provisioned automatically from
-the env vars in the compose file the first time the container
-starts. That account is for the Django admin UI, **not** for the
-desktop client to sign in as — the EteSync protocol uses its own
-user objects.
+The compose file pre-provisions two accounts on first container
+start:
 
-Create a *test user* via the management command shipped with the
-upstream project:
+- **Django superuser** `admin / changeme` — for the `/admin/` web
+  UI only. Not the account the desktop client signs in as.
+- **Etebase test user** `alice / alicepw` — what the desktop
+  client uses on the Accounts pane. Override via the
+  `ETEBASE_TEST_USER` / `ETEBASE_TEST_PASSWORD` env vars in the
+  compose file.
 
-```sh
-docker compose -f docker-compose.test-servers.yml exec etebase \
-    ./manage.py etebase-server create-user alice alice@example.com
-```
+The legacy `manage.py etebase-server create-user` command isn't
+shipped in v0.13.0; the entrypoint creates the test user via
+`manage.py shell` instead. The Etebase signup flow on first
+client connect attaches the user-info / pubkey rows it needs
+around it.
 
-The command prompts for a password. Then point the desktop
-client's Accounts pane at:
+Point the desktop client's Accounts pane at:
 
 - **Type**:        EteSync
 - **Server URL**:  `http://127.0.0.1:3735`
 - **Username**:    `alice`
-- **Password**:    whatever password you set above
+- **Password**:    `alicepw`
 
 ## Radicale setup notes
 

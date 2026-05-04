@@ -233,8 +233,9 @@ impl Provider for CalDavProvider {
         let s = guard
             .as_ref()
             .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
-        let cal_url = Url::parse(calendar_remote_id)
-            .map_err(|e| SyncError::Protocol(format!("bad calendar url: {e}")))?;
+        let cal_url = Url::parse(calendar_remote_id).map_err(|e| {
+            SyncError::Protocol(format!("bad calendar url '{calendar_remote_id}': {e}"))
+        })?;
         s.trusted_origin.check(&cal_url)?;
         let body = report(
             &s.http,
@@ -290,8 +291,12 @@ impl Provider for CalDavProvider {
             .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
         // The object URL follows Tasks.org's convention:
         //   <calendar_url>/<UID>.ics
-        let cal_url = Url::parse(&task.calendar_remote_id)
-            .map_err(|e| SyncError::Protocol(format!("bad calendar url: {e}")))?;
+        let cal_url = Url::parse(&task.calendar_remote_id).map_err(|e| {
+            SyncError::Protocol(format!(
+                "bad calendar url '{}': {e}",
+                task.calendar_remote_id
+            ))
+        })?;
         s.trusted_origin.check(&cal_url)?;
         let obj_url = cal_url
             .join(&format!("{}.ics", task.remote_id))
@@ -355,8 +360,9 @@ impl Provider for CalDavProvider {
         let s = guard
             .as_ref()
             .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
-        let cal_url = Url::parse(calendar_remote_id)
-            .map_err(|e| SyncError::Protocol(format!("bad calendar url: {e}")))?;
+        let cal_url = Url::parse(calendar_remote_id).map_err(|e| {
+            SyncError::Protocol(format!("bad calendar url '{calendar_remote_id}': {e}"))
+        })?;
         s.trusted_origin.check(&cal_url)?;
         let obj_url = cal_url
             .join(&format!("{remote_id}.ics"))

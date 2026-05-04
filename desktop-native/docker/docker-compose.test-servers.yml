@@ -42,6 +42,12 @@ services:
       DJANGO_SUPERUSER_USERNAME: admin
       DJANGO_SUPERUSER_EMAIL: admin@example.com
       DJANGO_SUPERUSER_PASSWORD: changeme
+      # Pre-provision a normal Etebase test user on first start.
+      # The desktop client signs in as this user; the Django
+      # superuser above is just for the /admin/ web UI.
+      ETEBASE_TEST_USER: alice
+      ETEBASE_TEST_EMAIL: alice@example.com
+      ETEBASE_TEST_PASSWORD: alicepw
     ports:
       - "127.0.0.1:3735:3735"
     volumes:

@@ -102,16 +102,21 @@ ScrollView {
     // don't push the add-form off the pane.
     Frame {
         Layout.fillWidth: true
-        Layout.preferredHeight: Math.min(220, Math.max(60, listView.contentHeight + 16))
+        // Floor bumped so a single-row account with the three-line
+        // ColumnLayout (label / kind+server / sync-state badge) +
+        // its two trailing buttons doesn't overflow the Frame.
+        // contentHeight + 24 keeps the binding reactive when more
+        // rows arrive or the badge appears.
+        Layout.preferredHeight: Math.min(260, Math.max(96, listView.contentHeight + 24))
         visible: pane.vm && pane.vm.accountLabels.length > 0
-        padding: 4
+        padding: 8
 
         ListView {
             id: listView
             anchors.fill: parent
             clip: true
             model: pane.vm ? pane.vm.accountLabels.length : 0
-            spacing: 4
+            spacing: 6
             delegate: RowLayout {
                 id: row
                 required property int index

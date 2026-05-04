@@ -59,6 +59,28 @@ else:
 "
 fi
 
+# 2b. Provision a normal Etebase test user if env vars are set.
+#     v0.13.0 doesn't ship a `manage.py etebase-server create-user`
+#     command (that landed in a later upstream rev), so we create
+#     the underlying Django auth user directly via `manage.py
+#     shell`. The Etebase signup flow on first client connect will
+#     attach the user-info / pubkey rows it needs around it.
+if [ -n "${ETEBASE_TEST_USER:-}" ] && [ -n "${ETEBASE_TEST_PASSWORD:-}" ]; then
+    ./manage.py shell -c "
+from django.contrib.auth import get_user_model
+U = get_user_model()
+u = '${ETEBASE_TEST_USER}'
+if not U.objects.filter(username=u).exists():
+    U.objects.create_user(
+        u,
+        '${ETEBASE_TEST_EMAIL:-${ETEBASE_TEST_USER}@example.com}',
+        '${ETEBASE_TEST_PASSWORD}')
+    print(f'Created test user {u}')
+else:
+    print(f'Test user {u} already exists')
+"
+fi
+
 # 3. Serve. `--insecure` lets runserver hand back static files
 #    even though we don't run `collectstatic` — fine for a local
 #    test box, never use this layout in production.
