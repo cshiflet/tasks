@@ -2744,31 +2744,49 @@ fn build_sidebar(db: &Database) -> SidebarRows {
 }
 
 /// Make sure a Local account + a default "Inbox" list exist on the
-/// open DB. Idempotent — `INSERT OR IGNORE` keys on the well-known
-/// uuid so subsequent opens don't duplicate. Lets a fresh user
-/// create tasks immediately without first wiring up a CalDAV /
-/// EteSync account.
+/// open DB. `caldav_accounts.cda_uuid` and `caldav_lists.cdl_uuid`
+/// are plain TEXT columns (no UNIQUE constraint), so `INSERT OR
+/// IGNORE` won't de-dupe — every restart would inflate the
+/// sidebar with another copy. Read-then-conditional-INSERT keeps
+/// the rows singleton.
 fn ensure_local_default_list(path: &std::path::Path) {
     let Ok(conn) = open_rw_conn(path) else {
         tracing::warn!("ensure_local_default_list: couldn't open RW conn");
         return;
     };
-    // Account row. account_type = 2 == AccountType::LOCAL.
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO caldav_accounts \
-         (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
-          cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
-         VALUES ('local-default', 'Local', NULL, NULL, NULL, NULL, 2, 0, -1, 0)",
-        [],
-    );
-    // Default list under that account.
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO caldav_lists \
-         (cdl_uuid, cdl_account, cdl_name, cdl_color, cdl_url, cdl_access, \
-          cdl_ctag, cdl_order, cdl_last_sync) \
-         VALUES ('local-inbox', 'local-default', 'Inbox', 0, NULL, 1, NULL, 0, 0)",
-        [],
-    );
+    let account_present: bool = conn
+        .query_row(
+            "SELECT 1 FROM caldav_accounts WHERE cda_uuid = 'local-default' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !account_present {
+        // account_type = 2 == AccountType::LOCAL.
+        let _ = conn.execute(
+            "INSERT INTO caldav_accounts \
+             (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+              cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+             VALUES ('local-default', 'Local', NULL, NULL, NULL, NULL, 2, 0, -1, 0)",
+            [],
+        );
+    }
+    let list_present: bool = conn
+        .query_row(
+            "SELECT 1 FROM caldav_lists WHERE cdl_uuid = 'local-inbox' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !list_present {
+        let _ = conn.execute(
+            "INSERT INTO caldav_lists \
+             (cdl_uuid, cdl_account, cdl_name, cdl_color, cdl_url, cdl_access, \
+              cdl_ctag, cdl_order, cdl_last_sync) \
+             VALUES ('local-inbox', 'local-default', 'Inbox', 0, NULL, 1, NULL, 0, 0)",
+            [],
+        );
+    }
 }
 
 /// Snapshot the persistable subset of the view model and write it

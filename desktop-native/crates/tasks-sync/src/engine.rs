@@ -315,21 +315,23 @@ fn upsert_calendar(
         )
         .optional()?;
     let access = if cal.read_only { 2 } else { 1 }; // CalendarAccess::READ_ONLY / READ_WRITE
-    let color = cal.color.unwrap_or(0);
     if let Some(_id) = existing {
-        // Stamp `cdl_account` only when the caller actually has it
-        // — engine integration tests build a SyncEngine without an
-        // account filter and we don't want to clobber whatever was
-        // there before. The same logic applies on insert below.
+        // Update everything *except* cdl_color from the
+        // server-supplied row first; colour is a special case
+        // because the user can pick it locally via the sidebar's
+        // colour picker, and the provider almost always omits it
+        // (Radicale's PROPFIND doesn't return Apple-style
+        // calendar-color unless explicitly asked for, and most
+        // CalDAV deployments don't set one). Only overwrite
+        // cdl_color when the provider actually surfaced one.
         if account_uuid.is_some() {
             tx.execute(
                 "UPDATE caldav_lists \
-                 SET cdl_name = ?1, cdl_color = ?2, cdl_url = ?3, \
-                     cdl_access = ?4, cdl_ctag = ?5, cdl_account = ?6 \
-                 WHERE cdl_uuid = ?7",
+                 SET cdl_name = ?1, cdl_url = ?2, \
+                     cdl_access = ?3, cdl_ctag = ?4, cdl_account = ?5 \
+                 WHERE cdl_uuid = ?6",
                 params![
                     cal.name,
-                    color,
                     cal.url,
                     access,
                     cal.change_tag,
@@ -339,19 +341,21 @@ fn upsert_calendar(
             )?;
         } else {
             tx.execute(
-                "UPDATE caldav_lists SET cdl_name = ?1, cdl_color = ?2, cdl_url = ?3, \
-                 cdl_access = ?4, cdl_ctag = ?5 WHERE cdl_uuid = ?6",
-                params![
-                    cal.name,
-                    color,
-                    cal.url,
-                    access,
-                    cal.change_tag,
-                    cal.remote_id
-                ],
+                "UPDATE caldav_lists SET cdl_name = ?1, cdl_url = ?2, \
+                 cdl_access = ?3, cdl_ctag = ?4 WHERE cdl_uuid = ?5",
+                params![cal.name, cal.url, access, cal.change_tag, cal.remote_id],
+            )?;
+        }
+        if let Some(c) = cal.color {
+            tx.execute(
+                "UPDATE caldav_lists SET cdl_color = ?1 WHERE cdl_uuid = ?2",
+                params![c, cal.remote_id],
             )?;
         }
     } else {
+        // Fresh insert: 0 means "no colour" (the QML chip /
+        // sidebar dot fall back to neutral grey).
+        let color = cal.color.unwrap_or(0);
         tx.execute(
             "INSERT INTO caldav_lists \
              (cdl_uuid, cdl_name, cdl_color, cdl_url, cdl_access, cdl_ctag, \
