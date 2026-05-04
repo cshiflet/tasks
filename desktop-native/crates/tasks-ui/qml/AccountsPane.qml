@@ -22,7 +22,6 @@ ScrollView {
     id: pane
     // Pin the Material context so child Labels resolve against the
     // window's actual colour scheme. See ListSettingsPane.qml.
-    Material.theme: Material.System
     Material.accent: Material.Blue
     // Pin the content's horizontal extent to the viewport so the
     // inner ColumnLayout doesn't blow out and produce a phantom

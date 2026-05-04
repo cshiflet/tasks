@@ -19,7 +19,6 @@ Pane {
     id: root
     padding: 0
     // Belt-and-braces theme propagation; see TaskDetailPane.qml.
-    Material.theme: Material.System
     Material.accent: Material.Blue
     required property QtObject vm
 
@@ -73,6 +72,34 @@ Pane {
             case "saved":           return qsTr("Saved filters");
             default:                return qsTr("Other");
         }
+    }
+    // Whether the named group is backed by a working sync engine in
+    // this build. Everything except "local" + the built-in / saved
+    // filters represents an external sync provider whose `tasks-sync`
+    // path isn't wired into the bridge yet (PLAN_UPDATES §11), so
+    // their lists are read-only views of the imported data. The
+    // sidebar surfaces a "(not connected)" suffix on the section
+    // header + lower opacity on each row so the user can tell at a
+    // glance which lists won't refresh from a server.
+    function _groupIsSync(group) {
+        switch (group) {
+            case "caldav":
+            case "gtasks":
+            case "mstodo":
+            case "etebase":
+            case "tasksorg":
+            case "opentasks":
+                return true;
+            default:
+                return false;
+        }
+    }
+    function _groupConnected(group) {
+        // Sync isn't wired yet for any provider — every external
+        // group is "not connected" in this build. When the sync
+        // bridge lands, swap this for a check against the running
+        // SyncEngine's account status.
+        return !_groupIsSync(group) ? true : false;
     }
 
     // Per-group collapsed flags. Defaults to expanded; toggling
@@ -191,6 +218,18 @@ Pane {
                             opacity: 0.75
                             elide: Text.ElideRight
                         }
+                        // "(not connected)" suffix for sync providers
+                        // whose engine isn't running. Same hint shows
+                        // up in the section header so a glance at
+                        // either the header or a list row tells the
+                        // user "this is offline/imported data".
+                        Label {
+                            visible: !root._groupConnected(row.myGroup)
+                            text: qsTr("(not connected)")
+                            font.italic: true
+                            font.pointSize: Qt.application.font.pointSize - 2
+                            opacity: 0.55
+                        }
                     }
                 }
 
@@ -205,6 +244,11 @@ Pane {
                     topPadding: 0
                     bottomPadding: 0
                     text: root.vm ? root.vm.sidebarLabels[row.index] : ""
+                    // Dim rows whose owning provider has no live sync
+                    // backing them — the data is whatever the import
+                    // captured and won't refresh until the sync engine
+                    // is wired up.
+                    opacity: root._groupConnected(row.myGroup) ? 1.0 : 0.55
                     highlighted: root.vm
                         && root.vm.activeFilterId === root.vm.sidebarIds[row.index]
                     onClicked: if (root.vm) root.vm.selectFilter(root.vm.sidebarIds[row.index])

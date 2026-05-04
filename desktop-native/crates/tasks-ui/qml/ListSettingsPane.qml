@@ -21,7 +21,6 @@ ColumnLayout {
     // window's actual colour scheme. Without this anchor a
     // ColumnLayout's children sometimes fall back to a hard-coded
     // light-theme black on a dark-themed Settings window.
-    Material.theme: Material.System
     Material.accent: Material.Blue
 
     required property QtObject vm

@@ -28,7 +28,6 @@ ApplicationWindow {
            | Qt.WindowCloseButtonHint | Qt.WindowMinMaxButtonsHint
     // Mirror the main window's theme so Settings doesn't snap back
     // to light on a dark desktop.
-    Material.theme: Material.System
     Material.accent: Material.Blue
 
     required property QtObject vm
@@ -61,7 +60,6 @@ ApplicationWindow {
     // always match the window-level theme that the panes expect.
     Pane {
         anchors.fill: parent
-        Material.theme: Material.System
         Material.accent: Material.Blue
         padding: 16
 

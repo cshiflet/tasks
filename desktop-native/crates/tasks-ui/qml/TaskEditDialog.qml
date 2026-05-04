@@ -34,7 +34,6 @@ Pane {
     padding: 0
     // Pin the Material context so the overlay reliably matches the
     // host window's theme rather than falling back to a default.
-    Material.theme: Material.System
     Material.accent: Material.Blue
     // Sit above any sibling content in the detail pane.
     z: 10

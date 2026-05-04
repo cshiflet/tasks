@@ -2,20 +2,23 @@
 //
 // Same transparent-fill + themed-border trick CompactTextField.qml
 // uses so dark-theme windows don't flash a Light-theme grey slab.
-// See CompactTextField.qml for the Qt 6.4 vs 6.5+ rationale on
-// dropping `Material.containerStyle`.
 //
-// Earlier revisions also forced topPadding / bottomPadding to 6 to
-// match the text fields, but Material's ComboBox positions its
-// content + dropdown indicator from those paddings and clipped the
-// label baseline at the bottom on Windows. Material's default
-// padding is fine; only the background needed replacing.
+// Earlier revisions tried `topPadding/bottomPadding: 6` for
+// density, but Material's contentItem positioning then shaved the
+// descenders off `g` / `p` / `y` in dark mode on Linux. Bump both
+// paddings to 8 so a full lineHeight + descender always fits, and
+// pin a minimum implicitHeight so the borderless background can't
+// collapse the box below readable size.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 
 ComboBox {
     id: control
+    topPadding: 8
+    bottomPadding: 8
+    implicitHeight: Math.max(36, contentItem ? contentItem.implicitHeight + topPadding + bottomPadding : 36)
+
     background: Rectangle {
         color: "transparent"
         radius: 2

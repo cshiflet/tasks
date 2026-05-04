@@ -17,7 +17,6 @@ Pane {
     // (light) default if the attached-property chain is broken by
     // an intervening QObject — pin it here so this pane reliably
     // matches the rest of the window.
-    Material.theme: Material.System
     Material.accent: Material.Blue
     required property QtObject vm
 
