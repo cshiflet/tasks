@@ -101,11 +101,84 @@ jobs:
             exit 1
           fi
 
-  # macOS and Windows checks are intentionally skipped on per-push CI.
-  # Local testing happens on Linux right now and the release workflow
-  # (`desktop-native-release.yml`) still builds + tests on all three
-  # platforms when a tag fires, so cross-OS regressions can't ship
-  # without a green check there. Re-add the `check-macos` /
-  # `check-windows` jobs here if iteration ever needs faster feedback
-  # on the other two OSes again.
+  # macOS and Windows jobs only run build + test — fmt/clippy/schema-hash
+  # are deterministic across OSes and would just burn CI time.
+  check-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: GUI smoke test (offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_LOGGING_RULES: "qt.qml.binding*.warning=true"
+        run: |
+          cargo build --workspace
+          set +e
+          # macOS `timeout` isn't BSD-default; use perl as a portable
+          # fallback.
+          perl -e 'alarm 3; exec @ARGV' -- ./target/debug/tasks-desktop \
+            2> smoke-stderr.log
+          rc=$?
+          set -e
+          if [ "$rc" != "142" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
+            echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            cat smoke-stderr.log >&2 || true
+            exit $rc
+          fi
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:" smoke-stderr.log; then
+            echo "QML smoke test found warnings — see matches above" >&2
+            exit 1
+          fi
+
+  check-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      # Skipping the GUI smoke step on Windows for now — `QT_QPA_PLATFORM
+      # =offscreen` works, but invoking a short-lived process via PowerShell
+      # requires platform-specific plumbing that's not worth the coverage.
+      # Revisit once the Qt front-end has feature tests worth running on
+      # Windows specifically.
 
