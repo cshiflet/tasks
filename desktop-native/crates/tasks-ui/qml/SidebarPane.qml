@@ -71,6 +71,111 @@ Pane {
         collapsedGroups = next;
     }
 
+    // Material-palette swatch picker reused by every list row's
+    // right-click → Choose colour… action. Click a swatch to
+    // commit; "Default" clears the colour back to neutral grey.
+    Dialog {
+        id: colorPicker
+        modal: true
+        title: qsTr("Choose colour")
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Cancel
+        property string targetUuid: ""
+        property string targetLabel: ""
+        // Material 500-level swatches across the standard palette,
+        // plus a leading "default / no colour" sentinel that maps to
+        // 0 on the bridge side.
+        readonly property var swatches: [
+            { name: qsTr("Default"), argb: 0 },
+            { name: "Red",         argb: 0xffd32f2f },
+            { name: "Pink",        argb: 0xffe91e63 },
+            { name: "Purple",      argb: 0xff9c27b0 },
+            { name: "Deep Purple", argb: 0xff673ab7 },
+            { name: "Indigo",      argb: 0xff3f51b5 },
+            { name: "Blue",        argb: 0xff1976d2 },
+            { name: "Cyan",        argb: 0xff00bcd4 },
+            { name: "Teal",        argb: 0xff009688 },
+            { name: "Green",       argb: 0xff4caf50 },
+            { name: "Lime",        argb: 0xffcddc39 },
+            { name: "Yellow",      argb: 0xfffbc02d },
+            { name: "Orange",      argb: 0xfff57c00 },
+            { name: "Deep Orange", argb: 0xffe64a19 },
+            { name: "Brown",       argb: 0xff795548 },
+            { name: "Grey",        argb: 0xff757575 },
+            { name: "Blue Grey",   argb: 0xff607d8b }
+        ]
+
+        function openFor(label, uuid) {
+            colorPicker.targetLabel = label;
+            colorPicker.targetUuid = uuid;
+            open();
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 8
+            implicitWidth: 320
+            Label {
+                Layout.fillWidth: true
+                opacity: 0.7
+                wrapMode: Text.Wrap
+                text: colorPicker.targetLabel.length > 0
+                      ? qsTr("Colour for \"%1\".").arg(colorPicker.targetLabel)
+                      : qsTr("Choose a colour.")
+            }
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 6
+                rowSpacing: 6
+                columnSpacing: 6
+
+                Repeater {
+                    model: colorPicker.swatches
+                    delegate: Rectangle {
+                        required property var modelData
+                        Layout.preferredWidth: 36
+                        Layout.preferredHeight: 36
+                        radius: 18
+                        // Convert the i32 ARGB into a Qt color. 0 →
+                        // a transparent ring with an "x" so the user
+                        // can tell which swatch clears the colour.
+                        property int argb: modelData.argb | 0
+                        color: {
+                            if (argb === 0) { return "transparent"; }
+                            const a = ((argb >>> 24) & 0xff) / 255.0;
+                            const r = ((argb >>> 16) & 0xff) / 255.0;
+                            const g = ((argb >>>  8) & 0xff) / 255.0;
+                            const b = ( argb         & 0xff) / 255.0;
+                            return Qt.rgba(r, g, b, a);
+                        }
+                        border.width: argb === 0 ? 1 : 0
+                        border.color: Material.foreground
+                        Label {
+                            visible: parent.argb === 0
+                            anchors.centerIn: parent
+                            text: "✕"
+                            opacity: 0.6
+                        }
+                        ToolTip.visible: hover.hovered
+                        ToolTip.text: modelData.name
+                        HoverHandler { id: hover }
+                        TapHandler {
+                            onTapped: {
+                                if (!root.vm
+                                    || colorPicker.targetUuid.length === 0) {
+                                    return;
+                                }
+                                root.vm.updateListColor(
+                                    colorPicker.targetUuid,
+                                    parent.argb | 0);
+                                colorPicker.close();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Inline "New list" dialog reused by every account header's
     // right-click → New list... action. Lives at the pane root so
     // the per-row TapHandler can openFor() into it.
@@ -306,6 +411,7 @@ Pane {
                 // header indexes (the header IS that index's only
                 // visible content).
                 ItemDelegate {
+                    id: listRow
                     width: row.width
                     visible: !row._groupCollapsed && !row._isAccountHeader
                     implicitHeight: visible ? 28 : 0
@@ -318,6 +424,30 @@ Pane {
                     text: row.myLabel
                     highlighted: root.vm && root.vm.activeFilterId === row.myId
                     onClicked: if (root.vm) root.vm.selectFilter(row.myId)
+
+                    // Right-click opens a per-list menu — currently
+                    // just "Choose colour…" (icon support lands when
+                    // the icon-font work does). Only meaningful for
+                    // `caldav:` rows; built-ins / saved filters
+                    // don't surface the menu.
+                    TapHandler {
+                        enabled: row.myId.startsWith("caldav:")
+                        acceptedButtons: Qt.RightButton
+                        onTapped: listMenu.popup()
+                    }
+                    Menu {
+                        id: listMenu
+                        MenuItem {
+                            text: qsTr("Choose colour…")
+                            onTriggered: {
+                                colorPicker.openFor(
+                                    row.myLabel,
+                                    row.myId.startsWith("caldav:")
+                                        ? row.myId.slice("caldav:".length)
+                                        : "");
+                            }
+                        }
+                    }
                 }
             }
         }

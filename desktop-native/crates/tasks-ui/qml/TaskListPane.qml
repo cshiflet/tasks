@@ -200,15 +200,24 @@ Pane {
                                     ctx.reset();
                                     const w = width;
                                     const h = height;
-                                    // Inset has to clear the
-                                    // arrowhead's perpendicular
-                                    // flanks (head * 0.7 either
-                                    // side of the corner). With
-                                    // inset 2 and head 5 the top
-                                    // flank rendered at y = -1.5
-                                    // and the stroke chopped a
-                                    // pixel off the outside edge.
-                                    const inset = 5;
+                                    // The inset has to clear the
+                                    // arrowhead's perpendicular flanks
+                                    // (head * factor on each side of
+                                    // the corner). Earlier rev was
+                                    // inset 5 / head 5 / factor 0.7 —
+                                    // safe but the L-shape shrunk to
+                                    // an 8 × 8 footprint inside the
+                                    // 22 × 22 indicator and looked
+                                    // visibly smaller than the regular
+                                    // square checkbox sat alongside.
+                                    // Trim the inset to 2 + drop the
+                                    // arrowhead profile to head 4 /
+                                    // factor 0.5 so the outer L-square
+                                    // matches the regular box, and the
+                                    // arrowhead's top flank lands at
+                                    // y = 0 — flush with the canvas
+                                    // edge but no longer outside it.
+                                    const inset = 2;
                                     const x0 = inset;
                                     const y0 = inset;
                                     const x1 = w - inset;
@@ -239,24 +248,26 @@ Pane {
                                     ctx.lineTo(x0, y1);     // left along bottom
                                     ctx.stroke();
 
-                                    // Arrowheads. Filled triangles at
-                                    // each arrow's terminal corner;
-                                    // arrow 1 points right at top-right,
-                                    // arrow 2 points left at bottom-left.
-                                    // Slightly chunkier than the line
-                                    // weight so the heads read at a
-                                    // glance against the priority bg.
-                                    const head = 5;
+                                    // Arrowheads — filled triangles
+                                    // sized to the new inset budget.
+                                    // head 4 / factor 0.5 keeps the
+                                    // perpendicular flank at exactly
+                                    // y = 0 (no clipping) while the
+                                    // tip extends head*0.4 past the
+                                    // corner so the head still reads
+                                    // as separate from the line.
+                                    const head = 4;
+                                    const flank = head * 0.5;
                                     ctx.beginPath();
                                     ctx.moveTo(x1 + head * 0.4, y0);
-                                    ctx.lineTo(x1 - head, y0 - head * 0.7);
-                                    ctx.lineTo(x1 - head, y0 + head * 0.7);
+                                    ctx.lineTo(x1 - head, y0 - flank);
+                                    ctx.lineTo(x1 - head, y0 + flank);
                                     ctx.closePath();
                                     ctx.fill();
                                     ctx.beginPath();
                                     ctx.moveTo(x0 - head * 0.4, y1);
-                                    ctx.lineTo(x0 + head, y1 - head * 0.7);
-                                    ctx.lineTo(x0 + head, y1 + head * 0.7);
+                                    ctx.lineTo(x0 + head, y1 - flank);
+                                    ctx.lineTo(x0 + head, y1 + flank);
                                     ctx.closePath();
                                     ctx.fill();
 

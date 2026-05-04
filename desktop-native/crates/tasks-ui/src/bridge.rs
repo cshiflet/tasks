@@ -381,6 +381,14 @@ pub mod qobject {
             color: i32,
         );
 
+        /// Update the visual appearance of an existing list (colour
+        /// for now; icon will land alongside the icon-font work).
+        /// Writes `caldav_lists.cdl_color` directly and refreshes
+        /// the sidebar / active filter so the change paints
+        /// immediately in the chip strip + per-row checkbox tint.
+        #[qinvokable]
+        fn update_list_color(self: Pin<&mut TaskListViewModel>, cdl_uuid: QString, color: i32);
+
         /// H-4: free-text substring search across task title +
         /// notes. Empty input restores the currently-active filter.
         /// Called from the toolbar search field on every text edit.
@@ -1245,6 +1253,53 @@ impl qobject::TaskListViewModel {
                 self.as_mut().set_status(QString::from(&msg));
             }
         }
+    }
+
+    /// Repaint the per-list colour. Writes `caldav_lists.cdl_color`
+    /// via a transient RW connection then rebuilds the sidebar and
+    /// reloads the active filter so the new colour shows up
+    /// immediately in the per-row chip + the priority-checkbox
+    /// background that keys off it. `color` is i32 ARGB; 0 means
+    /// "no custom colour" (the chip falls back to neutral grey).
+    pub fn update_list_color(mut self: Pin<&mut Self>, cdl_uuid: QString, color: i32) {
+        let uuid = cdl_uuid.to_string();
+        if uuid.is_empty() {
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database first."));
+            return;
+        };
+        let res = open_rw_conn(&path).and_then(|conn| {
+            conn.execute(
+                "UPDATE caldav_lists SET cdl_color = ?1 WHERE cdl_uuid = ?2",
+                rusqlite::params![color, uuid],
+            )
+            .map(|_| ())
+        });
+        if let Err(e) = res {
+            self.as_mut()
+                .set_status(QString::from(&format!("DB write failed: {e}")));
+            return;
+        }
+        // Refresh sidebar so the new colour drives chip + checkbox
+        // backgrounds on the next paint.
+        if let Some(db) = &self.db {
+            let (labels, ids, kinds, groups) = build_sidebar(db);
+            self.as_mut()
+                .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
+            self.as_mut()
+                .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
+            let mut kl: QList<i32> = QList::default();
+            for k in &kinds {
+                kl.append(*k);
+            }
+            self.as_mut().set_sidebar_account_kinds(kl);
+            self.as_mut()
+                .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
+        }
+        self.as_mut().reload_active_filter();
     }
 
     /// Create a new calendar on the given account's server, then
