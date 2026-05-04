@@ -1,0 +1,20 @@
+# Radicale config used by docker-compose.test-servers.yml.
+#
+# Plain-text htpasswd auth so the test user just works without a
+# bind to a real auth backend. Localhost-only binding so the
+# bare credentials never leave the loopback interface.
+#
+# Default user: test / test (hash below was generated with
+# `htpasswd -B -c users test`; replace if you want a different
+# password — the format is bcrypt over `htpasswd -B`).
+
+[server]
+hosts = 0.0.0.0:5232, [::]:5232
+
+[auth]
+type = htpasswd
+htpasswd_filename = /config/users
+htpasswd_encryption = bcrypt
+
+[storage]
+filesystem_folder = /data/collections

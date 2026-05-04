@@ -1,0 +1,76 @@
+# Local test servers for the sync providers we care about today.
+# Brings up an Etebase (EteSync 2.0) server + a Radicale CalDAV
+# server on dedicated localhost ports. Both ship with seeded
+# default credentials so you can hit them straight from the
+# desktop client's Accounts pane without a setup dance.
+#
+# Run from this directory:
+#
+#     docker compose -f docker-compose.test-servers.yml up -d
+#
+# Tear down (and wipe persistent volumes):
+#
+#     docker compose -f docker-compose.test-servers.yml down -v
+#
+# Defaults, intentionally weak — never expose either container
+# to the public internet:
+#
+#   Etebase    http://127.0.0.1:8001
+#              superuser: admin / changeme
+#              create your test user via /admin or the SDK
+#   Radicale   http://127.0.0.1:5232
+#              user:     test / test
+#              calendar: http://127.0.0.1:5232/test/test-calendar/
+
+services:
+  etebase:
+    image: etesync/server:0.13.0
+    container_name: tasks-test-etebase
+    restart: unless-stopped
+    environment:
+      # SECRET_FILE is required by the entrypoint script. It seeds
+      # Django's SECRET_KEY; rotate or wipe the volume if you ever
+      # take this past local testing.
+      SUPER_USER: admin
+      DJANGO_SUPERUSER_PASSWORD: changeme
+      AUTO_REFRESH: "true"
+      # Bind to the container's external port directly; HTTPS is
+      # off because the desktop client points at http://127.0.0.1.
+      PORT: "8001"
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - etebase_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8001/api/v1/authentication/is_etebase/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  radicale:
+    image: tomsquest/docker-radicale:3.5.4.0
+    container_name: tasks-test-radicale
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, KILL]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 50
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--retry", "1", "--max-time", "3", "http://[::1]:5232/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "127.0.0.1:5232:5232"
+    volumes:
+      - radicale_data:/data
+      - ./radicale-config:/config:ro
+
+volumes:
+  etebase_data:
+  radicale_data:
