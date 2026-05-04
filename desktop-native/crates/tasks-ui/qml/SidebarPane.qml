@@ -30,19 +30,46 @@ Pane {
         sidebarList.forceActiveFocus();
     }
 
-    // Map a sidebar id prefix to its group key. Unknowns fall under
-    // "Other" so a future bridge extension surfaces explicitly.
-    function _groupOf(id) {
+    // Map a sidebar entry to its group key. Built-in / saved filters
+    // are decided by the id prefix; list rows (`caldav:*`) consult
+    // the parallel `sidebarAccountKinds` array to split LOCAL from
+    // real CalDAV from Google Tasks / Microsoft To Do / Etebase /
+    // etc. — every list lives in the `caldav_lists` table so the id
+    // prefix is uniform, but the visual grouping should match the
+    // account type the import / sync layer recorded.
+    function _groupOfIndex(idx) {
+        if (!root.vm) { return "other"; }
+        const id = root.vm.sidebarIds[idx];
         if (!id) { return "other"; }
         if (id.startsWith("__")) { return "filters_builtin"; }
-        if (id.startsWith("caldav:")) { return "caldav"; }
         if (id.startsWith("filter:")) { return "saved"; }
+        if (id.startsWith("caldav:")) {
+            const kinds = root.vm.sidebarAccountKinds;
+            const k = (kinds && idx < kinds.length) ? (kinds[idx] | 0) : 0;
+            // Mirrors `tasks_core::models::caldav::AccountType`.
+            switch (k) {
+                case 0:  return "caldav";        // CALDAV
+                case 2:  return "local";         // LOCAL
+                case 3:  return "opentasks";     // OPENTASKS
+                case 4:  return "tasksorg";      // TASKS_ORG
+                case 5:  return "etebase";       // ETEBASE
+                case 6:  return "mstodo";        // MICROSOFT
+                case 7:  return "gtasks";        // GOOGLE_TASKS
+                default: return "caldav";
+            }
+        }
         return "other";
     }
     function _groupLabel(group) {
         switch (group) {
             case "filters_builtin": return qsTr("Quick filters");
             case "caldav":          return qsTr("CalDAV lists");
+            case "local":           return qsTr("Local lists");
+            case "gtasks":          return qsTr("Google Tasks");
+            case "mstodo":          return qsTr("Microsoft To Do");
+            case "etebase":         return qsTr("Etebase");
+            case "tasksorg":        return qsTr("Tasks.org");
+            case "opentasks":       return qsTr("OpenTasks");
             case "saved":           return qsTr("Saved filters");
             default:                return qsTr("Other");
         }
@@ -83,13 +110,12 @@ Pane {
                 // Section header when the group switches (or for the
                 // very first row).
                 property string myGroup: root.vm
-                    ? root._groupOf(root.vm.sidebarIds[row.index])
+                    ? root._groupOfIndex(row.index)
                     : ""
                 property bool _isSectionStart: {
                     if (!root.vm) { return false; }
                     if (row.index === 0) { return true; }
-                    const prevId = root.vm.sidebarIds[row.index - 1];
-                    return root._groupOf(prevId) !== row.myGroup;
+                    return root._groupOfIndex(row.index - 1) !== row.myGroup;
                 }
                 property bool _groupCollapsed: root._isCollapsed(row.myGroup)
 

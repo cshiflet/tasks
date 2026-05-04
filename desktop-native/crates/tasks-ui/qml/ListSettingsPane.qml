@@ -25,6 +25,11 @@ ColumnLayout {
     Material.accent: Material.Blue
 
     required property QtObject vm
+    // Reference to the top-level ApplicationWindow whose
+    // `appearanceTheme` property drives Material.theme. Threaded in
+    // by SettingsWindow.qml. The Appearance row writes directly to
+    // it so the change takes effect on every paint.
+    required property var appWindow
 
     // Called by SettingsWindow.loadFromVm() right before show(), so
     // every re-open starts from the bridge's current preferences
@@ -44,6 +49,9 @@ ColumnLayout {
         showCompletedBox.checked = vm.prefShowCompleted;
         showHiddenBox.checked = vm.prefShowHidden;
         completedAtBottomBox.checked = vm.prefCompletedAtBottom;
+        if (appWindow) {
+            themeBox.currentIndex = appWindow.appearanceTheme | 0;
+        }
     }
 
     Component.onCompleted: loadFromVm()
@@ -80,6 +88,29 @@ ColumnLayout {
             id: directionBox
             Layout.fillWidth: true
             model: [qsTr("Ascending"), qsTr("Descending")]
+        }
+
+        // Appearance — drives Material.theme on the main window.
+        // Writes directly into `appWindow.appearanceTheme`; the
+        // binding on Main.qml's ApplicationWindow re-evaluates on
+        // every change so the switch is immediate.
+        Label {
+            text: qsTr("Appearance")
+            opacity: 0.7
+        }
+        CompactComboBox {
+            id: themeBox
+            Layout.fillWidth: true
+            model: [
+                qsTr("Follow system"),
+                qsTr("Light"),
+                qsTr("Dark"),
+            ]
+            onActivated: {
+                if (pane.appWindow) {
+                    pane.appWindow.appearanceTheme = currentIndex;
+                }
+            }
         }
     }
 

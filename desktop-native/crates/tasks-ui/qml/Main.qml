@@ -25,9 +25,20 @@ ApplicationWindow {
            ? qsTr("Tasks — %1").arg(viewModel.dbPathDisplay)
            : qsTr("Tasks")
 
-    // Auto-follow OS light/dark mode. When the user flips their system
-    // theme, Qt updates Material.theme to match on the next paint.
-    Material.theme: Material.System
+    // Theme override exposed to Settings → List → "Appearance". Three
+    // states map to Material's enum:
+    //   0 = follow OS (Material.System)  — default
+    //   1 = light                          (Material.Light)
+    //   2 = dark                           (Material.Dark)
+    // Session-local for now; QSettings persistence lands with the
+    // wider preferences pass tracked in PLAN_UPDATES §8.
+    property int appearanceTheme: 0
+
+    Material.theme: appearanceTheme === 1
+                    ? Material.Light
+                    : appearanceTheme === 2
+                        ? Material.Dark
+                        : Material.System
     Material.accent: Material.Blue
 
     TaskListViewModel {
@@ -373,12 +384,36 @@ ApplicationWindow {
                         : searchField.Material.foreground
                     opacity: searchField.activeFocus ? 1.0 : 0.45
                 }
-                Label {
-                    text: "\u{1F50D}"  // magnifier
+                // Painted magnifier — same approach the sidebar
+                // chevrons use (see SidebarPane.qml). The U+1F50D 🔍
+                // emoji needed a colour-emoji font that Linux hosts
+                // don't ship by default, leaving this slot rendering
+                // as an empty box. A circle + handle drawn via
+                // Canvas works on every OS without extra fonts.
+                Canvas {
+                    id: magnifier
+                    width: 14
+                    height: 14
                     anchors.left: parent.left
                     anchors.leftMargin: 10
                     anchors.verticalCenter: parent.verticalCenter
                     opacity: 0.55
+                    onPaint: {
+                        const ctx = getContext("2d");
+                        ctx.reset();
+                        ctx.lineWidth = 1.6;
+                        ctx.lineCap = "round";
+                        ctx.strokeStyle = searchField.Material.foreground;
+                        // Glass — circle in the upper-left.
+                        ctx.beginPath();
+                        ctx.arc(5.5, 5.5, 4, 0, 2 * Math.PI);
+                        ctx.stroke();
+                        // Handle — diagonal toward the lower-right.
+                        ctx.beginPath();
+                        ctx.moveTo(8.5, 8.5);
+                        ctx.lineTo(12.5, 12.5);
+                        ctx.stroke();
+                    }
                 }
             }
 
@@ -390,13 +425,49 @@ ApplicationWindow {
             // `display: IconOnly` which strips text rendering, so
             // the buttons rendered as transparent click targets.
             ToolButton {
+                id: importButton
                 action: importBackupAction
                 Layout.preferredWidth: 36
                 Layout.preferredHeight: 36
-                text: "\u{1F4E5}"             // 📥 inbox tray
-                font.pointSize: Qt.application.font.pointSize + 2
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Import a Tasks.org JSON backup")
+                // Painted inbox-tray icon — same Canvas approach
+                // the magnifier uses. The U+1F4E5 📥 emoji depends
+                // on a colour-emoji font Linux hosts don't ship by
+                // default, so the original glyph rendered as an
+                // empty box. Drawing it ourselves dodges the font
+                // dependency entirely.
+                contentItem: Canvas {
+                    id: importIcon
+                    implicitWidth: 18
+                    implicitHeight: 18
+                    onPaint: {
+                        const ctx = getContext("2d");
+                        ctx.reset();
+                        ctx.lineWidth = 1.6;
+                        ctx.lineCap = "round";
+                        ctx.lineJoin = "round";
+                        ctx.strokeStyle = importButton.Material.foreground;
+                        // Down-arrow, top half.
+                        ctx.beginPath();
+                        ctx.moveTo(9, 1);
+                        ctx.lineTo(9, 11);
+                        ctx.stroke();
+                        // Arrowhead.
+                        ctx.beginPath();
+                        ctx.moveTo(5, 7);
+                        ctx.lineTo(9, 11);
+                        ctx.lineTo(13, 7);
+                        ctx.stroke();
+                        // Tray — open box across the bottom.
+                        ctx.beginPath();
+                        ctx.moveTo(2, 12);
+                        ctx.lineTo(2, 16);
+                        ctx.lineTo(16, 16);
+                        ctx.lineTo(16, 12);
+                        ctx.stroke();
+                    }
+                }
             }
             ToolButton {
                 action: openSettingsAction
@@ -417,6 +488,7 @@ ApplicationWindow {
     SettingsWindow {
         id: settingsWindow
         vm: viewModel
+        appWindow: root
     }
 
     footer: ToolBar {

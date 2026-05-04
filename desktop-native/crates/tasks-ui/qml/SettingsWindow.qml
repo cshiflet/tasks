@@ -32,6 +32,11 @@ ApplicationWindow {
     Material.accent: Material.Blue
 
     required property QtObject vm
+    // Reference to the main ApplicationWindow so the List tab can
+    // toggle `appearanceTheme`. The List tab reads / writes it
+    // directly; we don't proxy through a property on this window
+    // because that would introduce two sources of truth.
+    required property var appWindow
 
     // Called by Main.qml before show() so the List tab's current
     // controls reflect the live preferences.
@@ -67,6 +72,7 @@ ApplicationWindow {
             ListSettingsPane {
                 id: listPane
                 vm: settingsWindow.vm
+                appWindow: settingsWindow.appWindow
             }
 
             AccountsPane {

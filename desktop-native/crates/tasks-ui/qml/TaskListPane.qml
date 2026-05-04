@@ -122,6 +122,8 @@ Pane {
                         id: completeBox
                         padding: 0
                         checked: root.vm && root.vm.completedFlags[index]
+                        property bool recurring: root.vm
+                            && root.vm.recurringFlags[index]
                         property color priorityColor: {
                             const p = root.vm ? root.vm.priorities[index] : 3;
                             switch (p) {
@@ -131,25 +133,104 @@ Pane {
                                 default: return "#9e9e9e";
                             }
                         }
-                        indicator: Rectangle {
+                        indicator: Item {
                             implicitWidth: 18
                             implicitHeight: 18
                             x: completeBox.leftPadding
                             y: parent.height / 2 - height / 2
-                            radius: 3
-                            border.color: completeBox.priorityColor
-                            border.width: 2
-                            color: completeBox.checked
-                                   ? completeBox.priorityColor
-                                   : "transparent"
-                            // Checkmark on the filled state.
-                            Label {
-                                anchors.centerIn: parent
-                                text: "\u{2713}"           // ✓
-                                color: "white"
-                                font.bold: true
-                                font.pointSize: 11
-                                visible: completeBox.checked
+
+                            // Square checkbox for non-recurring tasks.
+                            // Border + fill follow the priority colour
+                            // so unchecked rows still hint at priority.
+                            Rectangle {
+                                visible: !completeBox.recurring
+                                anchors.fill: parent
+                                radius: 3
+                                border.color: completeBox.priorityColor
+                                border.width: 2
+                                color: completeBox.checked
+                                       ? completeBox.priorityColor
+                                       : "transparent"
+                                Label {
+                                    anchors.centerIn: parent
+                                    text: "\u{2713}"           // ✓
+                                    color: "white"
+                                    font.bold: true
+                                    font.pointSize: 11
+                                    visible: completeBox.checked
+                                }
+                            }
+
+                            // Round arrows-loop indicator for recurring
+                            // tasks — two ¾-arc segments with arrowheads
+                            // forming a circle, matching the Android
+                            // client's row design. Drawn via Canvas so
+                            // we don't depend on an icon font; circle
+                            // and arrowheads use the priority colour.
+                            Canvas {
+                                id: recurIcon
+                                visible: completeBox.recurring
+                                anchors.fill: parent
+                                antialiasing: true
+                                onPaint: {
+                                    const ctx = getContext("2d");
+                                    ctx.reset();
+                                    const cx = width / 2;
+                                    const cy = height / 2;
+                                    const r = Math.min(width, height) / 2 - 2;
+                                    ctx.lineWidth = 2;
+                                    ctx.lineCap = "round";
+                                    ctx.lineJoin = "round";
+                                    ctx.strokeStyle = completeBox.priorityColor;
+                                    ctx.fillStyle = completeBox.priorityColor;
+
+                                    // Two ~150° arcs leaving small
+                                    // gaps at the right and left for
+                                    // the arrowheads.
+                                    ctx.beginPath();
+                                    ctx.arc(cx, cy, r, -Math.PI * 0.4, Math.PI * 0.4);
+                                    ctx.stroke();
+                                    ctx.beginPath();
+                                    ctx.arc(cx, cy, r, Math.PI * 0.6, Math.PI * 1.4);
+                                    ctx.stroke();
+
+                                    // Arrowhead at the right gap,
+                                    // pointing down.
+                                    const headLen = 3.5;
+                                    const xR = cx + r * Math.cos(Math.PI * 0.4);
+                                    const yR = cy + r * Math.sin(Math.PI * 0.4);
+                                    ctx.beginPath();
+                                    ctx.moveTo(xR, yR);
+                                    ctx.lineTo(xR - headLen, yR - headLen * 0.6);
+                                    ctx.lineTo(xR + headLen * 0.4, yR - headLen);
+                                    ctx.closePath();
+                                    ctx.fill();
+
+                                    // Arrowhead at the left gap,
+                                    // pointing up.
+                                    const xL = cx + r * Math.cos(Math.PI * 1.4);
+                                    const yL = cy + r * Math.sin(Math.PI * 1.4);
+                                    ctx.beginPath();
+                                    ctx.moveTo(xL, yL);
+                                    ctx.lineTo(xL + headLen, yL + headLen * 0.6);
+                                    ctx.lineTo(xL - headLen * 0.4, yL + headLen);
+                                    ctx.closePath();
+                                    ctx.fill();
+
+                                    // When checked, paint a centre
+                                    // dot so the "completed" state is
+                                    // still legible.
+                                    if (completeBox.checked) {
+                                        ctx.beginPath();
+                                        ctx.arc(cx, cy, 2.5, 0, 2 * Math.PI);
+                                        ctx.fill();
+                                    }
+                                }
+                                Connections {
+                                    target: completeBox
+                                    function onCheckedChanged() { recurIcon.requestPaint(); }
+                                    function onPriorityColorChanged() { recurIcon.requestPaint(); }
+                                }
                             }
                         }
                         nextCheckState: function() {

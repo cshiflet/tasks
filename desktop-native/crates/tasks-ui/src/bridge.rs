@@ -48,6 +48,12 @@ pub mod qobject {
         #[qproperty(QList_i64, task_ids)]
         #[qproperty(QList_i32, indents)]
         #[qproperty(QList_bool, completed_flags)]
+        // Whether each row is recurring (`tasks.recurrence` non-empty).
+        // The list pane swaps the priority-coloured checkbox for a
+        // round arrows-loop indicator when this flag is true so the
+        // user can spot recurring tasks at a glance, matching the
+        // Android client's row design.
+        #[qproperty(QList_bool, recurring_flags)]
         #[qproperty(QStringList, due_labels)]
         #[qproperty(QList_i32, priorities)]
         // H-7: per-row metadata so list rows can render at parity
@@ -159,6 +165,15 @@ pub mod qobject {
         //   "filter:<id>"                            (custom saved filter)
         #[qproperty(QStringList, sidebar_labels)]
         #[qproperty(QStringList, sidebar_ids)]
+        // Parallel to `sidebar_ids`. -1 for built-in filters and
+        // saved filters; for `caldav:<uuid>` rows it carries the
+        // owning `caldav_accounts.cda_account_type` so the QML can
+        // group LOCAL (2) lists separately from real CalDAV (0)
+        // lists, and similarly distinguish Google Tasks / Microsoft
+        // To Do / Etebase / Tasks.org / OpenTasks accounts. The id
+        // prefix stays uniform because every row lives in
+        // `caldav_lists`; the kind is purely a display concern.
+        #[qproperty(QList_i32, sidebar_account_kinds)]
         #[qproperty(QString, active_filter_id)]
         // Configured sync accounts, parallel arrays for the Settings
         // → Accounts pane. `account_kinds` is the integer tag
@@ -372,6 +387,7 @@ pub struct TaskListViewModelRust {
     task_ids: QList<i64>,
     indents: QList<i32>,
     completed_flags: QList<bool>,
+    recurring_flags: QList<bool>,
     due_labels: QStringList,
     priorities: QList<i32>,
     task_tag_summaries: QStringList,
@@ -418,6 +434,7 @@ pub struct TaskListViewModelRust {
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
+    sidebar_account_kinds: QList<i32>,
     active_filter_id: QString,
     // H-4: free-text substring search across title + notes. When
     // non-empty, `reload_active_filter` runs `run_search` instead
@@ -465,6 +482,7 @@ impl Default for TaskListViewModelRust {
             task_ids: QList::default(),
             indents: QList::default(),
             completed_flags: QList::default(),
+            recurring_flags: QList::default(),
             due_labels: QStringList::default(),
             priorities: QList::default(),
             task_tag_summaries: QStringList::default(),
@@ -515,6 +533,7 @@ impl Default for TaskListViewModelRust {
             pref_completed_at_bottom: false,
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
+            sidebar_account_kinds: QList::default(),
             active_filter_id: QString::from(FILTER_ALL),
             search_query: String::new(),
             account_labels: QStringList::default(),
@@ -1201,6 +1220,7 @@ impl qobject::TaskListViewModel {
         self.as_mut().set_task_ids(QList::default());
         self.as_mut().set_indents(QList::default());
         self.as_mut().set_completed_flags(QList::default());
+        self.as_mut().set_recurring_flags(QList::default());
         self.as_mut().set_due_labels(QStringList::default());
         self.as_mut().set_priorities(QList::default());
         self.as_mut().set_task_tag_summaries(QStringList::default());
@@ -1235,6 +1255,7 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     let mut task_ids: QList<i64> = QList::default();
     let mut indents: QList<i32> = QList::default();
     let mut completed_flags: QList<bool> = QList::default();
+    let mut recurring_flags: QList<bool> = QList::default();
     let mut priorities: QList<i32> = QList::default();
 
     // `append(&QString)` on QStringList isn't exposed as a public helper;
@@ -1259,6 +1280,12 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
         indent_by_id.insert(t.id, indent);
         indents.append(indent);
         completed_flags.append(t.is_completed());
+        recurring_flags.append(
+            t.recurrence
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false),
+        );
         due_list.append(QString::from(&format_due_label(t.due_date)));
         priorities.append(t.priority);
     }
@@ -1334,6 +1361,7 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     vm.as_mut().set_task_ids(task_ids);
     vm.as_mut().set_indents(indents);
     vm.as_mut().set_completed_flags(completed_flags);
+    vm.as_mut().set_recurring_flags(recurring_flags);
     vm.as_mut().set_due_labels(due_labels);
     vm.as_mut().set_priorities(priorities);
     vm.as_mut().set_task_tag_summaries(tag_summaries);
@@ -1495,11 +1523,18 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
 
     match result {
         Ok(db) => {
-            let (labels, ids) = build_sidebar(&db);
+            let (labels, ids, kinds) = build_sidebar(&db);
             vm.as_mut()
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
             vm.as_mut()
                 .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
+            {
+                let mut kl: QList<i32> = QList::default();
+                for k in &kinds {
+                    kl.append(*k);
+                }
+                vm.as_mut().set_sidebar_account_kinds(kl);
+            }
             // Edit dialog's CalDAV list picker uses the calendars
             // directly (no built-in filters prepended, no
             // "caldav:" prefix on the UUID).
@@ -1764,7 +1799,7 @@ fn current_caldav_meta_for(db: &Database, task_id: i64) -> (String, i32) {
     }
 }
 
-fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
+fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
     let mut labels = vec![
         "All active".to_string(),
         "Today".to_string(),
@@ -1775,19 +1810,37 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
         FILTER_TODAY.to_string(),
         FILTER_RECENT.to_string(),
     ];
+    // Parallel array — built-in filters and saved filters get -1.
+    // For caldav_lists rows we record `cda_account_type` so the
+    // QML side can put local-only lists ("Local lists"), Google
+    // Tasks ("Google Tasks"), Microsoft To Do ("Microsoft To Do"),
+    // Etebase ("Etebase"), etc. under their own headings instead
+    // of lumping them all under "CalDAV lists". The id prefix
+    // stays `caldav:<uuid>` because every list lives in the same
+    // `caldav_lists` table and `run_by_filter_id` only needs the
+    // uuid — the kind is purely a display concern.
+    let mut kinds: Vec<i32> = vec![-1, -1, -1];
 
-    match db
-        .connection()
-        .prepare("SELECT * FROM caldav_lists ORDER BY cdl_order, cdl_name")
-    {
-        Ok(mut stmt) => match stmt.query_map([], CaldavCalendar::from_row) {
+    // Pull cda_account_type alongside the list rows in one query so
+    // we don't N+1 against the accounts table.
+    let sql = "SELECT caldav_lists.*, \
+                      COALESCE(caldav_accounts.cda_account_type, 0) AS cda_account_type \
+               FROM caldav_lists \
+               LEFT JOIN caldav_accounts \
+                    ON caldav_lists.cdl_account = caldav_accounts.cda_uuid \
+               ORDER BY cda_account_type, cdl_order, cdl_name";
+    match db.connection().prepare(sql) {
+        Ok(mut stmt) => match stmt.query_map([], |r| {
+            Ok((CaldavCalendar::from_row(r)?, r.get::<_, i32>("cda_account_type")?))
+        }) {
             Ok(rows) => {
                 for row in rows {
                     match row {
-                        Ok(cal) => {
+                        Ok((cal, account_type)) => {
                             if let (Some(name), Some(uuid)) = (cal.name, cal.uuid) {
                                 labels.push(name);
                                 ids.push(format!("caldav:{uuid}"));
+                                kinds.push(account_type);
                             }
                         }
                         Err(e) => tracing::warn!("caldav_lists row decode failed: {e}"),
@@ -1811,6 +1864,7 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
                             if let Some(title) = f.title {
                                 labels.push(title);
                                 ids.push(format!("filter:{}", f.id));
+                                kinds.push(-1);
                             }
                         }
                         Err(e) => tracing::warn!("filters row decode failed: {e}"),
@@ -1822,7 +1876,7 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>) {
         Err(e) => tracing::warn!("filters prepare failed: {e}"),
     }
 
-    (labels, ids)
+    (labels, ids, kinds)
 }
 
 fn string_list_from_iter<'a>(iter: impl Iterator<Item = &'a str>) -> QStringList {
