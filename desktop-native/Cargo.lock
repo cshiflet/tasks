@@ -2038,12 +2038,16 @@ dependencies = [
  "cxx-qt-build",
  "cxx-qt-lib",
  "dirs",
+ "rusqlite",
  "secrecy",
  "serde",
  "serde_json",
  "tasks-core",
+ "tasks-sync",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

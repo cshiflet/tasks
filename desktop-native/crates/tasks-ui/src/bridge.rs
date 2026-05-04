@@ -191,6 +191,15 @@ pub mod qobject {
         #[qproperty(QList_i32, account_kinds)]
         #[qproperty(QStringList, account_servers)]
         #[qproperty(QStringList, account_usernames)]
+        // `caldav_accounts.cda_uuid` per row, parallel to the
+        // other account_* arrays. QML hands a uuid to
+        // `sync_account` to point the engine at the right row.
+        #[qproperty(QStringList, account_uuids)]
+        // Per-account user-facing sync state ("idle", "syncing…",
+        // "Synced 5s ago", "Sync failed: …"). Updated synchronously
+        // around each `sync_account` invokable; the QML row binds
+        // its trailing label to the matching index.
+        #[qproperty(QStringList, account_sync_states)]
         // H-6: id of the last task soft-deleted in this session,
         // valid until the toast countdown expires or the user
         // restores it. 0 = nothing to undo. The toast Popup
@@ -308,6 +317,14 @@ pub mod qobject {
         #[qinvokable]
         fn remove_account(self: Pin<&mut TaskListViewModel>, index: i32);
 
+        /// Drive a one-shot pull-then-push cycle against the account
+        /// identified by `cda_uuid`. Blocks the QML thread for the
+        /// duration of the call (acceptable for a manual button press
+        /// against a local test server; a future change moves the
+        /// dispatch onto a worker thread + signal).
+        #[qinvokable]
+        fn sync_account(self: Pin<&mut TaskListViewModel>, cda_uuid: QString);
+
         /// H-4: free-text substring search across task title +
         /// notes. Empty input restores the currently-active filter.
         /// Called from the toolbar search field on every text edit.
@@ -357,6 +374,8 @@ use tasks_core::query::{
 };
 use tasks_core::recurrence::humanize_rrule;
 use tasks_core::watch::DatabaseWatcher;
+use tasks_sync::providers::{caldav::CalDavProvider, etesync::EteSyncProvider};
+use tasks_sync::{AccountCredentials, Provider, SyncEngine};
 
 /// Provider kind tags that match `tasks_sync::ProviderKind` in
 /// numeric order. Kept as bare integers at the bridge boundary so
@@ -383,6 +402,11 @@ const KIND_ETESYNC: i32 = 3;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct StoredAccount {
+    /// `caldav_accounts.cda_uuid` of the row this StoredAccount
+    /// represents. Generated when the account is added via the
+    /// Accounts pane (uuid::Uuid::new_v4); QML passes it back into
+    /// `sync_account` to identify the row to refresh.
+    uuid: String,
     kind: i32,
     label: String,
     server: String,
@@ -458,9 +482,17 @@ pub struct TaskListViewModelRust {
     account_kinds: QList<i32>,
     account_servers: QStringList,
     account_usernames: QStringList,
+    account_uuids: QStringList,
+    account_sync_states: QStringList,
     // Non-Qt account storage: keeps the password alongside the
     // user-facing fields without exposing it to QML. Session-local.
     accounts: Vec<StoredAccount>,
+    /// Parallel to `accounts` — current sync state string for each
+    /// row, mirrored into the `account_sync_states` Q_PROPERTY.
+    /// Lives on the Rust side so we can patch a single index
+    /// without round-tripping through QStringList (cxx-qt 0.7
+    /// doesn't expose an index setter on QStringList).
+    account_states: Vec<String>,
     // H-6: last-deleted-task pinning for the undo flow. The id
     // crosses FFI as a Q_PROPERTY (so QML can show / hide the
     // Undo button); the title stays Rust-side because nothing in
@@ -483,6 +515,11 @@ pub struct TaskListViewModelRust {
     /// with the spawned thread via `Arc`. `None` when no watcher is
     /// currently active.
     watcher_stop: Option<Arc<AtomicBool>>,
+    /// Multi-threaded tokio runtime hosting `tasks-sync` calls.
+    /// Built lazily on first sync_account invocation; one Runtime
+    /// instance is shared across every Sync now click for the
+    /// lifetime of the view model.
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Default for TaskListViewModelRust {
@@ -556,7 +593,10 @@ impl Default for TaskListViewModelRust {
             account_kinds: QList::default(),
             account_servers: QStringList::default(),
             account_usernames: QStringList::default(),
+            account_uuids: QStringList::default(),
+            account_sync_states: QStringList::default(),
             accounts: Vec::new(),
+            account_states: Vec::new(),
             last_deleted_id: 0,
             last_deleted_title: String::new(),
             status: QString::default(),
@@ -573,6 +613,7 @@ impl Default for TaskListViewModelRust {
                 ..QueryPreferences::default()
             },
             watcher_stop: None,
+            runtime: None,
         }
     }
 }
@@ -742,13 +783,56 @@ impl qobject::TaskListViewModel {
             ));
             return;
         }
-        self.as_mut().rust_mut().accounts.push(StoredAccount {
-            kind,
-            label: label_s,
-            server: server_s,
-            username: username_s,
-            password: SecretString::from(password_s),
-        });
+        let uuid = uuid::Uuid::new_v4().to_string();
+
+        // Persist into `caldav_accounts` so the bridge's sync path
+        // (and future restarts) can find this row by uuid. This is
+        // a session-local DB write; the password lands in plaintext
+        // for now, mirroring how the JSON import stores it. OS-
+        // keychain integration is tracked in PLAN_UPDATES §11.
+        let cda_account_type = match kind {
+            KIND_CALDAV => 0,  // tasks_core::AccountType::CALDAV
+            KIND_ETESYNC => 5, // tasks_core::AccountType::ETEBASE
+            _ => unreachable!("kind validated above"),
+        };
+        if let Some(db) = &self.db {
+            let res = db.connection().execute(
+                "INSERT OR REPLACE INTO caldav_accounts \
+                 (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+                  cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, -1, 0)",
+                rusqlite::params![
+                    uuid,
+                    label_s,
+                    server_s,
+                    username_s,
+                    password_s,
+                    cda_account_type,
+                ],
+            );
+            if let Err(e) = res {
+                self.as_mut()
+                    .set_status(QString::from(&format!("DB write failed: {e}")));
+                return;
+            }
+        } else {
+            self.as_mut()
+                .set_status(QString::from("Open a database before adding an account."));
+            return;
+        }
+
+        {
+            let mut inner = self.as_mut().rust_mut();
+            inner.accounts.push(StoredAccount {
+                uuid,
+                kind,
+                label: label_s,
+                server: server_s,
+                username: username_s,
+                password: SecretString::from(password_s),
+            });
+            inner.account_states.push(String::from("Idle"));
+        }
         publish_accounts(self.as_mut());
         self.as_mut()
             .set_status(QString::from("Account saved (session-local)."));
@@ -769,16 +853,181 @@ impl qobject::TaskListViewModel {
         self.as_mut().reload_active_filter();
     }
 
-    /// Drop the account at `index`. No-op on out-of-range.
+    /// Drop the account at `index`. Also removes the corresponding
+    /// `caldav_accounts` row plus any `caldav_lists` / `caldav_tasks`
+    /// hanging off it via the FK chain so the sidebar's lists for
+    /// the deleted account disappear on the next reload.
     pub fn remove_account(mut self: Pin<&mut Self>, index: i32) {
         let idx = index as usize;
         if index < 0 || idx >= self.accounts.len() {
             return;
         }
         let removed = self.as_mut().rust_mut().accounts.remove(idx);
+        if idx < self.account_states.len() {
+            self.as_mut().rust_mut().account_states.remove(idx);
+        }
+        if let Some(db) = &self.db {
+            let conn = db.connection();
+            // Tear down child rows first so a missing FK CASCADE
+            // doesn't leave orphans in the lists / tasks tables.
+            let _ = conn.execute(
+                "DELETE FROM caldav_tasks WHERE cd_calendar IN \
+                 (SELECT cdl_uuid FROM caldav_lists WHERE cdl_account = ?1)",
+                rusqlite::params![removed.uuid],
+            );
+            let _ = conn.execute(
+                "DELETE FROM caldav_lists WHERE cdl_account = ?1",
+                rusqlite::params![removed.uuid],
+            );
+            let _ = conn.execute(
+                "DELETE FROM caldav_accounts WHERE cda_uuid = ?1",
+                rusqlite::params![removed.uuid],
+            );
+        }
         publish_accounts(self.as_mut());
+        // Refresh sidebar so the removed account's lists disappear.
+        if let Some(db) = &self.db {
+            let (labels, ids, kinds) = build_sidebar(db);
+            self.as_mut()
+                .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
+            self.as_mut()
+                .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
+            let mut kl: QList<i32> = QList::default();
+            for k in &kinds {
+                kl.append(*k);
+            }
+            self.as_mut().set_sidebar_account_kinds(kl);
+        }
+        self.as_mut().reload_active_filter();
         self.as_mut()
             .set_status(QString::from(&format!("Removed \"{}\".", removed.label)));
+    }
+
+    /// Run a single sync cycle (pull + push) against the account
+    /// keyed by `cda_uuid`. Synchronous wrt. the QML caller — the
+    /// app freezes until the cycle finishes. Acceptable for a
+    /// manual Sync now button against a local test server; the
+    /// proper background-thread + signal version comes later.
+    ///
+    /// On success: rebuilds the sidebar so newly-pulled calendars
+    /// appear, and reloads the active filter so any newly-pulled
+    /// tasks show up in the list pane.
+    pub fn sync_account(mut self: Pin<&mut Self>, cda_uuid: QString) {
+        let uuid = cda_uuid.to_string();
+        let Some(stored) = self.accounts.iter().find(|a| a.uuid == uuid).cloned() else {
+            self.as_mut()
+                .set_status(QString::from(&format!("No account with uuid {uuid}")));
+            return;
+        };
+        let Some(db_path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database before syncing."));
+            return;
+        };
+
+        // Build (or reuse) the tokio runtime. Construction can fail
+        // if the OS refuses thread spawn — surface that on the
+        // status bar rather than panicking.
+        if self.runtime.is_none() {
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("tasks-sync")
+                .build()
+            {
+                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
+                Err(e) => {
+                    self.as_mut()
+                        .set_status(QString::from(&format!("Couldn't start sync runtime: {e}")));
+                    return;
+                }
+            }
+        }
+
+        // Update the per-row state to "Syncing…" before the blocking
+        // call so the user sees feedback even though the UI thread
+        // freezes for the duration.
+        set_account_state(self.as_mut(), &uuid, "Syncing…");
+        self.as_mut()
+            .set_status(QString::from(&format!("Syncing {}…", stored.label)));
+
+        // Build the right Provider for the account kind. CalDAV /
+        // EteSync are password-based; OAuth providers
+        // (Google / Microsoft) live behind a sign-in flow that
+        // hasn't been wired yet, so refuse those here.
+        let creds = AccountCredentials::new_password(
+            &stored.server,
+            &stored.username,
+            // The SecretString deref via expose_secret() is the
+            // narrow path agreed in provider.rs's docstring.
+            secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+        );
+        let label = stored.label.clone();
+        let provider: Box<dyn Provider> = match stored.kind {
+            KIND_CALDAV => Box::new(CalDavProvider::new(creds, label.clone())),
+            KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, label.clone())),
+            _ => {
+                self.as_mut().set_status(QString::from(
+                    "OAuth providers (Google / Microsoft) need the sign-in flow to land first.",
+                ));
+                set_account_state(self.as_mut(), &uuid, "Idle");
+                return;
+            }
+        };
+
+        // SyncEngine borrows the db path; the ref needs to outlive
+        // the future, so the PathBuf binding above keeps it alive.
+        let result = self
+            .as_mut()
+            .rust_mut()
+            .runtime
+            .as_ref()
+            .expect("runtime constructed above")
+            .block_on(async move {
+                let mut engine = SyncEngine::new(&db_path, provider);
+                engine.sync_now().await
+            });
+
+        match result {
+            Ok(outcome) => {
+                let summary = format!(
+                    "Synced {}: {} pulled, {} pushed",
+                    stored.label, outcome.tasks_pulled, outcome.tasks_pushed
+                );
+                set_account_state(
+                    self.as_mut(),
+                    &uuid,
+                    &format!(
+                        "Synced ({}↓ / {}↑)",
+                        outcome.tasks_pulled, outcome.tasks_pushed
+                    ),
+                );
+                self.as_mut().set_status(QString::from(&summary));
+
+                // Refresh sidebar + active filter so newly-pulled
+                // calendars + tasks land in the UI without forcing
+                // the user to reopen the DB.
+                if let Some(db) = &self.db {
+                    let (labels, ids, kinds) = build_sidebar(db);
+                    let labels_qsl = string_list_from_iter(labels.iter().map(String::as_str));
+                    let ids_qsl = string_list_from_iter(ids.iter().map(String::as_str));
+                    let mut kl: QList<i32> = QList::default();
+                    for k in &kinds {
+                        kl.append(*k);
+                    }
+                    self.as_mut().set_sidebar_labels(labels_qsl);
+                    self.as_mut().set_sidebar_ids(ids_qsl);
+                    self.as_mut().set_sidebar_account_kinds(kl);
+                }
+                self.as_mut().reload_active_filter();
+            }
+            Err(e) => {
+                let msg = format!("Sync of {} failed: {e}", stored.label);
+                tracing::warn!("{msg}");
+                set_account_state(self.as_mut(), &uuid, &format!("Failed: {e}"));
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
     }
 
     /// Create a new task in the open DB with `title`. If the user
@@ -1262,24 +1511,54 @@ impl qobject::TaskListViewModel {
     }
 }
 
-/// Rebuild the four Q_PROPERTY arrays the Accounts pane binds to
-/// from `self.accounts`. Called after every add/remove.
+/// Rebuild every Q_PROPERTY array the Accounts pane binds to
+/// from `self.accounts` + `self.account_states`. Called after
+/// every add/remove and after each sync_account so the pane
+/// reflects the current sync state per row.
 fn publish_accounts(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     let snapshot: Vec<StoredAccount> = vm.accounts.clone();
+    let states_snapshot: Vec<String> = vm.account_states.clone();
     let mut kinds: QList<i32> = QList::default();
     let mut labels: QList<QString> = QList::default();
     let mut servers: QList<QString> = QList::default();
     let mut users: QList<QString> = QList::default();
-    for a in &snapshot {
+    let mut uuids: QList<QString> = QList::default();
+    let mut states: QList<QString> = QList::default();
+    for (i, a) in snapshot.iter().enumerate() {
         kinds.append(a.kind);
         labels.append(QString::from(&a.label));
         servers.append(QString::from(&a.server));
         users.append(QString::from(&a.username));
+        uuids.append(QString::from(&a.uuid));
+        let state = states_snapshot.get(i).map(String::as_str).unwrap_or("Idle");
+        states.append(QString::from(state));
     }
     vm.as_mut().set_account_kinds(kinds);
     vm.as_mut().set_account_labels(QStringList::from(&labels));
     vm.as_mut().set_account_servers(QStringList::from(&servers));
     vm.as_mut().set_account_usernames(QStringList::from(&users));
+    vm.as_mut().set_account_uuids(QStringList::from(&uuids));
+    vm.as_mut()
+        .set_account_sync_states(QStringList::from(&states));
+}
+
+/// Update the per-account sync state for the row whose `cda_uuid`
+/// matches `uuid`, then republish the parallel arrays. No-op if
+/// the uuid isn't currently in the in-memory accounts list
+/// (race with `remove_account`).
+fn set_account_state(mut vm: Pin<&mut qobject::TaskListViewModel>, uuid: &str, state: &str) {
+    let Some(idx) = vm.accounts.iter().position(|a| a.uuid == uuid) else {
+        return;
+    };
+    {
+        let mut inner = vm.as_mut().rust_mut();
+        // Pad in case account_states fell behind accounts.len().
+        while inner.account_states.len() <= idx {
+            inner.account_states.push(String::from("Idle"));
+        }
+        inner.account_states[idx] = state.to_string();
+    }
+    publish_accounts(vm);
 }
 
 fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>) {
@@ -1598,6 +1877,22 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             ));
             vm.as_mut()
                 .set_place_uids(string_list_from_iter(place_uids.iter().map(String::as_str)));
+
+            // Pull existing caldav_accounts rows into the in-memory
+            // accounts list so the Accounts pane shows previously-
+            // added (or JSON-imported) accounts and the Sync now
+            // button can dispatch against them. Only CalDAV (0) +
+            // EteSync (5) are reachable from here today; OAuth
+            // providers stay invisible until their sign-in flow
+            // lands.
+            let loaded = load_password_accounts(&db);
+            {
+                let mut inner = vm.as_mut().rust_mut();
+                inner.account_states = vec![String::from("Idle"); loaded.len()];
+                inner.accounts = loaded;
+            }
+            publish_accounts(vm.as_mut());
+
             // The local database is exclusively managed by the app
             // and re-opened on every launch — flagging the open in
             // the status bar is just noise. Real failures still set
@@ -1833,6 +2128,58 @@ fn current_caldav_meta_for(db: &Database, task_id: i64) -> (String, i32) {
         Some((Some(uuid), color)) => (uuid, color.unwrap_or(0)),
         _ => (String::new(), 0),
     }
+}
+
+/// Load every password-auth `caldav_accounts` row (kinds 0 = CALDAV
+/// and 5 = ETEBASE) into the bridge's in-memory `accounts` list so
+/// the Accounts pane reflects whatever the DB carries — both rows
+/// the user added in a prior session and rows brought in by the
+/// JSON-import path. OAuth providers stay invisible here until
+/// their sign-in flow lands; their tokens won't be in `cda_password`
+/// anyway.
+fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = db.connection().prepare(
+        "SELECT cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_account_type \
+         FROM caldav_accounts \
+         WHERE cda_account_type IN (0, 5) \
+         ORDER BY cda_account_type, cda_name",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, i32>(5)?,
+        ))
+    });
+    if let Ok(rows) = rows {
+        for row in rows.flatten() {
+            let (uuid, name, url, username, password, kind_in_db) = row;
+            let Some(uuid) = uuid else { continue };
+            // Map cda_account_type back onto the bridge's KIND_*
+            // integers (which match `tasks_sync::ProviderKind` for
+            // QML, not the cda_account_type column).
+            let kind = match kind_in_db {
+                0 => KIND_CALDAV,
+                5 => KIND_ETESYNC,
+                _ => continue,
+            };
+            out.push(StoredAccount {
+                uuid,
+                kind,
+                label: name.unwrap_or_default(),
+                server: url.unwrap_or_default(),
+                username: username.unwrap_or_default(),
+                password: SecretString::from(password.unwrap_or_default()),
+            });
+        }
+    }
+    out
 }
 
 fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {

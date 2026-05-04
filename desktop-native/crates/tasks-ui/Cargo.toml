@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 tasks-core = { path = "../tasks-core" }
+tasks-sync = { path = "../tasks-sync" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 cxx = { workspace = true }
@@ -20,6 +21,18 @@ cxx-qt-lib = { workspace = true }
 # Secret-wrapped password on `StoredAccount` so the ViewModel can't
 # stringify / log the raw bytes, and the value zeroes on drop.
 secrecy = { workspace = true }
+# Async runtime hosting `tasks-sync::SyncEngine` calls. We pin the
+# `rt-multi-thread` feature so providers can spawn their own
+# fan-out work without blocking the UI thread; the bridge owns
+# exactly one Runtime instance shared across every Sync now click.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+# Generate cda_uuid values for accounts created via the
+# Accounts pane. Mirrors the `uuid` dep pattern used by tasks-core.
+uuid = { version = "1", features = ["v4"] }
+# Direct SQLite access for the bridge's writeback path on
+# add_password_account / remove_account / sync_account, which
+# need to mutate caldav_accounts without going through tasks-core.
+rusqlite = { workspace = true }
 # Preferences persistence — small JSON blob in
 # `<dirs::config_dir()>/tasks-desktop/preferences.json`. Avoids the
 # QSettings FFI surface (not exposed by cxx-qt-lib in our pinned

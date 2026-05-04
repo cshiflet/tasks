@@ -143,6 +143,37 @@ ScrollView {
                         Layout.fillWidth: true
                         font.pointSize: Qt.application.font.pointSize - 1
                     }
+                    // Per-account sync state badge — populated from
+                    // `account_sync_states[index]` ("Idle",
+                    // "Syncing…", "Synced (N↓ / M↑)", "Failed: …").
+                    // Hidden while idle so the row stays clean.
+                    Label {
+                        visible: pane.vm
+                                 && pane.vm.accountSyncStates
+                                 && pane.vm.accountSyncStates[row.index]
+                                 && pane.vm.accountSyncStates[row.index] !== "Idle"
+                        text: pane.vm ? pane.vm.accountSyncStates[row.index] : ""
+                        opacity: 0.85
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                        font.pointSize: Qt.application.font.pointSize - 1
+                        font.italic: true
+                    }
+                }
+
+                // CalDAV / EteSync rows get a Sync now button. OAuth
+                // providers (kind 1 / 2) hide it because their sign-in
+                // path isn't wired yet.
+                Button {
+                    text: qsTr("Sync now")
+                    flat: true
+                    visible: pane.vm
+                             && (pane.vm.accountKinds[row.index] === 0
+                                 || pane.vm.accountKinds[row.index] === 3)
+                    onClicked: {
+                        if (!pane.vm) { return; }
+                        pane.vm.syncAccount(pane.vm.accountUuids[row.index]);
+                    }
                 }
 
                 Button {
