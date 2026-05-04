@@ -25,14 +25,20 @@ ApplicationWindow {
            ? qsTr("Tasks — %1").arg(viewModel.dbPathDisplay)
            : qsTr("Tasks")
 
-    // Theme override exposed to Settings → List → "Appearance". Three
-    // states map to Material's enum:
+    // Theme override exposed via Settings → General → Appearance.
+    // Three states map to Material's enum:
     //   0 = follow OS (Material.System)  — default
     //   1 = light                          (Material.Light)
     //   2 = dark                           (Material.Dark)
-    // Session-local for now; QSettings persistence lands with the
-    // wider preferences pass tracked in PLAN_UPDATES §8.
-    property int appearanceTheme: 0
+    //
+    // Persisted on the bridge side: `viewModel.themeMode` is loaded
+    // from `<config_dir>/tasks-desktop/preferences.json` on
+    // construction and saved on every change via
+    // `updateThemeMode(...)`, so a restart picks up the same value.
+    // The local `appearanceTheme` shadow lets the toggle paint
+    // immediately even if a binding-loop check would refuse a direct
+    // self-binding to the view-model property.
+    property int appearanceTheme: viewModel.themeMode | 0
 
     Material.theme: appearanceTheme === 1
                     ? Material.Light

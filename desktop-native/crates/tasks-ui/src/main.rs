@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
 
 mod bridge;
+mod preferences;
 
 #[cfg(target_os = "windows")]
 mod win_dark_titlebar;

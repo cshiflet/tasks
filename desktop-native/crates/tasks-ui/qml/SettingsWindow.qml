@@ -37,19 +37,25 @@ ApplicationWindow {
     // because that would introduce two sources of truth.
     required property var appWindow
 
-    // Called by Main.qml before show() so the List tab's current
-    // controls reflect the live preferences.
+    // Called by Main.qml before show() so each tab starts from the
+    // bridge's live state rather than whatever stale value the
+    // widget held from the prior open.
     function loadFromVm() {
+        generalPane.loadFromVm();
         listPane.loadFromVm();
     }
 
     header: TabBar {
         id: tabs
-        // "View" reads more clearly than "List" — the prefs in this
-        // tab control how the task list is sorted and which rows
-        // appear, which is a view concern. The pane file kept the
-        // ListSettingsPane name to avoid churn in the bridge.
-        TabButton { text: qsTr("View") }
+        // Three tabs:
+        //   General      — app-wide preferences (theme, etc.).
+        //   List defaults — defaults applied to every list view.
+        //                   Per-list overrides will land behind a
+        //                   right-click affordance on each sidebar
+        //                   entry; not implemented yet.
+        //   Accounts     — sync account configuration.
+        TabButton { text: qsTr("General") }
+        TabButton { text: qsTr("List defaults") }
         TabButton { text: qsTr("Accounts") }
     }
 
@@ -67,10 +73,15 @@ ApplicationWindow {
             anchors.fill: parent
             currentIndex: tabs.currentIndex
 
+            GeneralSettingsPane {
+                id: generalPane
+                vm: settingsWindow.vm
+                appWindow: settingsWindow.appWindow
+            }
+
             ListSettingsPane {
                 id: listPane
                 vm: settingsWindow.vm
-                appWindow: settingsWindow.appWindow
             }
 
             AccountsPane {

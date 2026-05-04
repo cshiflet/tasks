@@ -24,6 +24,7 @@ fn main() {
                 "qml/TaskDetailPane.qml",
                 "qml/TaskEditDialog.qml",
                 "qml/SettingsWindow.qml",
+                "qml/GeneralSettingsPane.qml",
                 "qml/ListSettingsPane.qml",
                 "qml/AccountsPane.qml",
                 "qml/DatePickerButton.qml",

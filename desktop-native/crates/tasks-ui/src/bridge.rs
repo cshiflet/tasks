@@ -159,6 +159,11 @@ pub mod qobject {
         #[qproperty(bool, pref_show_completed)]
         #[qproperty(bool, pref_show_hidden)]
         #[qproperty(bool, pref_completed_at_bottom)]
+        // Material theme override — persisted across restarts.
+        //   0 = Follow OS, 1 = Light, 2 = Dark.
+        // Surfaced in Settings → General → Appearance and read by
+        // Main.qml's `appearanceTheme` binding.
+        #[qproperty(i32, theme_mode)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -235,6 +240,11 @@ pub mod qobject {
             show_hidden: bool,
             completed_at_bottom: bool,
         );
+
+        /// Update + persist the appearance theme (0=System, 1=Light, 2=Dark).
+        /// QML calls this from Settings → General → Appearance.
+        #[qinvokable]
+        fn update_theme_mode(self: Pin<&mut TaskListViewModel>, mode: i32);
 
         #[qinvokable]
         fn toggle_task_completion(self: Pin<&mut TaskListViewModel>, id: i64, completed: bool);
@@ -431,6 +441,7 @@ pub struct TaskListViewModelRust {
     pref_show_completed: bool,
     pref_show_hidden: bool,
     pref_completed_at_bottom: bool,
+    theme_mode: i32,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -476,6 +487,11 @@ pub struct TaskListViewModelRust {
 
 impl Default for TaskListViewModelRust {
     fn default() -> Self {
+        // Load on construction so the view model's Q_PROPERTYs come
+        // up reflecting whatever the user picked last session. A
+        // missing / malformed file falls back to the struct's
+        // own defaults.
+        let saved = crate::preferences::Preferences::load();
         TaskListViewModelRust {
             count: 0,
             titles: QStringList::default(),
@@ -520,17 +536,17 @@ impl Default for TaskListViewModelRust {
             selected_elapsed_text: QString::default(),
             selected_recurrence_raw: QString::default(),
             selected_repeat_from: 0,
-            // Seed from Android defaults — sort_auto, ascending,
-            // completed+hidden hidden. The Default impl of
-            // QueryPreferences carries the same values; we keep
-            // them in sync here so the Q_PROPERTYs read correctly
-            // on first open before the preferences dialog is ever
-            // invoked.
-            pref_sort_mode: 0, // SORT_AUTO
-            pref_sort_ascending: true,
-            pref_show_completed: false,
-            pref_show_hidden: false,
-            pref_completed_at_bottom: false,
+            // Seed from the persisted Preferences blob — falls back
+            // to Android defaults when nothing is saved. The
+            // QueryPreferences struct further down carries the same
+            // values so the Q_PROPERTYs and the in-memory query
+            // input stay in sync from the first paint.
+            pref_sort_mode: saved.sort_mode,
+            pref_sort_ascending: saved.sort_ascending,
+            pref_show_completed: saved.show_completed,
+            pref_show_hidden: saved.show_hidden,
+            pref_completed_at_bottom: saved.completed_at_bottom,
+            theme_mode: saved.theme_mode,
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             sidebar_account_kinds: QList::default(),
@@ -548,7 +564,14 @@ impl Default for TaskListViewModelRust {
             db_path: None,
             db: None,
             task_cache: Vec::new(),
-            preferences: QueryPreferences::default(),
+            preferences: QueryPreferences {
+                sort_mode: saved.sort_mode,
+                sort_ascending: saved.sort_ascending,
+                show_completed: saved.show_completed,
+                show_hidden: saved.show_hidden,
+                completed_tasks_at_bottom: saved.completed_at_bottom,
+                ..QueryPreferences::default()
+            },
             watcher_stop: None,
         }
     }
@@ -646,7 +669,7 @@ impl qobject::TaskListViewModel {
         self.as_mut().reload_active_filter();
     }
 
-    /// Apply new query preferences and reload. Session-local.
+    /// Apply + persist new list-default query preferences and reload.
     pub fn update_preferences(
         mut self: Pin<&mut Self>,
         sort_mode: i32,
@@ -669,7 +692,15 @@ impl qobject::TaskListViewModel {
         self.as_mut().set_pref_show_hidden(show_hidden);
         self.as_mut()
             .set_pref_completed_at_bottom(completed_at_bottom);
+        persist_prefs(self.as_ref().get_ref());
         self.as_mut().reload_active_filter();
+    }
+
+    /// Apply + persist the appearance theme override.
+    pub fn update_theme_mode(mut self: Pin<&mut Self>, mode: i32) {
+        let clamped = mode.clamp(0, 2);
+        self.as_mut().set_theme_mode(clamped);
+        persist_prefs(self.as_ref().get_ref());
     }
 
     /// Add a CalDAV or EteSync account to the session's accounts
@@ -1880,6 +1911,22 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
     }
 
     (labels, ids, kinds)
+}
+
+/// Snapshot the persistable subset of the view model and write it
+/// to disk. Called whenever an updateXxx invokable changes a
+/// preference; failures are logged but never propagated (the
+/// session keeps running on the in-memory copy).
+fn persist_prefs(vm: &qobject::TaskListViewModel) {
+    let prefs = crate::preferences::Preferences {
+        theme_mode: vm.theme_mode,
+        sort_mode: vm.pref_sort_mode,
+        sort_ascending: vm.pref_sort_ascending,
+        show_completed: vm.pref_show_completed,
+        show_hidden: vm.pref_show_hidden,
+        completed_at_bottom: vm.pref_completed_at_bottom,
+    };
+    prefs.save();
 }
 
 fn string_list_from_iter<'a>(iter: impl Iterator<Item = &'a str>) -> QStringList {

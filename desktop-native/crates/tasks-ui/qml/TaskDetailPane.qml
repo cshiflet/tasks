@@ -146,7 +146,7 @@ Pane {
                     if (!root.vm) { return "#9e9e9e"; }
                     switch (root.vm.selectedPriority) {
                         case 0: return "#d32f2f";  // red
-                        case 1: return "#f57c00";  // orange
+                        case 1: return "#fbc02d";  // yellow
                         case 2: return "#1976d2";  // blue
                         default: return "#9e9e9e"; // grey
                     }

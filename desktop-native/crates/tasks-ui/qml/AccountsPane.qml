@@ -72,7 +72,13 @@ ScrollView {
     // horizontal scrollbar.
     ColumnLayout {
         id: column
-        width: pane.availableWidth
+        // Subtract the scrollbar's reserved width on top of
+        // `availableWidth` so the inner controls never tuck under
+        // the always-on vertical bar. Material's ScrollBar floats
+        // over the content area unless the content actively
+        // sidesteps it; pinning a 12-px right margin keeps the
+        // form tidy.
+        width: pane.availableWidth - 12
         spacing: 12
 
         Label {

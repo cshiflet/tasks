@@ -114,7 +114,7 @@ Pane {
                     // outline + filled state both use the priority
                     // colour. Mapping matches the Android palette:
                     //   HIGH   #d32f2f  red
-                    //   MEDIUM #f57c00  orange
+                    //   MEDIUM #fbc02d  yellow
                     //   LOW    #1976d2  blue
                     //   NONE   neutral grey
                     CheckBox {
@@ -127,7 +127,7 @@ Pane {
                             const p = root.vm ? root.vm.priorities[index] : 3;
                             switch (p) {
                                 case 0: return "#d32f2f";
-                                case 1: return "#f57c00";
+                                case 1: return "#fbc02d";
                                 case 2: return "#1976d2";
                                 default: return "#9e9e9e";
                             }
@@ -226,7 +226,10 @@ Pane {
                                     // each arrow's terminal corner;
                                     // arrow 1 points right at top-right,
                                     // arrow 2 points left at bottom-left.
-                                    const head = 3.5;
+                                    // Slightly chunkier than the line
+                                    // weight so the heads read at a
+                                    // glance against the priority bg.
+                                    const head = 5;
                                     ctx.beginPath();
                                     ctx.moveTo(x1 + head * 0.4, y0);
                                     ctx.lineTo(x1 - head, y0 - head * 0.7);

@@ -1,13 +1,18 @@
-// "List" tab of the Settings window.
+// "List defaults" tab of the Settings window.
 //
-// Hosts the query preferences that used to live in the standalone
-// PreferencesDialog (sort mode + direction, show completed/hidden,
-// completed at the bottom). Mirrors the pre-tabbed UI's semantics:
-// a Save button at the bottom writes into the bridge via
-// `updatePreferences(...)` which re-runs the active filter.
+// Hosts the query preferences applied by default to every list
+// view: sort mode + direction, show completed / hidden, completed
+// at the bottom. Persisted via the bridge — `updatePreferences`
+// writes them to the JSON blob in `<config_dir>/tasks-desktop/`
+// and reloads the active filter so the change is visible
+// immediately.
 //
-// Session-local for now — a QSettings persistence pass is a
-// follow-up (see PLAN_UPDATES §8).
+// Per-list overrides (e.g. "this CalDAV list always sorts by due,
+// regardless of the global default") will land behind a right-
+// click context menu on each sidebar entry; not implemented yet.
+//
+// The app-wide Appearance toggle lives on the General tab, not
+// here — it doesn't belong with list-shape preferences.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -16,19 +21,8 @@ import QtQuick.Layouts
 ColumnLayout {
     id: pane
     spacing: 16
-    // Pin the Material context so child Labels (which default to
-    // `Material.foreground` for their colour) resolve against the
-    // window's actual colour scheme. Without this anchor a
-    // ColumnLayout's children sometimes fall back to a hard-coded
-    // light-theme black on a dark-themed Settings window.
-    Material.accent: Material.Blue
 
     required property QtObject vm
-    // Reference to the top-level ApplicationWindow whose
-    // `appearanceTheme` property drives Material.theme. Threaded in
-    // by SettingsWindow.qml. The Appearance row writes directly to
-    // it so the change takes effect on every paint.
-    required property var appWindow
 
     // Called by SettingsWindow.loadFromVm() right before show(), so
     // every re-open starts from the bridge's current preferences
@@ -48,12 +42,18 @@ ColumnLayout {
         showCompletedBox.checked = vm.prefShowCompleted;
         showHiddenBox.checked = vm.prefShowHidden;
         completedAtBottomBox.checked = vm.prefCompletedAtBottom;
-        if (appWindow) {
-            themeBox.currentIndex = appWindow.appearanceTheme | 0;
-        }
     }
 
     Component.onCompleted: loadFromVm()
+
+    Label {
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+        opacity: 0.6
+        font.pointSize: Qt.application.font.pointSize - 1
+        text: qsTr("Defaults applied to every list view. Right-click a list " +
+                   "in the sidebar to override these for that list (coming soon).")
+    }
 
     GridLayout {
         columns: 2
@@ -88,29 +88,6 @@ ColumnLayout {
             Layout.fillWidth: true
             model: [qsTr("Ascending"), qsTr("Descending")]
         }
-
-        // Appearance — drives Material.theme on the main window.
-        // Writes directly into `appWindow.appearanceTheme`; the
-        // binding on Main.qml's ApplicationWindow re-evaluates on
-        // every change so the switch is immediate.
-        Label {
-            text: qsTr("Appearance")
-            opacity: 0.7
-        }
-        CompactComboBox {
-            id: themeBox
-            Layout.fillWidth: true
-            model: [
-                qsTr("Follow system"),
-                qsTr("Light"),
-                qsTr("Dark"),
-            ]
-            onActivated: {
-                if (pane.appWindow) {
-                    pane.appWindow.appearanceTheme = currentIndex;
-                }
-            }
-        }
     }
 
     CheckBox {
@@ -138,7 +115,7 @@ ColumnLayout {
         Layout.fillWidth: true
         Item { Layout.fillWidth: true }
         Button {
-            text: qsTr("Save list preferences")
+            text: qsTr("Save defaults")
             highlighted: true
             onClicked: {
                 if (!pane.vm) { return; }

@@ -13,10 +13,11 @@ import QtQuick.Controls.Material
 
 ComboBox {
     id: control
-    // Trim the vertical chrome so the visible whitespace inside the
-    // box is just font leading, not Material's stock padding.
-    topPadding: 4
-    bottomPadding: 4
+    // Outer padding is slightly more generous than the compact
+    // text fields so the closed box visually pairs with the
+    // adjacent Label rows in Settings instead of looking shorter.
+    topPadding: 6
+    bottomPadding: 6
     leftPadding: 10
     rightPadding: control.indicator ? control.indicator.width + 4 : 24
 
@@ -37,5 +38,27 @@ ComboBox {
             ? control.Material.accentColor
             : control.Material.foreground
         opacity: control.activeFocus ? 1.0 : 0.45
+    }
+
+    // Drop-down items — each row gets a touch more vertical
+    // padding so options aren't crammed against each other when
+    // the popup opens. Material's default ItemDelegate height is
+    // tied to the same 48 px touch-target floor we override
+    // elsewhere; an explicit topPadding/bottomPadding here lifts
+    // it without touching the entire app's ItemDelegate style.
+    delegate: ItemDelegate {
+        width: control.width
+        topPadding: 8
+        bottomPadding: 8
+        leftPadding: 10
+        rightPadding: 10
+        text: control.textRole
+            ? (Array.isArray(control.model)
+                ? modelData[control.textRole]
+                : model[control.textRole])
+            : modelData
+        font: control.font
+        highlighted: control.highlightedIndex === index
+        hoverEnabled: control.hoverEnabled
     }
 }
