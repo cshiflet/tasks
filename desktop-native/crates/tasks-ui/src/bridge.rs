@@ -1400,8 +1400,10 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     vm.as_mut().set_task_list_names(list_names);
     vm.as_mut().set_task_list_colors(list_color_list);
     vm.as_mut().set_count(count);
-    vm.as_mut()
-        .set_status(QString::from(&format!("{count} task(s) in view")));
+    // The list pane header already prints "N task(s)" — no need to
+    // repeat it on every reload, and the previous status chatter
+    // overwrote whatever genuine error message was sitting in the
+    // status bar.
     vm.as_mut().rust_mut().task_cache = tasks;
 }
 
@@ -1596,10 +1598,13 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             ));
             vm.as_mut()
                 .set_place_uids(string_list_from_iter(place_uids.iter().map(String::as_str)));
-            vm.as_mut().set_status(QString::from(&format!(
-                "Opened {path_display} ({} sidebar entries)",
-                labels.len()
-            )));
+            // The local database is exclusively managed by the app
+            // and re-opened on every launch — flagging the open in
+            // the status bar is just noise. Real failures still set
+            // the status text on the error branch below, and the
+            // titlebar carries the open path so the user can confirm
+            // what's loaded if they want.
+            vm.as_mut().set_status(QString::default());
             vm.as_mut()
                 .set_db_path_display(QString::from(&path_display));
             {

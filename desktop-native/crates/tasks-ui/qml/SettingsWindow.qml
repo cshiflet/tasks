@@ -26,16 +26,25 @@ ApplicationWindow {
     visible: false
     flags: Qt.Dialog | Qt.WindowTitleHint | Qt.WindowSystemMenuHint
            | Qt.WindowCloseButtonHint | Qt.WindowMinMaxButtonsHint
-    // Mirror the main window's theme so Settings doesn't snap back
-    // to light on a dark desktop.
-    Material.accent: Material.Blue
 
     required property QtObject vm
-    // Reference to the main ApplicationWindow so the List tab can
-    // toggle `appearanceTheme`. The List tab reads / writes it
-    // directly; we don't proxy through a property on this window
-    // because that would introduce two sources of truth.
+    // Reference to the main ApplicationWindow so the General tab
+    // can drive `appearanceTheme`. We also read its
+    // `appearanceTheme` here because Material.theme is *per-window*
+    // — separate top-level ApplicationWindows don't inherit from a
+    // sibling, so without this binding the Settings window stays
+    // Light even when the main window resolves to Dark.
     required property var appWindow
+
+    Material.theme: appWindow ? (
+                        appWindow.appearanceTheme === 1 ? Material.Light :
+                        appWindow.appearanceTheme === 2 ? Material.Dark :
+                                                          Material.System
+                    ) : Material.System
+    Material.accent: Material.Blue
+    // Mirror Main.qml's MixedCase override so buttons + tabs in
+    // Settings don't render in ALL CAPS.
+    font.capitalization: Font.MixedCase
 
     // Called by Main.qml before show() so each tab starts from the
     // bridge's live state rather than whatever stale value the

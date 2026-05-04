@@ -72,13 +72,13 @@ ScrollView {
     // horizontal scrollbar.
     ColumnLayout {
         id: column
-        // Subtract the scrollbar's reserved width on top of
-        // `availableWidth` so the inner controls never tuck under
-        // the always-on vertical bar. Material's ScrollBar floats
-        // over the content area unless the content actively
-        // sidesteps it; pinning a 12-px right margin keeps the
-        // form tidy.
-        width: pane.availableWidth - 12
+        // Subtract the Material ScrollBar's typical visible width
+        // (its `implicitWidth` plus a few px of breathing room) so
+        // the inner controls never tuck under the always-on
+        // vertical bar. Empirically 20 px is needed — a flat 12 px
+        // margin still left the right-edge of the password field +
+        // the Sign-in button overlapping the scrollbar.
+        width: pane.availableWidth - 20
         spacing: 12
 
         Label {

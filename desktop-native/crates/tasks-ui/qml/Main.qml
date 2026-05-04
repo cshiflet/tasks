@@ -46,6 +46,13 @@ ApplicationWindow {
                         ? Material.Dark
                         : Material.System
     Material.accent: Material.Blue
+    // Override Qt 6 Material's hard-coded AllUppercase casing on
+    // Buttons / TabButtons. Set on the ApplicationWindow root so
+    // every child control inherits MixedCase via Qt's font-
+    // inheritance chain (control.font reads from parent.font when
+    // not explicitly overridden, and Material's contentItem hooks
+    // up `font: control.font` verbatim).
+    font.capitalization: Font.MixedCase
 
     TaskListViewModel {
         id: viewModel
@@ -205,93 +212,29 @@ ApplicationWindow {
         onTriggered: aboutDialog.open()
     }
 
-    // ---------- H-5: transient toast surface ----------
+    // ---------- Transient status auto-clear ----------
     //
-    // The bottom status-bar Label is easy to miss because the eye
-    // is on the active pane during an action. This Popup mirrors
-    // the latest non-empty status message at the top of the window
-    // for `_toastDurationMs`, then auto-hides. The status bar
-    // continues to carry the latest text persistently for users
-    // who do glance down.
-    //
-    // Heuristic to keep noise down: skip messages that are pure
-    // "N task(s) in view" reload chatter — the UI already shows
-    // the count in the list pane header.
-    readonly property int _toastDurationMs: 4000
-
+    // The status bar is the only surface for ad-hoc messages — the
+    // earlier top-of-window toast popup was dropped because the
+    // user explicitly asked for status text to live at the bottom-
+    // right of the window, not in a centred pop-up. Auto-clear keeps
+    // stale errors from sitting in the bar forever; while undo is
+    // available the timer pauses so the user has time to act on it.
+    readonly property int _statusAutoclearMs: 6000
     Connections {
         target: viewModel
         function onStatusChanged() {
-            const msg = viewModel.status;
-            if (msg.length === 0) { return; }
-            if (/^\d+ task\(s\) in view$/.test(msg)) { return; }
-            toastLabel.text = msg;
-            toastPopup.open();
-            toastTimer.restart();
+            statusClearTimer.stop();
+            if (viewModel.status.length === 0) { return; }
+            if (viewModel.lastDeletedId > 0) { return; }
+            statusClearTimer.restart();
         }
     }
-
-    Popup {
-        id: toastPopup
-        x: (root.width - width) / 2
-        y: 8
-        padding: 10
-        modal: false
-        focus: false
-        closePolicy: Popup.NoAutoClose
-        Material.elevation: 6
-
-        background: Rectangle {
-            color: Material.background
-            radius: 6
-            border.color: Material.foreground
-            border.width: 0
-            opacity: 0.95
-        }
-        contentItem: RowLayout {
-            spacing: 12
-            Label {
-                id: toastLabel
-                Layout.fillWidth: true
-                wrapMode: Text.Wrap
-                elide: Text.ElideRight
-                maximumLineCount: 3
-            }
-            // H-6: undo button visible only while the bridge has a
-            // pinned last-deleted row. Clicking it both restores
-            // the task and dismisses the toast.
-            Button {
-                visible: viewModel.lastDeletedId > 0
-                text: qsTr("Undo")
-                flat: true
-                highlighted: true
-                onClicked: {
-                    viewModel.restoreLastDeleted();
-                    toastPopup.close();
-                    toastTimer.stop();
-                }
-            }
-        }
-
-        // Fade-in / fade-out via the popup's built-in transitions.
-        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: 180 } }
-        exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: 220 } }
-
-        onClosed: {
-            // When the toast hides, drop any stale undo state so
-            // the button doesn't reappear next time the popup opens
-            // for an unrelated message.
-            if (viewModel.lastDeletedId > 0) {
-                viewModel.clearLastDeleted();
-            }
-        }
-    }
-
     Timer {
-        id: toastTimer
-        interval: root._toastDurationMs
+        id: statusClearTimer
+        interval: root._statusAutoclearMs
         repeat: false
-        onTriggered: toastPopup.close()
+        onTriggered: viewModel.status = "";
     }
 
     // Lightweight About dialog wired from the Help menu.
@@ -500,7 +443,7 @@ ApplicationWindow {
     footer: ToolBar {
         // Pin the status bar height so a long error string can't
         // grow the bar and shove the SplitView upward.
-        implicitHeight: 24
+        implicitHeight: 26
         // Same color treatment as the header — no Material accent.
         Material.background: "transparent"
 
@@ -512,14 +455,40 @@ ApplicationWindow {
             color: Material.foreground
             opacity: 0.10
         }
-        Label {
+        // Status messages live at the bottom-right per the user's
+        // direction; the Undo button sits to the right of the
+        // status text whenever the bridge has a pinned
+        // last-deleted task. Clearing the undo state also clears
+        // the status string so the bar empties cleanly.
+        RowLayout {
             anchors.fill: parent
             anchors.leftMargin: 8
-            verticalAlignment: Text.AlignVCenter
-            text: viewModel.status
-            elide: Text.ElideRight
-            font.pointSize: Qt.application.font.pointSize - 1
-            opacity: 0.7
+            anchors.rightMargin: 8
+            spacing: 8
+
+            Item { Layout.fillWidth: true }   // pushes content right
+            Label {
+                text: viewModel.status
+                elide: Text.ElideRight
+                horizontalAlignment: Text.AlignRight
+                font.pointSize: Qt.application.font.pointSize - 1
+                opacity: 0.7
+            }
+            Button {
+                visible: viewModel.lastDeletedId > 0
+                text: qsTr("Undo")
+                flat: true
+                highlighted: true
+                topPadding: 0
+                bottomPadding: 0
+                leftPadding: 8
+                rightPadding: 8
+                onClicked: {
+                    viewModel.restoreLastDeleted();
+                    viewModel.clearLastDeleted();
+                    viewModel.status = "";
+                }
+            }
         }
     }
 
