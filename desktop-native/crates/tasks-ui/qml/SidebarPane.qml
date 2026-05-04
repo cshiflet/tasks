@@ -421,9 +421,48 @@ Pane {
                     // Indent list rows so they read as children of
                     // their account header.
                     leftPadding: row.myGroup.startsWith("account:") ? 24 : 16
-                    text: row.myLabel
                     highlighted: root.vm && root.vm.activeFilterId === row.myId
                     onClicked: if (root.vm) root.vm.selectFilter(row.myId)
+
+                    // Custom contentItem so we can paint the colour
+                    // dot before the label. Stock `text:` would
+                    // bypass this layout.
+                    property int rowColor: {
+                        if (!root.vm) { return 0; }
+                        const cs = root.vm.sidebarColors;
+                        return (cs && row.index < cs.length) ? (cs[row.index] | 0) : 0;
+                    }
+                    contentItem: RowLayout {
+                        spacing: 8
+                        Rectangle {
+                            // Dot only visible for `caldav:` rows
+                            // with a non-zero colour. Built-ins keep
+                            // a clean text-only look.
+                            visible: row.myId.startsWith("caldav:")
+                            Layout.preferredWidth: 10
+                            Layout.preferredHeight: 10
+                            radius: 5
+                            color: {
+                                const c = listRow.rowColor;
+                                const a = ((c >>> 24) & 0xff) / 255.0;
+                                if (a === 0) { return "#9e9e9e"; }
+                                const r = ((c >>> 16) & 0xff) / 255.0;
+                                const g = ((c >>>  8) & 0xff) / 255.0;
+                                const b = ( c         & 0xff) / 255.0;
+                                return Qt.rgba(r, g, b, 1.0);
+                            }
+                            // Faint outline so a light dot stays
+                            // visible against a light row bg.
+                            border.width: 1
+                            border.color: Material.foreground
+                            opacity: ((listRow.rowColor >>> 24) & 0xff) === 0 ? 0.45 : 1.0
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: row.myLabel
+                            elide: Text.ElideRight
+                        }
+                    }
 
                     // Right-click opens a per-list menu — currently
                     // just "Choose colour…" (icon support lands when

@@ -506,10 +506,16 @@ fn tombstone_missing_tasks(
     seen: &[String],
     now_ms: i64,
 ) -> rusqlite::Result<usize> {
-    // Pull the set of caldav_tasks rows currently in this calendar.
+    // Pull the set of caldav_tasks rows currently in this calendar
+    // *that the server has acknowledged*. A row originating from a
+    // pull carries a non-null `cd_etag` (the server stamped it on
+    // the calendar-query); rows created locally before they've ever
+    // been pushed have NULL etag and must not be treated as remote
+    // deletions, or the pull-then-push cycle wipes a freshly-
+    // created task before it ever leaves the device.
     let mut stmt = tx.prepare(
         "SELECT cd_task, cd_remote_id FROM caldav_tasks \
-         WHERE cd_calendar = ?1 AND cd_deleted = 0",
+         WHERE cd_calendar = ?1 AND cd_deleted = 0 AND cd_etag IS NOT NULL",
     )?;
     let rows: Vec<(i64, String)> = stmt
         .query_map([calendar_remote_id], |r| {

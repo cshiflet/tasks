@@ -187,6 +187,12 @@ pub mod qobject {
         // emit the group key directly is simpler than re-deriving
         // it in QML by walking back over earlier indexes.
         #[qproperty(QStringList, sidebar_groups)]
+        // i32 ARGB per row, parallel to `sidebar_ids`. Drives the
+        // little colour dot the sidebar paints next to each list
+        // label. 0 for non-list rows (built-ins / account headers /
+        // saved filters); for `caldav:` rows it's the
+        // `caldav_lists.cdl_color` value.
+        #[qproperty(QList_i32, sidebar_colors)]
         #[qproperty(QString, active_filter_id)]
         // Configured sync accounts, parallel arrays for the Settings
         // → Accounts pane. `account_kinds` is the integer tag
@@ -535,6 +541,7 @@ pub struct TaskListViewModelRust {
     sidebar_ids: QStringList,
     sidebar_account_kinds: QList<i32>,
     sidebar_groups: QStringList,
+    sidebar_colors: QList<i32>,
     active_filter_id: QString,
     // H-4: free-text substring search across title + notes. When
     // non-empty, `reload_active_filter` runs `run_search` instead
@@ -654,6 +661,7 @@ impl Default for TaskListViewModelRust {
             sidebar_ids: QStringList::default(),
             sidebar_account_kinds: QList::default(),
             sidebar_groups: QStringList::default(),
+            sidebar_colors: QList::default(),
             active_filter_id: QString::from(FILTER_ALL),
             search_query: String::new(),
             account_labels: QStringList::default(),
@@ -959,7 +967,7 @@ impl qobject::TaskListViewModel {
         publish_accounts(self.as_mut());
         // Refresh sidebar so the removed account's lists disappear.
         if let Some(db) = &self.db {
-            let (labels, ids, kinds, groups) = build_sidebar(db);
+            let (labels, ids, kinds, groups, colors) = build_sidebar(db);
             self.as_mut()
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
             self.as_mut()
@@ -971,6 +979,11 @@ impl qobject::TaskListViewModel {
             self.as_mut().set_sidebar_account_kinds(kl);
             self.as_mut()
                 .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
+            let mut cl: QList<i32> = QList::default();
+            for c in &colors {
+                cl.append(*c);
+            }
+            self.as_mut().set_sidebar_colors(cl);
         }
         self.as_mut().reload_active_filter();
         self.as_mut()
@@ -1231,7 +1244,7 @@ impl qobject::TaskListViewModel {
                 // calendars + tasks land in the UI without forcing
                 // the user to reopen the DB.
                 if let Some(db) = &self.db {
-                    let (labels, ids, kinds, groups) = build_sidebar(db);
+                    let (labels, ids, kinds, groups, colors) = build_sidebar(db);
                     let labels_qsl = string_list_from_iter(labels.iter().map(String::as_str));
                     let ids_qsl = string_list_from_iter(ids.iter().map(String::as_str));
                     let groups_qsl = string_list_from_iter(groups.iter().map(String::as_str));
@@ -1239,10 +1252,15 @@ impl qobject::TaskListViewModel {
                     for k in &kinds {
                         kl.append(*k);
                     }
+                    let mut cl: QList<i32> = QList::default();
+                    for c in &colors {
+                        cl.append(*c);
+                    }
                     self.as_mut().set_sidebar_labels(labels_qsl);
                     self.as_mut().set_sidebar_ids(ids_qsl);
                     self.as_mut().set_sidebar_account_kinds(kl);
                     self.as_mut().set_sidebar_groups(groups_qsl);
+                    self.as_mut().set_sidebar_colors(cl);
                 }
                 self.as_mut().reload_active_filter();
             }
@@ -1286,7 +1304,7 @@ impl qobject::TaskListViewModel {
         // Refresh sidebar so the new colour drives chip + checkbox
         // backgrounds on the next paint.
         if let Some(db) = &self.db {
-            let (labels, ids, kinds, groups) = build_sidebar(db);
+            let (labels, ids, kinds, groups, colors) = build_sidebar(db);
             self.as_mut()
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
             self.as_mut()
@@ -1298,6 +1316,11 @@ impl qobject::TaskListViewModel {
             self.as_mut().set_sidebar_account_kinds(kl);
             self.as_mut()
                 .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
+            let mut cl: QList<i32> = QList::default();
+            for c in &colors {
+                cl.append(*c);
+            }
+            self.as_mut().set_sidebar_colors(cl);
         }
         self.as_mut().reload_active_filter();
     }
@@ -2208,7 +2231,11 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
 
     match result {
         Ok(db) => {
-            let (labels, ids, kinds, groups) = build_sidebar(&db);
+            // Auto-create the local-default account + Inbox list
+            // before the first sidebar build so a fresh user sees a
+            // usable list immediately. Idempotent.
+            ensure_local_default_list(&path);
+            let (labels, ids, kinds, groups, colors) = build_sidebar(&db);
             vm.as_mut()
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
             vm.as_mut()
@@ -2219,6 +2246,13 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
                     kl.append(*k);
                 }
                 vm.as_mut().set_sidebar_account_kinds(kl);
+            }
+            {
+                let mut cl: QList<i32> = QList::default();
+                for c in &colors {
+                    cl.append(*c);
+                }
+                vm.as_mut().set_sidebar_colors(cl);
             }
             vm.as_mut()
                 .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
@@ -2557,7 +2591,7 @@ fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
     out
 }
 
-fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<String>) {
+fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<String>, Vec<i32>) {
     let mut labels = vec![
         "All active".to_string(),
         "Today".to_string(),
@@ -2576,6 +2610,10 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<Stri
         "filters_builtin".to_string(),
         "filters_builtin".to_string(),
     ];
+    // Per-row i32 ARGB colour. Non-list rows (built-ins, account
+    // headers, saved filters) carry 0 — the QML side treats that
+    // as "no swatch".
+    let mut colors: Vec<i32> = vec![0, 0, 0];
     // `kinds[i]` carries:
     //   -1 for built-in / saved filters
     //   `cda_account_type` (0/2/3/4/5/6/7) for `caldav:` rows AND
@@ -2612,11 +2650,11 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<Stri
             }
         }
     }
-    // Lookup table: cdl_account → list of (cdl_uuid, cdl_name).
-    let mut lists_by_account: std::collections::HashMap<String, Vec<(String, String)>> =
+    // Lookup table: cdl_account → list of (cdl_uuid, cdl_name, cdl_color).
+    let mut lists_by_account: std::collections::HashMap<String, Vec<(String, String, i32)>> =
         std::collections::HashMap::new();
     if let Ok(mut stmt) = db.connection().prepare(
-        "SELECT cdl_uuid, cdl_name, cdl_account \
+        "SELECT cdl_uuid, cdl_name, cdl_account, COALESCE(cdl_color, 0) \
          FROM caldav_lists \
          WHERE cdl_account IS NOT NULL AND cdl_uuid IS NOT NULL \
          ORDER BY cdl_order, cdl_name",
@@ -2626,14 +2664,16 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<Stri
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, i32>(3)?,
             ))
         }) {
             for row in rows.flatten() {
-                if let (Some(uuid), name, Some(account)) = (row.0, row.1, row.2) {
-                    lists_by_account
-                        .entry(account)
-                        .or_default()
-                        .push((uuid, name.unwrap_or_default()));
+                if let (Some(uuid), name, Some(account), color) = (row.0, row.1, row.2, row.3) {
+                    lists_by_account.entry(account).or_default().push((
+                        uuid,
+                        name.unwrap_or_default(),
+                        color,
+                    ));
                 }
             }
         }
@@ -2651,9 +2691,10 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<Stri
         ids.push(account_group.clone());
         kinds.push(*account_type);
         groups.push(account_group.clone());
+        colors.push(0);
         // Lists belonging to this account.
         if let Some(rows) = lists_by_account.get(account_uuid) {
-            for (cdl_uuid, cdl_name) in rows {
+            for (cdl_uuid, cdl_name, cdl_color) in rows {
                 labels.push(if cdl_name.is_empty() {
                     cdl_uuid.clone()
                 } else {
@@ -2662,6 +2703,7 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<Stri
                 ids.push(format!("caldav:{cdl_uuid}"));
                 kinds.push(*account_type);
                 groups.push(account_group.clone());
+                colors.push(*cdl_color);
             }
         }
     }
@@ -2680,6 +2722,7 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<Stri
                                 ids.push(format!("filter:{}", f.id));
                                 kinds.push(-1);
                                 groups.push("saved".to_string());
+                                colors.push(0);
                             }
                         }
                         Err(e) => tracing::warn!("filters row decode failed: {e}"),
@@ -2691,7 +2734,35 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>, Vec<Stri
         Err(e) => tracing::warn!("filters prepare failed: {e}"),
     }
 
-    (labels, ids, kinds, groups)
+    (labels, ids, kinds, groups, colors)
+}
+
+/// Make sure a Local account + a default "Inbox" list exist on the
+/// open DB. Idempotent — `INSERT OR IGNORE` keys on the well-known
+/// uuid so subsequent opens don't duplicate. Lets a fresh user
+/// create tasks immediately without first wiring up a CalDAV /
+/// EteSync account.
+fn ensure_local_default_list(path: &std::path::Path) {
+    let Ok(conn) = open_rw_conn(path) else {
+        tracing::warn!("ensure_local_default_list: couldn't open RW conn");
+        return;
+    };
+    // Account row. account_type = 2 == AccountType::LOCAL.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO caldav_accounts \
+         (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+          cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+         VALUES ('local-default', 'Local', NULL, NULL, NULL, NULL, 2, 0, -1, 0)",
+        [],
+    );
+    // Default list under that account.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO caldav_lists \
+         (cdl_uuid, cdl_account, cdl_name, cdl_color, cdl_url, cdl_access, \
+          cdl_ctag, cdl_order, cdl_last_sync) \
+         VALUES ('local-inbox', 'local-default', 'Inbox', 0, NULL, 1, NULL, 0, 0)",
+        [],
+    );
 }
 
 /// Snapshot the persistable subset of the view model and write it
