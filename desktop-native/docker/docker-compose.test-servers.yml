@@ -4,9 +4,13 @@
 # default credentials so you can hit them straight from the
 # desktop client's Accounts pane without a setup dance.
 #
+# The Etebase service is built from upstream source on first
+# `up` (no public Docker Hub image exists for the 2.x server).
+# Subsequent `up` invocations reuse the cached image.
+#
 # Run from this directory:
 #
-#     docker compose -f docker-compose.test-servers.yml up -d
+#     docker compose -f docker-compose.test-servers.yml up -d --build
 #
 # Tear down (and wipe persistent volumes):
 #
@@ -15,40 +19,45 @@
 # Defaults, intentionally weak — never expose either container
 # to the public internet:
 #
-#   Etebase    http://127.0.0.1:8001
-#              superuser: admin / changeme
-#              create your test user via /admin or the SDK
+#   Etebase    http://127.0.0.1:3735
+#              admin (Django) : admin / changeme
+#              create the test user via the management command
+#              shown in README.test-servers.md
 #   Radicale   http://127.0.0.1:5232
 #              user:     test / test
 #              calendar: http://127.0.0.1:5232/test/test-calendar/
 
 services:
   etebase:
-    image: etesync/server:0.13.0
+    build:
+      context: ./etebase
+      args:
+        # Pin upstream to a known-good ref. Override on the
+        # `--build-arg` flag if you want a specific tag.
+        ETEBASE_REF: master
+    image: tasks-test-etebase:local
     container_name: tasks-test-etebase
     restart: unless-stopped
     environment:
-      # SECRET_FILE is required by the entrypoint script. It seeds
-      # Django's SECRET_KEY; rotate or wipe the volume if you ever
-      # take this past local testing.
-      SUPER_USER: admin
+      DJANGO_SUPERUSER_USERNAME: admin
+      DJANGO_SUPERUSER_EMAIL: admin@example.com
       DJANGO_SUPERUSER_PASSWORD: changeme
-      AUTO_REFRESH: "true"
-      # Bind to the container's external port directly; HTTPS is
-      # off because the desktop client points at http://127.0.0.1.
-      PORT: "8001"
     ports:
-      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:3735:3735"
     volumes:
-      - etebase_data:/data
+      # Persist the SQLite DB across `down` (without -v) so test
+      # users and their data survive container recreation. `down -v`
+      # wipes this and you start fresh.
+      - etebase_data:/app/data
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8001/api/v1/authentication/is_etebase/"]
+      test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://localhost:3735/api/v1/authentication/is_etebase/"]
       interval: 10s
-      timeout: 3s
-      retries: 5
+      timeout: 4s
+      retries: 6
+      start_period: 20s
 
   radicale:
-    image: tomsquest/docker-radicale:3.5.4.0
+    image: tomsquest/docker-radicale:latest
     container_name: tasks-test-radicale
     restart: unless-stopped
     init: true

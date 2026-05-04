@@ -6,40 +6,54 @@ hitting the public internet.
 
 ```sh
 cd desktop-native/docker
-docker compose -f docker-compose.test-servers.yml up -d
+docker compose -f docker-compose.test-servers.yml up -d --build
 ```
+
+The first `up` builds the Etebase image from upstream source
+(there's no Docker Hub image for the 2.x server) — expect ~2-3
+minutes of clone + pip install. Subsequent runs reuse the cached
+image; pass `--build` again whenever you want to refresh.
 
 The compose stack uses two services on dedicated localhost ports:
 
-| Service  | Port | Wire-up                                                                  |
-|----------|------|--------------------------------------------------------------------------|
-| Etebase  | 8001 | `http://127.0.0.1:8001` — superuser `admin / changeme`                   |
-| Radicale | 5232 | `http://127.0.0.1:5232/` — user `test / test`                            |
+| Service  | Port  | Wire-up                                                                  |
+|----------|-------|--------------------------------------------------------------------------|
+| Etebase  | 3735  | `http://127.0.0.1:3735` — Django admin `admin / changeme`                |
+| Radicale | 5232  | `http://127.0.0.1:5232/` — user `test / test`                            |
 
-Tear-down (and wipe volumes):
+Tear-down (wipe state):
 
 ```sh
 docker compose -f docker-compose.test-servers.yml down -v
 ```
 
+Tear-down without losing data:
+
+```sh
+docker compose -f docker-compose.test-servers.yml down
+```
+
 ## Etebase setup notes
 
-The `etesync/server` image creates the Django superuser on first
-start using the `SUPER_USER` + `DJANGO_SUPERUSER_PASSWORD` env vars
-in the compose file. To create a *test user* (the account the
-desktop client signs in as), use the Django admin at
-`http://127.0.0.1:8001/admin/` or the `etebase-cli` from inside
-the running container:
+The Django superuser (`admin`) is provisioned automatically from
+the env vars in the compose file the first time the container
+starts. That account is for the Django admin UI, **not** for the
+desktop client to sign in as — the EteSync protocol uses its own
+user objects.
+
+Create a *test user* via the management command shipped with the
+upstream project:
 
 ```sh
 docker compose -f docker-compose.test-servers.yml exec etebase \
     ./manage.py etebase-server create-user alice alice@example.com
 ```
 
-Then point the desktop client's Accounts pane at:
+The command prompts for a password. Then point the desktop
+client's Accounts pane at:
 
 - **Type**:        EteSync
-- **Server URL**:  `http://127.0.0.1:8001`
+- **Server URL**:  `http://127.0.0.1:3735`
 - **Username**:    `alice`
 - **Password**:    whatever password you set above
 
