@@ -1831,7 +1831,10 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
                ORDER BY cda_account_type, cdl_order, cdl_name";
     match db.connection().prepare(sql) {
         Ok(mut stmt) => match stmt.query_map([], |r| {
-            Ok((CaldavCalendar::from_row(r)?, r.get::<_, i32>("cda_account_type")?))
+            Ok((
+                CaldavCalendar::from_row(r)?,
+                r.get::<_, i32>("cda_account_type")?,
+            ))
         }) {
             Ok(rows) => {
                 for row in rows {
