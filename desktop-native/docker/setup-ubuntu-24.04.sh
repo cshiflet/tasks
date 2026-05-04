@@ -26,6 +26,7 @@ sudo apt-get install -y --no-install-recommends \
     libsqlite3-dev \
     libssl-dev \
     pkg-config \
+    qml6-module-qt-labs-folderlistmodel \
     qml6-module-qt-labs-platform \
     qml6-module-qtqml-workerscript \
     qml6-module-qtquick \
