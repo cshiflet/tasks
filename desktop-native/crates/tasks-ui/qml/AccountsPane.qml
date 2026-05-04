@@ -318,12 +318,13 @@ ScrollView {
     RowLayout {
         Layout.fillWidth: true
         // Test runs `provider.connect()` against the entered creds
-        // without persisting — the result lands on the status bar.
-        // Hidden for OAuth providers because their sign-in flow
-        // isn't a credentials-only test.
+        // without persisting — the result is published into
+        // `vm.lastTestResult` and rendered next to the button so
+        // the user doesn't have to chase the status bar at the
+        // bottom of the window. Hidden for OAuth providers because
+        // their sign-in flow isn't a credentials-only test.
         Button {
             text: qsTr("Test")
-            flat: true
             visible: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
             onClicked: {
                 if (!pane.vm) { return; }
@@ -334,7 +335,24 @@ ScrollView {
                     passwordField.text);
             }
         }
-        Item { Layout.fillWidth: true }
+        Label {
+            Layout.fillWidth: true
+            text: pane.vm ? pane.vm.lastTestResult : ""
+            wrapMode: Text.Wrap
+            elide: Text.ElideRight
+            maximumLineCount: 2
+            font.pointSize: Qt.application.font.pointSize - 1
+            // Tint by outcome so success / failure are obvious
+            // without reading the wording. "Test successful" stays
+            // green, anything starting with "Test failed" goes red,
+            // the in-flight "Testing connection…" stays neutral.
+            color: {
+                const t = pane.vm ? pane.vm.lastTestResult : "";
+                if (t.startsWith("Test successful")) { return "#2e7d32"; }
+                if (t.startsWith("Test failed"))     { return "#c62828"; }
+                return Material.foreground;
+            }
+        }
         Button {
             id: addButton
             text: pane.providerKinds[kindBox.currentIndex].requiresOAuth

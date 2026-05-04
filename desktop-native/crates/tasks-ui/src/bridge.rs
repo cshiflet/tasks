@@ -210,6 +210,13 @@ pub mod qobject {
         #[qproperty(i64, last_deleted_id)]
         // Status bar text.
         #[qproperty(QString, status)]
+        // Inline result string from the most recent
+        // `test_account_connection` invokable. Updated to
+        // "Testing connection…" / "Test successful — credentials
+        // work." / "Test failed: …" so the Accounts pane can
+        // render the verdict next to the Test button instead of
+        // routing it through the status bar at the bottom.
+        #[qproperty(QString, last_test_result)]
         // Absolute path of the currently-open database, surfaced in
         // the window title + Browse path field so users know which
         // file they're looking at.
@@ -542,6 +549,7 @@ pub struct TaskListViewModelRust {
     last_deleted_title: String,
     // Status.
     status: QString,
+    last_test_result: QString,
     db_path_display: QString,
     // Non-Qt bookkeeping. Held on the Rust side only; not exposed to QML.
     db_path: Option<PathBuf>,
@@ -641,6 +649,7 @@ impl Default for TaskListViewModelRust {
             last_deleted_id: 0,
             last_deleted_title: String::new(),
             status: QString::default(),
+            last_test_result: QString::default(),
             db_path_display: QString::default(),
             db_path: None,
             db: None,
@@ -1044,7 +1053,7 @@ impl qobject::TaskListViewModel {
         let username_s = username.to_string().trim().to_string();
         let password_s = password.to_string();
         if server_s.is_empty() || username_s.is_empty() || password_s.is_empty() {
-            self.as_mut().set_status(QString::from(
+            self.as_mut().set_last_test_result(QString::from(
                 "Server, username, and password are required to test.",
             ));
             return;
@@ -1065,7 +1074,7 @@ impl qobject::TaskListViewModel {
             }
         }
         self.as_mut()
-            .set_status(QString::from("Testing connection…"));
+            .set_last_test_result(QString::from("Testing connection…"));
         let creds = AccountCredentials::new_password(&server_s, &username_s, password_s);
         let mut provider: Box<dyn Provider> = match kind {
             KIND_CALDAV => Box::new(CalDavProvider::new(creds, "test")),
@@ -1082,10 +1091,10 @@ impl qobject::TaskListViewModel {
         match result {
             Ok(()) => self
                 .as_mut()
-                .set_status(QString::from("Test successful — credentials work.")),
+                .set_last_test_result(QString::from("Test successful — credentials work.")),
             Err(e) => self
                 .as_mut()
-                .set_status(QString::from(&format!("Test failed: {e}"))),
+                .set_last_test_result(QString::from(&format!("Test failed: {e}"))),
         }
     }
 

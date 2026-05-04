@@ -191,7 +191,15 @@ Pane {
                                     ctx.reset();
                                     const w = width;
                                     const h = height;
-                                    const inset = 2;
+                                    // Inset has to clear the
+                                    // arrowhead's perpendicular
+                                    // flanks (head * 0.7 either
+                                    // side of the corner). With
+                                    // inset 2 and head 5 the top
+                                    // flank rendered at y = -1.5
+                                    // and the stroke chopped a
+                                    // pixel off the outside edge.
+                                    const inset = 5;
                                     const x0 = inset;
                                     const y0 = inset;
                                     const x1 = w - inset;
