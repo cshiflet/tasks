@@ -795,21 +795,24 @@ impl qobject::TaskListViewModel {
             KIND_ETESYNC => 5, // tasks_core::AccountType::ETEBASE
             _ => unreachable!("kind validated above"),
         };
-        if let Some(db) = &self.db {
-            let res = db.connection().execute(
-                "INSERT OR REPLACE INTO caldav_accounts \
-                 (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
-                  cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, -1, 0)",
-                rusqlite::params![
-                    uuid,
-                    label_s,
-                    server_s,
-                    username_s,
-                    password_s,
-                    cda_account_type,
-                ],
-            );
+        if let Some(path) = self.db_path.clone() {
+            let res = open_rw_conn(&path).and_then(|conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO caldav_accounts \
+                     (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+                      cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, -1, 0)",
+                    rusqlite::params![
+                        uuid,
+                        label_s,
+                        server_s,
+                        username_s,
+                        password_s,
+                        cda_account_type,
+                    ],
+                )
+                .map(|_| ())
+            });
             if let Err(e) = res {
                 self.as_mut()
                     .set_status(QString::from(&format!("DB write failed: {e}")));
@@ -866,23 +869,24 @@ impl qobject::TaskListViewModel {
         if idx < self.account_states.len() {
             self.as_mut().rust_mut().account_states.remove(idx);
         }
-        if let Some(db) = &self.db {
-            let conn = db.connection();
-            // Tear down child rows first so a missing FK CASCADE
-            // doesn't leave orphans in the lists / tasks tables.
-            let _ = conn.execute(
-                "DELETE FROM caldav_tasks WHERE cd_calendar IN \
-                 (SELECT cdl_uuid FROM caldav_lists WHERE cdl_account = ?1)",
-                rusqlite::params![removed.uuid],
-            );
-            let _ = conn.execute(
-                "DELETE FROM caldav_lists WHERE cdl_account = ?1",
-                rusqlite::params![removed.uuid],
-            );
-            let _ = conn.execute(
-                "DELETE FROM caldav_accounts WHERE cda_uuid = ?1",
-                rusqlite::params![removed.uuid],
-            );
+        if let Some(path) = self.db_path.clone() {
+            if let Ok(conn) = open_rw_conn(&path) {
+                // Tear down child rows first so a missing FK CASCADE
+                // doesn't leave orphans in the lists / tasks tables.
+                let _ = conn.execute(
+                    "DELETE FROM caldav_tasks WHERE cd_calendar IN \
+                     (SELECT cdl_uuid FROM caldav_lists WHERE cdl_account = ?1)",
+                    rusqlite::params![removed.uuid],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM caldav_lists WHERE cdl_account = ?1",
+                    rusqlite::params![removed.uuid],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM caldav_accounts WHERE cda_uuid = ?1",
+                    rusqlite::params![removed.uuid],
+                );
+            }
         }
         publish_accounts(self.as_mut());
         // Refresh sidebar so the removed account's lists disappear.
@@ -2269,6 +2273,21 @@ fn build_sidebar(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
 /// to disk. Called whenever an updateXxx invokable changes a
 /// preference; failures are logged but never propagated (the
 /// session keeps running on the in-memory copy).
+/// Open a short-lived read-write connection to the SQLite file at
+/// `path`. Mirrors `tasks_core::write::open_rw` (which is private)
+/// — the bridge's `Database` handle is intentionally read-only so
+/// the query path can't accidentally mutate; writes that go around
+/// `tasks-core`'s helpers (currently just our `caldav_accounts`
+/// add / remove) get their own brief RW connection that closes
+/// once the call returns.
+fn open_rw_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(std::time::Duration::from_millis(1_000))?;
+    Ok(conn)
+}
+
 fn persist_prefs(vm: &qobject::TaskListViewModel) {
     let prefs = crate::preferences::Preferences {
         theme_mode: vm.theme_mode,

@@ -50,7 +50,13 @@ services:
       # wipes this and you start fresh.
       - etebase_data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://localhost:3735/api/v1/authentication/is_etebase/"]
+      # Any HTTP response is good enough to know the Django dev
+      # server is up. The earlier `is_etebase` probe returned a
+      # 404 on v0.13.0 (the endpoint moved across releases) and
+      # tripped the healthcheck even though sync requests worked
+      # fine. Drop `-f` so 4xx isn't fatal here; the test is
+      # liveness only.
+      test: ["CMD", "curl", "-sS", "--max-time", "3", "-o", "/dev/null", "http://localhost:3735/"]
       interval: 10s
       timeout: 4s
       retries: 6
