@@ -61,14 +61,12 @@ services:
     container_name: tasks-test-radicale
     restart: unless-stopped
     init: true
-    read_only: true
-    cap_drop: [ALL]
-    cap_add: [SETUID, SETGID, CHOWN, KILL]
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          pids: 50
+    # Hardening flags (read_only / cap_drop / cap_add) intentionally
+    # left off — the upstream image's startup script chowns /data
+    # to the radicale user, and a tightly-locked container couldn't
+    # do that against a Docker-managed named volume, leaving the
+    # service in a chown-fail crashloop. The compose stack is for
+    # local-only iteration anyway, so the defaults are fine.
     healthcheck:
       test: ["CMD", "curl", "-fsS", "--retry", "1", "--max-time", "3", "http://[::1]:5232/"]
       interval: 10s

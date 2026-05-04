@@ -14,6 +14,11 @@ The first `up` builds the Etebase image from upstream source
 minutes of clone + pip install. Subsequent runs reuse the cached
 image; pass `--build` again whenever you want to refresh.
 
+The Etebase image pins upstream to `v0.13.0` because newer master
+revs of `etesync/server` have shipped without `etebase_server/wsgi.py`,
+which Django's runserver needs. Override with
+`--build-arg ETEBASE_REF=…` if you want to try a different tag.
+
 The compose stack uses two services on dedicated localhost ports:
 
 | Service  | Port  | Wire-up                                                                  |
