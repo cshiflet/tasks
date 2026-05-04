@@ -123,6 +123,38 @@ impl Database {
         Self::open_read_only(path)
     }
 
+    /// Read-write equivalent of [`open_or_create_read_only`]. Used by
+    /// the GUI now that M2+ writes (task create / edit / delete) and
+    /// sync writeback share the same long-lived handle. The
+    /// schema-hash check still runs so a stale Android backup can't
+    /// silently corrupt the desktop's local DB.
+    pub fn open_or_create_read_write(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        reject_if_symlink(&path)?;
+        if !path.exists() {
+            create_empty_db(&path)?;
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&path, flags)?;
+        // 1 s busy_timeout: matches `tasks_core::write::open_rw`.
+        // The desktop client may have a transient writer (sync
+        // engine running on the tokio runtime) plus this handle,
+        // and SQLITE_BUSY on a sub-second contended lock is
+        // recoverable without bothering the user.
+        conn.busy_timeout(std::time::Duration::from_millis(1_000))?;
+
+        let actual_hash = read_identity_hash(&conn)?;
+        if actual_hash != PINNED_IDENTITY_HASH {
+            return Err(CoreError::SchemaMismatch {
+                expected: PINNED_IDENTITY_HASH,
+                actual: actual_hash,
+                expected_version: PINNED_SCHEMA_VERSION,
+            });
+        }
+
+        Ok(Database { conn, path })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

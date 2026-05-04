@@ -1832,9 +1832,16 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
     stop_prior_watcher(vm.as_mut());
 
     let path_display = path.display().to_string();
+    // Open the long-lived handle read-write now that M2+ writes
+    // (task edit, account add/remove) and sync writeback all need
+    // to mutate the same file. Read-only mode was an M1-era safety
+    // net; with the schema-hash check still in place, opening RW
+    // here is no riskier and side-steps the SQLITE_READONLY error
+    // we were getting when a transient RW connection coincided
+    // with the read-only handle.
     let result = match mode {
         OpenMode::ReadOnlyOnly => Database::open_read_only(&path),
-        OpenMode::CreateIfMissing => Database::open_or_create_read_only(&path),
+        OpenMode::CreateIfMissing => Database::open_or_create_read_write(&path),
     };
 
     match result {
