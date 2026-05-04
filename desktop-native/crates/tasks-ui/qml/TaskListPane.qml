@@ -133,8 +133,17 @@ Pane {
                             }
                         }
                         indicator: Item {
-                            implicitWidth: 18
-                            implicitHeight: 18
+                            // Bumped from 18 to 22 so the recurring
+                            // indicator's L-shape lines have room to
+                            // breathe at inset=5 (which the
+                            // arrowhead's perpendicular flanks need
+                            // to avoid the canvas-edge clip we hit
+                            // earlier). The regular square checkbox
+                            // grows the same 4 px so the two
+                            // variants stay identical in size from
+                            // row to row.
+                            implicitWidth: 22
+                            implicitHeight: 22
                             x: completeBox.leftPadding
                             y: parent.height / 2 - height / 2
 

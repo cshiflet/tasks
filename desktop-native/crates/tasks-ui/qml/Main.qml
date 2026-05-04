@@ -21,9 +21,7 @@ ApplicationWindow {
     width: 1100
     height: 720
     visible: true
-    title: viewModel.dbPathDisplay.length > 0
-           ? qsTr("Tasks — %1").arg(viewModel.dbPathDisplay)
-           : qsTr("Tasks")
+    title: qsTr("Tasks")
 
     // Theme override exposed via Settings → General → Appearance.
     // Three states map to Material's enum:

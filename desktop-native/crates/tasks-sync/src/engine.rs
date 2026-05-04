@@ -79,7 +79,8 @@ impl<'a> SyncEngine<'a> {
             .map_err(|e| SyncError::Local(format!("begin tx: {e}")))?;
 
         for cal in &calendars {
-            upsert_calendar(&tx, cal).map_err(|e| SyncError::Local(format!("calendar: {e}")))?;
+            upsert_calendar(&tx, cal, self.account_filter.as_deref())
+                .map_err(|e| SyncError::Local(format!("calendar: {e}")))?;
         }
 
         let mut tasks_pulled = 0usize;
@@ -301,7 +302,11 @@ fn open_rw(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn upsert_calendar(tx: &rusqlite::Transaction<'_>, cal: &RemoteCalendar) -> rusqlite::Result<()> {
+fn upsert_calendar(
+    tx: &rusqlite::Transaction<'_>,
+    cal: &RemoteCalendar,
+    account_uuid: Option<&str>,
+) -> rusqlite::Result<()> {
     let existing: Option<i64> = tx
         .query_row(
             "SELECT cdl_id FROM caldav_lists WHERE cdl_uuid = ?1",
@@ -312,31 +317,54 @@ fn upsert_calendar(tx: &rusqlite::Transaction<'_>, cal: &RemoteCalendar) -> rusq
     let access = if cal.read_only { 2 } else { 1 }; // CalendarAccess::READ_ONLY / READ_WRITE
     let color = cal.color.unwrap_or(0);
     if let Some(_id) = existing {
-        tx.execute(
-            "UPDATE caldav_lists SET cdl_name = ?1, cdl_color = ?2, cdl_url = ?3, \
-             cdl_access = ?4, cdl_ctag = ?5 WHERE cdl_uuid = ?6",
-            params![
-                cal.name,
-                color,
-                cal.url,
-                access,
-                cal.change_tag,
-                cal.remote_id
-            ],
-        )?;
+        // Stamp `cdl_account` only when the caller actually has it
+        // — engine integration tests build a SyncEngine without an
+        // account filter and we don't want to clobber whatever was
+        // there before. The same logic applies on insert below.
+        if account_uuid.is_some() {
+            tx.execute(
+                "UPDATE caldav_lists \
+                 SET cdl_name = ?1, cdl_color = ?2, cdl_url = ?3, \
+                     cdl_access = ?4, cdl_ctag = ?5, cdl_account = ?6 \
+                 WHERE cdl_uuid = ?7",
+                params![
+                    cal.name,
+                    color,
+                    cal.url,
+                    access,
+                    cal.change_tag,
+                    account_uuid,
+                    cal.remote_id
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE caldav_lists SET cdl_name = ?1, cdl_color = ?2, cdl_url = ?3, \
+                 cdl_access = ?4, cdl_ctag = ?5 WHERE cdl_uuid = ?6",
+                params![
+                    cal.name,
+                    color,
+                    cal.url,
+                    access,
+                    cal.change_tag,
+                    cal.remote_id
+                ],
+            )?;
+        }
     } else {
         tx.execute(
             "INSERT INTO caldav_lists \
              (cdl_uuid, cdl_name, cdl_color, cdl_url, cdl_access, cdl_ctag, \
-              cdl_order, cdl_last_sync) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)",
+              cdl_order, cdl_last_sync, cdl_account) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)",
             params![
                 cal.remote_id,
                 cal.name,
                 color,
                 cal.url,
                 access,
-                cal.change_tag
+                cal.change_tag,
+                account_uuid
             ],
         )?;
     }
