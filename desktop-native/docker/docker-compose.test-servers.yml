@@ -29,32 +29,24 @@
 
 services:
   etebase:
-    build:
-      context: ./etebase
-      args:
-        # Pin upstream to a known-good ref. Override on the
-        # `--build-arg` flag if you want a specific tag.
-        ETEBASE_REF: master
-    image: tasks-test-etebase:local
-    container_name: tasks-test-etebase
-    restart: unless-stopped
+    image: victorrds/etesync:alpine
+    container_name: etebase
     environment:
-      DJANGO_SUPERUSER_USERNAME: admin
-      DJANGO_SUPERUSER_EMAIL: admin@example.com
-      DJANGO_SUPERUSER_PASSWORD: changeme
-      # Pre-provision a normal Etebase test user on first start.
-      # The desktop client signs in as this user; the Django
-      # superuser above is just for the /admin/ web UI.
+      DEBUG: true
+      REGEN_INI: "yes"
+      DEBUG_DJANGO: "true"
+      SERVER: http-socket
+      SUPER_USER: admin
+      SUPER_PASS: "pEjQEwKLd%o^gcLUP#VncOl@&LBn6@"
       ETEBASE_TEST_USER: alice
       ETEBASE_TEST_EMAIL: alice@example.com
       ETEBASE_TEST_PASSWORD: alicepw
+      ALLOWED_HOSTS: "localhost"
+      TIME_ZONE: "America/Denver"
+      AUTO_SIGNUP: "true"
     ports:
       - "127.0.0.1:3735:3735"
-    volumes:
-      # Persist the SQLite DB across `down` (without -v) so test
-      # users and their data survive container recreation. `down -v`
-      # wipes this and you start fresh.
-      - etebase_data:/app/data
+    restart: unless-stopped
     healthcheck:
       # Any HTTP response is good enough to know the Django dev
       # server is up. The earlier `is_etebase` probe returned a
@@ -67,6 +59,9 @@ services:
       timeout: 4s
       retries: 6
       start_period: 20s
+    volumes:
+      - etebase_data:/data:rw
+
 
   radicale:
     image: tomsquest/docker-radicale:latest
