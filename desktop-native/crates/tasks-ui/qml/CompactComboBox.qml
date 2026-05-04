@@ -1,23 +1,33 @@
-// Drop-in ComboBox replacement with theme-aware background.
+// Drop-in ComboBox replacement with a theme-aware background and a
+// tight contentItem that gives the displayText the full vertical
+// room of the control instead of nesting it inside Material's
+// internal TextField — that nested editor reserves a hidden
+// underline + line-padding block that shaved descenders off
+// `g`/`p`/`y` even at sane outer padding values.
 //
 // Same transparent-fill + themed-border trick CompactTextField.qml
 // uses so dark-theme windows don't flash a Light-theme grey slab.
-//
-// Earlier revisions tried `topPadding/bottomPadding: 6` for
-// density, but Material's contentItem positioning then shaved the
-// descenders off `g` / `p` / `y` in dark mode on Linux. Bump both
-// paddings to 8 so a full lineHeight + descender always fits, and
-// pin a minimum implicitHeight so the borderless background can't
-// collapse the box below readable size.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 
 ComboBox {
     id: control
-    topPadding: 8
-    bottomPadding: 8
-    implicitHeight: Math.max(36, contentItem ? contentItem.implicitHeight + topPadding + bottomPadding : 36)
+    // Trim the vertical chrome so the visible whitespace inside the
+    // box is just font leading, not Material's stock padding.
+    topPadding: 4
+    bottomPadding: 4
+    leftPadding: 10
+    rightPadding: control.indicator ? control.indicator.width + 4 : 24
+
+    contentItem: Text {
+        text: control.displayText
+        font: control.font
+        color: control.Material.foreground
+        verticalAlignment: Text.AlignVCenter
+        horizontalAlignment: Text.AlignLeft
+        elide: Text.ElideRight
+    }
 
     background: Rectangle {
         color: "transparent"

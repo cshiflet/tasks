@@ -160,13 +160,26 @@ Pane {
                                 }
                             }
 
-                            // Squared two-arrow loop for recurring
-                            // tasks — each arrow follows two sides of
-                            // a rounded square (two right-angle
-                            // turns) and ends with an arrowhead
-                            // pointing at the other arrow's tail.
-                            // Painted via Canvas so we don't depend
-                            // on an icon font; stroke + arrowheads
+                            // Two L-shaped arrows arranged like the
+                            // Android client's recurring badge.
+                            //
+                            //   ┌──────→     ← arrow 1 head (TR corner)
+                            //   │
+                            //   │
+                            //   ●                 ← arrow 1 tail
+                            //                              (mid of left edge)
+                            //              ●      ← arrow 2 tail
+                            //                              (mid of right edge)
+                            //              │
+                            //              │
+                            //  ←──────┘            ← arrow 2 head (BL corner)
+                            //
+                            // Each arrow has exactly one 90° bend.
+                            // Arrow 2 is arrow 1 rotated 180° — i.e.
+                            // reflected across both diagonals — so the
+                            // pair is point-symmetric about the box's
+                            // centre. Drawn via Canvas so we don't
+                            // depend on an icon font; stroke + fill
                             // use the priority colour.
                             Canvas {
                                 id: recurIcon
@@ -183,72 +196,54 @@ Pane {
                                     const y0 = inset;
                                     const x1 = w - inset;
                                     const y1 = h - inset;
-                                    // Where each arrow ends — about
-                                    // 60% along the third (vertical)
-                                    // segment, leaving room for the
-                                    // arrowhead and a visible gap
-                                    // before the other arrow's tail.
-                                    const stop = 0.55;
-                                    const yT = y0 + (y1 - y0) * (1 - stop);  // top arrow head Y
-                                    const yB = y1 - (y1 - y0) * (1 - stop);  // bottom arrow head Y
+                                    const cy = (y0 + y1) / 2;
                                     ctx.lineWidth = 2;
                                     ctx.lineCap = "round";
                                     ctx.lineJoin = "round";
                                     ctx.strokeStyle = completeBox.priorityColor;
                                     ctx.fillStyle = completeBox.priorityColor;
 
-                                    // Arrow 1 — tail just below the
-                                    // top-left corner, traces left
-                                    // edge up, across the top, down
-                                    // the right edge to ~60%.
+                                    // Arrow 1 — tail at midpoint of
+                                    // left edge, up to top-left, then
+                                    // right along top to top-right.
                                     ctx.beginPath();
-                                    ctx.moveTo(x0, y1 - 0.5);
-                                    ctx.lineTo(x0, y0);          // up the left
-                                    ctx.lineTo(x1, y0);          // across the top
-                                    ctx.lineTo(x1, yT);          // down the right (partial)
+                                    ctx.moveTo(x0, cy);     // tail
+                                    ctx.lineTo(x0, y0);     // up to TL (90° bend)
+                                    ctx.lineTo(x1, y0);     // right along top
                                     ctx.stroke();
 
-                                    // Arrow 2 — tail just above the
-                                    // bottom-right corner, traces
-                                    // right edge down, across the
-                                    // bottom, up the left edge to
-                                    // ~60%.
+                                    // Arrow 2 — 180°-rotated mirror of
+                                    // arrow 1: tail at midpoint of
+                                    // right edge, down to bottom-right,
+                                    // then left along bottom to BL.
                                     ctx.beginPath();
-                                    ctx.moveTo(x1, y0 + 0.5);
-                                    ctx.lineTo(x1, y1);          // down the right
-                                    ctx.lineTo(x0, y1);          // across the bottom
-                                    ctx.lineTo(x0, yB);          // up the left (partial)
+                                    ctx.moveTo(x1, cy);     // tail
+                                    ctx.lineTo(x1, y1);     // down to BR (90° bend)
+                                    ctx.lineTo(x0, y1);     // left along bottom
                                     ctx.stroke();
 
-                                    // Arrowheads. Each is a small
-                                    // filled triangle pointed at the
-                                    // other arrow's tail.
+                                    // Arrowheads. Filled triangles at
+                                    // each arrow's terminal corner;
+                                    // arrow 1 points right at top-right,
+                                    // arrow 2 points left at bottom-left.
                                     const head = 3.5;
-                                    // Top-half arrow ends on the right
-                                    // edge pointing down — toward the
-                                    // tail of arrow 2 (top of right
-                                    // edge).
                                     ctx.beginPath();
-                                    ctx.moveTo(x1, yT + head);
-                                    ctx.lineTo(x1 - head * 0.7, yT - head * 0.3);
-                                    ctx.lineTo(x1 + head * 0.7, yT - head * 0.3);
+                                    ctx.moveTo(x1 + head * 0.4, y0);
+                                    ctx.lineTo(x1 - head, y0 - head * 0.7);
+                                    ctx.lineTo(x1 - head, y0 + head * 0.7);
                                     ctx.closePath();
                                     ctx.fill();
-                                    // Bottom-half arrow ends on the
-                                    // left edge pointing up — toward
-                                    // the tail of arrow 1 (bottom of
-                                    // left edge).
                                     ctx.beginPath();
-                                    ctx.moveTo(x0, yB - head);
-                                    ctx.lineTo(x0 - head * 0.7, yB + head * 0.3);
-                                    ctx.lineTo(x0 + head * 0.7, yB + head * 0.3);
+                                    ctx.moveTo(x0 - head * 0.4, y1);
+                                    ctx.lineTo(x0 + head, y1 - head * 0.7);
+                                    ctx.lineTo(x0 + head, y1 + head * 0.7);
                                     ctx.closePath();
                                     ctx.fill();
 
                                     // Centre dot when checked — same
-                                    // affordance the round version
-                                    // had so completed-state is still
-                                    // legible.
+                                    // affordance the round / squared
+                                    // earlier versions had so
+                                    // completed-state stays legible.
                                     if (completeBox.checked) {
                                         ctx.beginPath();
                                         ctx.arc(w / 2, h / 2, 2.5, 0, 2 * Math.PI);
