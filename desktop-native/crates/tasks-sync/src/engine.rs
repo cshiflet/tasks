@@ -32,11 +32,38 @@ use crate::provider::{Provider, RemoteCalendar, RemoteTask, SyncError, SyncOutco
 pub struct SyncEngine<'a> {
     db_path: &'a Path,
     provider: Box<dyn Provider>,
+    /// `caldav_accounts.cda_uuid` to scope writes to. When set,
+    /// `push_dirty` only considers rows whose `cd_calendar` joins
+    /// to a `caldav_lists` whose `cdl_account` equals this uuid —
+    /// otherwise pushing the user's CalDAV account would try to
+    /// upload tasks that belong to a different (Google /
+    /// Microsoft / Etebase) account and fail with garbled URL
+    /// errors. `None` means "every dirty row" — kept for the
+    /// engine's own integration tests.
+    account_filter: Option<String>,
 }
 
 impl<'a> SyncEngine<'a> {
     pub fn new(db_path: &'a Path, provider: Box<dyn Provider>) -> Self {
-        Self { db_path, provider }
+        Self {
+            db_path,
+            provider,
+            account_filter: None,
+        }
+    }
+
+    /// Per-account constructor. Identical to [`new`] but every
+    /// later push cycle filters by `cdl_account = account_uuid`.
+    pub fn new_for_account(
+        db_path: &'a Path,
+        provider: Box<dyn Provider>,
+        account_uuid: impl Into<String>,
+    ) -> Self {
+        Self {
+            db_path,
+            provider,
+            account_filter: Some(account_uuid.into()),
+        }
     }
 
     /// Connect + pull every calendar's tasks. Returns the count of
@@ -121,8 +148,8 @@ impl<'a> SyncEngine<'a> {
     pub async fn push_dirty(&mut self) -> SyncResult<SyncOutcome> {
         self.provider.connect().await?;
         let conn = open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
-        let dirty =
-            load_dirty_tasks(&conn).map_err(|e| SyncError::Local(format!("load dirty: {e}")))?;
+        let dirty = load_dirty_tasks(&conn, self.account_filter.as_deref())
+            .map_err(|e| SyncError::Local(format!("load dirty: {e}")))?;
         drop(conn); // Release the write handle before the async round trips.
 
         let mut pushed = 0usize;
@@ -177,18 +204,44 @@ fn now_ms() -> i64 {
 /// paired `tasks.modified` exceeds `cd_last_sync`, OR (to cover
 /// brand-new local tasks about to sync for the first time) rows
 /// whose `cd_last_sync` is 0.
-fn load_dirty_tasks(conn: &Connection) -> rusqlite::Result<Vec<RemoteTask>> {
-    let mut stmt = conn.prepare(
-        "SELECT t._id, t.title, t.notes, t.dueDate, t.completed, \
-                t.importance, t.recurrence, t.modified, t.remoteId, \
-                ct.cd_calendar, ct.cd_remote_id, ct.cd_etag, \
-                ct.cd_remote_parent, ct.cd_last_sync \
-         FROM tasks t \
-         JOIN caldav_tasks ct ON ct.cd_task = t._id \
-         WHERE t.deleted = 0 \
-           AND (ct.cd_last_sync = 0 OR t.modified > ct.cd_last_sync)",
-    )?;
-    let rows = stmt.query_map([], |r| {
+///
+/// `account_filter` scopes the query to tasks belonging to a
+/// specific `caldav_accounts.cda_uuid` — the bridge passes the
+/// uuid of the account being synced so a CalDAV push doesn't
+/// touch Google / Microsoft / Etebase rows. `None` returns every
+/// dirty row, used by the engine's own integration tests.
+fn load_dirty_tasks(
+    conn: &Connection,
+    account_filter: Option<&str>,
+) -> rusqlite::Result<Vec<RemoteTask>> {
+    let base = "SELECT t._id, t.title, t.notes, t.dueDate, t.completed, \
+                       t.importance, t.recurrence, t.modified, t.remoteId, \
+                       ct.cd_calendar, ct.cd_remote_id, ct.cd_etag, \
+                       ct.cd_remote_parent, ct.cd_last_sync \
+                FROM tasks t \
+                JOIN caldav_tasks ct ON ct.cd_task = t._id";
+    let (sql, account_uuid) = match account_filter {
+        Some(uuid) => (
+            format!(
+                "{base} \
+                 JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+                 WHERE t.deleted = 0 \
+                   AND (ct.cd_last_sync = 0 OR t.modified > ct.cd_last_sync) \
+                   AND cl.cdl_account = ?1"
+            ),
+            Some(uuid.to_string()),
+        ),
+        None => (
+            format!(
+                "{base} \
+                 WHERE t.deleted = 0 \
+                   AND (ct.cd_last_sync = 0 OR t.modified > ct.cd_last_sync)"
+            ),
+            None,
+        ),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RemoteTask> {
         let due_ms: i64 = r.get(3)?;
         let due_has_time = due_ms != 0 && due_ms % 60_000 != 0;
         Ok(RemoteTask {
@@ -205,10 +258,18 @@ fn load_dirty_tasks(conn: &Connection) -> rusqlite::Result<Vec<RemoteTask>> {
             parent_remote_id: r.get::<_, Option<String>>(12)?,
             raw_vtodo: None,
         })
-    })?;
+    };
     let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    if let Some(ref uuid) = account_uuid {
+        let rows = stmt.query_map(params![uuid], map_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    } else {
+        let rows = stmt.query_map([], map_row)?;
+        for row in rows {
+            out.push(row?);
+        }
     }
     Ok(out)
 }

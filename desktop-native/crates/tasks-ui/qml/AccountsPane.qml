@@ -182,6 +182,12 @@ ScrollView {
                 }
 
                 Button {
+                    text: qsTr("Edit")
+                    flat: true
+                    onClicked: if (pane.vm) editDialog.openFor(row.index)
+                }
+
+                Button {
                     text: qsTr("Remove")
                     flat: true
                     onClicked: if (pane.vm) pane.vm.removeAccount(row.index)
@@ -298,6 +304,23 @@ ScrollView {
 
     RowLayout {
         Layout.fillWidth: true
+        // Test runs `provider.connect()` against the entered creds
+        // without persisting — the result lands on the status bar.
+        // Hidden for OAuth providers because their sign-in flow
+        // isn't a credentials-only test.
+        Button {
+            text: qsTr("Test")
+            flat: true
+            visible: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
+            onClicked: {
+                if (!pane.vm) { return; }
+                pane.vm.testAccountConnection(
+                    pane.providerKinds[kindBox.currentIndex].index,
+                    serverField.text,
+                    userField.text,
+                    passwordField.text);
+            }
+        }
         Item { Layout.fillWidth: true }
         Button {
             id: addButton
@@ -331,6 +354,67 @@ ScrollView {
                     passwordField.text = "";
                 }
             }
+        }
+    }
+
+    // Inline edit dialog. Pre-fills with the row's current values;
+    // an empty password field on save preserves the existing one.
+    Dialog {
+        id: editDialog
+        modal: true
+        title: qsTr("Edit account")
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Save | Dialog.Cancel
+        // Stash so onAccepted can pass it back to the bridge.
+        property string targetUuid: ""
+
+        function openFor(idx) {
+            if (!pane.vm) { return; }
+            editDialog.targetUuid = pane.vm.accountUuids[idx] ?? "";
+            editLabel.text = pane.vm.accountLabels[idx] ?? "";
+            editServer.text = pane.vm.accountServers[idx] ?? "";
+            editUser.text = pane.vm.accountUsernames[idx] ?? "";
+            editPassword.text = "";
+            open();
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 8
+            implicitWidth: 380
+
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 2
+                columnSpacing: 12
+                rowSpacing: 8
+
+                Label { text: qsTr("Label"); opacity: 0.7 }
+                CompactTextField { id: editLabel; Layout.fillWidth: true }
+
+                Label { text: qsTr("Server URL"); opacity: 0.7 }
+                CompactTextField { id: editServer; Layout.fillWidth: true }
+
+                Label { text: qsTr("Username"); opacity: 0.7 }
+                CompactTextField { id: editUser; Layout.fillWidth: true }
+
+                Label { text: qsTr("Password"); opacity: 0.7 }
+                CompactTextField {
+                    id: editPassword
+                    Layout.fillWidth: true
+                    echoMode: TextInput.Password
+                    placeholderText: qsTr("(leave blank to keep current)")
+                }
+            }
+        }
+
+        onAccepted: {
+            if (!pane.vm || editDialog.targetUuid.length === 0) { return; }
+            pane.vm.updatePasswordAccount(
+                editDialog.targetUuid,
+                editLabel.text,
+                editServer.text,
+                editUser.text,
+                editPassword.text);
         }
     }
     }   // close inner ColumnLayout

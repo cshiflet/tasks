@@ -317,6 +317,35 @@ pub mod qobject {
         #[qinvokable]
         fn remove_account(self: Pin<&mut TaskListViewModel>, index: i32);
 
+        /// Mutate the account row identified by `cda_uuid` in place.
+        /// Used by the Accounts pane's Edit dialog. Empty
+        /// `password` keeps the existing one (so the user doesn't
+        /// have to retype to change the label / username / URL).
+        #[qinvokable]
+        fn update_password_account(
+            self: Pin<&mut TaskListViewModel>,
+            cda_uuid: QString,
+            label: QString,
+            server: QString,
+            username: QString,
+            password: QString,
+        );
+
+        /// Try connecting with the supplied credentials without
+        /// persisting anything. Surfaces the result on the status
+        /// bar so the Accounts pane's Test button can verify a
+        /// server-URL / username / password combination before the
+        /// user clicks Add account. `kind` matches the same
+        /// integers `add_password_account` uses.
+        #[qinvokable]
+        fn test_account_connection(
+            self: Pin<&mut TaskListViewModel>,
+            kind: i32,
+            server: QString,
+            username: QString,
+            password: QString,
+        );
+
         /// Drive a one-shot pull-then-push cycle against the account
         /// identified by `cda_uuid`. Blocks the QML thread for the
         /// duration of the call (acceptable for a manual button press
@@ -907,6 +936,147 @@ impl qobject::TaskListViewModel {
             .set_status(QString::from(&format!("Removed \"{}\".", removed.label)));
     }
 
+    /// Update an existing account's editable fields (label, server,
+    /// username, password). Empty `password` preserves the current
+    /// value — the dialog leaves the password field blank by
+    /// default so the user only re-enters it when changing it.
+    pub fn update_password_account(
+        mut self: Pin<&mut Self>,
+        cda_uuid: QString,
+        label: QString,
+        server: QString,
+        username: QString,
+        password: QString,
+    ) {
+        let uuid = cda_uuid.to_string();
+        let label_s = label.to_string().trim().to_string();
+        let server_s = server.to_string().trim().to_string();
+        let username_s = username.to_string().trim().to_string();
+        let password_s = password.to_string();
+        if label_s.is_empty() || server_s.is_empty() || username_s.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Label, server, and username are required."));
+            return;
+        }
+        let Some(idx) = self.accounts.iter().position(|a| a.uuid == uuid) else {
+            self.as_mut()
+                .set_status(QString::from(&format!("No account with uuid {uuid}.")));
+            return;
+        };
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database before editing an account."));
+            return;
+        };
+        // Persist via a transient RW connection. Empty password
+        // preserves the existing one — caller blank-defaults the
+        // field so a user fixing a typo doesn't have to retype the
+        // password.
+        let res = open_rw_conn(&path).and_then(|conn| {
+            if password_s.is_empty() {
+                conn.execute(
+                    "UPDATE caldav_accounts \
+                     SET cda_name = ?1, cda_url = ?2, cda_username = ?3 \
+                     WHERE cda_uuid = ?4",
+                    rusqlite::params![label_s, server_s, username_s, uuid],
+                )
+                .map(|_| ())
+            } else {
+                conn.execute(
+                    "UPDATE caldav_accounts \
+                     SET cda_name = ?1, cda_url = ?2, cda_username = ?3, cda_password = ?4 \
+                     WHERE cda_uuid = ?5",
+                    rusqlite::params![label_s, server_s, username_s, password_s, uuid],
+                )
+                .map(|_| ())
+            }
+        });
+        if let Err(e) = res {
+            self.as_mut()
+                .set_status(QString::from(&format!("DB write failed: {e}")));
+            return;
+        }
+        {
+            let mut inner = self.as_mut().rust_mut();
+            let acct = &mut inner.accounts[idx];
+            acct.label = label_s.clone();
+            acct.server = server_s;
+            acct.username = username_s;
+            if !password_s.is_empty() {
+                acct.password = SecretString::from(password_s);
+            }
+        }
+        publish_accounts(self.as_mut());
+        self.as_mut()
+            .set_status(QString::from(&format!("Updated \"{}\".", label_s)));
+    }
+
+    /// Try `provider.connect()` against `(kind, server, username,
+    /// password)` without persisting anything. The Accounts pane's
+    /// Test button uses this to verify credentials before the user
+    /// commits via Add account. Status-bar text reports success or
+    /// the underlying error message.
+    pub fn test_account_connection(
+        mut self: Pin<&mut Self>,
+        kind: i32,
+        server: QString,
+        username: QString,
+        password: QString,
+    ) {
+        if kind != KIND_CALDAV && kind != KIND_ETESYNC {
+            self.as_mut()
+                .set_status(QString::from("Test only supports CalDAV / EteSync today."));
+            return;
+        }
+        let server_s = server.to_string().trim().to_string();
+        let username_s = username.to_string().trim().to_string();
+        let password_s = password.to_string();
+        if server_s.is_empty() || username_s.is_empty() || password_s.is_empty() {
+            self.as_mut().set_status(QString::from(
+                "Server, username, and password are required to test.",
+            ));
+            return;
+        }
+        if self.runtime.is_none() {
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("tasks-sync")
+                .build()
+            {
+                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
+                Err(e) => {
+                    self.as_mut()
+                        .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
+                    return;
+                }
+            }
+        }
+        self.as_mut()
+            .set_status(QString::from("Testing connection…"));
+        let creds = AccountCredentials::new_password(&server_s, &username_s, password_s);
+        let mut provider: Box<dyn Provider> = match kind {
+            KIND_CALDAV => Box::new(CalDavProvider::new(creds, "test")),
+            KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, "test")),
+            _ => unreachable!("kind validated above"),
+        };
+        let result = self
+            .as_mut()
+            .rust_mut()
+            .runtime
+            .as_ref()
+            .expect("runtime constructed above")
+            .block_on(async move { provider.connect().await });
+        match result {
+            Ok(()) => self
+                .as_mut()
+                .set_status(QString::from("Test successful — credentials work.")),
+            Err(e) => self
+                .as_mut()
+                .set_status(QString::from(&format!("Test failed: {e}"))),
+        }
+    }
+
     /// Run a single sync cycle (pull + push) against the account
     /// keyed by `cda_uuid`. Synchronous wrt. the QML caller — the
     /// app freezes until the cycle finishes. Acceptable for a
@@ -981,6 +1151,7 @@ impl qobject::TaskListViewModel {
 
         // SyncEngine borrows the db path; the ref needs to outlive
         // the future, so the PathBuf binding above keeps it alive.
+        let uuid_for_engine = uuid.clone();
         let result = self
             .as_mut()
             .rust_mut()
@@ -988,7 +1159,14 @@ impl qobject::TaskListViewModel {
             .as_ref()
             .expect("runtime constructed above")
             .block_on(async move {
-                let mut engine = SyncEngine::new(&db_path, provider);
+                // Scope push_dirty to this account so we don't try
+                // to upload tasks belonging to a different
+                // (Google / Microsoft / Etebase) account through a
+                // CalDAV / EteSync provider — that produces
+                // garbled "bad calendar url" errors when the
+                // foreign account stored a non-URL cd_calendar
+                // (Google list ids are numeric, etc.).
+                let mut engine = SyncEngine::new_for_account(&db_path, provider, uuid_for_engine);
                 engine.sync_now().await
             });
 
