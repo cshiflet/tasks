@@ -387,23 +387,10 @@ Pane {
                                 root.vm.syncAccount(root._accountUuidOf(row.myGroup));
                             }
                         }
-                        MenuSeparator {}
-                        MenuItem {
-                            text: qsTr("Remove account…")
-                            onTriggered: {
-                                if (!root.vm) { return; }
-                                // Find the account index by uuid;
-                                // removeAccount takes an index.
-                                const target = root._accountUuidOf(row.myGroup);
-                                const uuids = root.vm.accountUuids;
-                                for (let i = 0; i < uuids.length; i++) {
-                                    if (uuids[i] === target) {
-                                        root.vm.removeAccount(i);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        // "Remove account" deliberately lives only in
+                        // Settings → Accounts, not here: removing an
+                        // account from a quick right-click is too
+                        // easy to do by accident.
                     }
                 }
 

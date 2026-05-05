@@ -31,7 +31,7 @@ use crate::provider::{Provider, RemoteCalendar, RemoteTask, SyncError, SyncOutco
 /// pulled state into the local SQLite at `db_path`.
 pub struct SyncEngine<'a> {
     db_path: &'a Path,
-    provider: Box<dyn Provider>,
+    provider: Box<dyn Provider + Send>,
     /// `caldav_accounts.cda_uuid` to scope writes to. When set,
     /// `push_dirty` only considers rows whose `cd_calendar` joins
     /// to a `caldav_lists` whose `cdl_account` equals this uuid —
@@ -44,7 +44,7 @@ pub struct SyncEngine<'a> {
 }
 
 impl<'a> SyncEngine<'a> {
-    pub fn new(db_path: &'a Path, provider: Box<dyn Provider>) -> Self {
+    pub fn new(db_path: &'a Path, provider: Box<dyn Provider + Send>) -> Self {
         Self {
             db_path,
             provider,
@@ -56,7 +56,7 @@ impl<'a> SyncEngine<'a> {
     /// later push cycle filters by `cdl_account = account_uuid`.
     pub fn new_for_account(
         db_path: &'a Path,
-        provider: Box<dyn Provider>,
+        provider: Box<dyn Provider + Send>,
         account_uuid: impl Into<String>,
     ) -> Self {
         Self {

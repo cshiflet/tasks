@@ -368,12 +368,19 @@ pub mod qobject {
         );
 
         /// Drive a one-shot pull-then-push cycle against the account
-        /// identified by `cda_uuid`. Blocks the QML thread for the
-        /// duration of the call (acceptable for a manual button press
-        /// against a local test server; a future change moves the
-        /// dispatch onto a worker thread + signal).
+        /// identified by `cda_uuid`. Returns immediately — the
+        /// actual cycle runs on a background worker thread, and a
+        /// `qt_thread.queue` callback rejoins the QML thread to
+        /// publish the result.
         #[qinvokable]
         fn sync_account(self: Pin<&mut TaskListViewModel>, cda_uuid: QString);
+
+        /// Dispatch a sync against every non-local account. Wired
+        /// to the toolbar's manual Sync button. Same async dispatch
+        /// model as `sync_account`; status flows through the
+        /// status-bar text per account.
+        #[qinvokable]
+        fn sync_all_accounts(self: Pin<&mut TaskListViewModel>);
 
         /// Create a calendar / task list on `cda_uuid`'s server with
         /// the given display name and (optional) i32 ARGB colour.
@@ -1109,7 +1116,7 @@ impl qobject::TaskListViewModel {
         self.as_mut()
             .set_last_test_result(QString::from("Testing connection…"));
         let creds = AccountCredentials::new_password(&server_s, &username_s, password_s);
-        let mut provider: Box<dyn Provider> = match kind {
+        let mut provider: Box<dyn Provider + Send> = match kind {
             KIND_CALDAV => Box::new(CalDavProvider::new(creds, "test")),
             KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, "test")),
             _ => unreachable!("kind validated above"),
@@ -1140,6 +1147,13 @@ impl qobject::TaskListViewModel {
     /// On success: rebuilds the sidebar so newly-pulled calendars
     /// appear, and reloads the active filter so any newly-pulled
     /// tasks show up in the list pane.
+    /// Run a single sync cycle (pull + push) against the account
+    /// keyed by `cda_uuid`. Returns immediately — the actual cycle
+    /// runs on the background tokio runtime, and a `qt_thread.queue`
+    /// callback rejoins the QML thread once it finishes to update
+    /// the sidebar + status bar. Status surfaces as
+    /// "Syncing <label>…" while in flight, then "<label>: Done" or
+    /// "Sync of <label> failed: …" on completion.
     pub fn sync_account(mut self: Pin<&mut Self>, cda_uuid: QString) {
         let uuid = cda_uuid.to_string();
         let Some(stored) = self.accounts.iter().find(|a| a.uuid == uuid).cloned() else {
@@ -1172,26 +1186,16 @@ impl qobject::TaskListViewModel {
             }
         }
 
-        // Update the per-row state to "Syncing…" before the blocking
-        // call so the user sees feedback even though the UI thread
-        // freezes for the duration.
-        set_account_state(self.as_mut(), &uuid, "Syncing…");
-        self.as_mut()
-            .set_status(QString::from(&format!("Syncing {}…", stored.label)));
-
-        // Build the right Provider for the account kind. CalDAV /
-        // EteSync are password-based; OAuth providers
-        // (Google / Microsoft) live behind a sign-in flow that
-        // hasn't been wired yet, so refuse those here.
+        // Build the right Provider before we leave the QML thread
+        // — the credential plumbing reads from `self.accounts` and
+        // needs the `&self` borrow.
         let creds = AccountCredentials::new_password(
             &stored.server,
             &stored.username,
-            // The SecretString deref via expose_secret() is the
-            // narrow path agreed in provider.rs's docstring.
             secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
         );
         let label = stored.label.clone();
-        let provider: Box<dyn Provider> = match stored.kind {
+        let provider: Box<dyn Provider + Send> = match stored.kind {
             KIND_CALDAV => Box::new(CalDavProvider::new(creds, label.clone())),
             KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, label.clone())),
             _ => {
@@ -1203,73 +1207,91 @@ impl qobject::TaskListViewModel {
             }
         };
 
-        // SyncEngine borrows the db path; the ref needs to outlive
-        // the future, so the PathBuf binding above keeps it alive.
-        let uuid_for_engine = uuid.clone();
-        let result = self
+        // Initial in-flight state on the QML thread.
+        set_account_state(self.as_mut(), &uuid, "Syncing…");
+        self.as_mut()
+            .set_status(QString::from(&format!("Syncing {label}…")));
+
+        // Snapshot what the worker thread + completion callback
+        // need. CxxQtThread, the runtime handle, the path, the uuid
+        // / label strings, and the boxed Send-typed Provider are
+        // all Send + 'static.
+        let qt_thread = self.as_ref().qt_thread();
+        let runtime = self
             .as_mut()
             .rust_mut()
             .runtime
             .as_ref()
             .expect("runtime constructed above")
-            .block_on(async move {
-                // Scope push_dirty to this account so we don't try
-                // to upload tasks belonging to a different
-                // (Google / Microsoft / Etebase) account through a
-                // CalDAV / EteSync provider — that produces
-                // garbled "bad calendar url" errors when the
-                // foreign account stored a non-URL cd_calendar
-                // (Google list ids are numeric, etc.).
-                let mut engine = SyncEngine::new_for_account(&db_path, provider, uuid_for_engine);
-                engine.sync_now().await
-            });
+            .handle()
+            .clone();
+        let uuid_owned = uuid.clone();
+        let label_owned = label.clone();
 
-        match result {
-            Ok(outcome) => {
-                let summary = format!(
-                    "Synced {}: {} pulled, {} pushed",
-                    stored.label, outcome.tasks_pulled, outcome.tasks_pushed
-                );
-                set_account_state(
-                    self.as_mut(),
-                    &uuid,
-                    &format!(
-                        "Synced ({}↓ / {}↑)",
-                        outcome.tasks_pulled, outcome.tasks_pushed
-                    ),
-                );
-                self.as_mut().set_status(QString::from(&summary));
+        // `runtime.spawn` would require the future to be Send, but
+        // SyncEngine's pull cycle holds a `rusqlite::Transaction`
+        // (which borrows `&Connection`) across `.await` points and
+        // `Connection` is !Sync. Drive the future from a dedicated
+        // OS thread via `block_on` instead — that polls in place,
+        // so the !Sync borrow never crosses thread boundaries.
+        // Once the future resolves, queue a callback back onto the
+        // QML thread so the Q_PROPERTY updates run with exclusive
+        // pinned-mut access.
+        std::thread::Builder::new()
+            .name(format!("sync:{label}"))
+            .spawn(move || {
+                let uuid_for_engine = uuid_owned.clone();
+                let result = runtime.block_on(async move {
+                    let mut engine =
+                        SyncEngine::new_for_account(&db_path, provider, uuid_for_engine);
+                    engine.sync_now().await
+                });
+                let _ = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    match result {
+                        Ok(outcome) => {
+                            set_account_state(
+                                pinned.as_mut(),
+                                &uuid_owned,
+                                &format!(
+                                    "Synced ({}↓ / {}↑)",
+                                    outcome.tasks_pulled, outcome.tasks_pushed
+                                ),
+                            );
+                            pinned
+                                .as_mut()
+                                .set_status(QString::from(&format!("{label_owned}: Done")));
+                            refresh_sidebar(pinned.as_mut());
+                            pinned.as_mut().reload_active_filter();
+                        }
+                        Err(e) => {
+                            let msg = format!("Sync of {label_owned} failed: {e}");
+                            tracing::warn!("{msg}");
+                            set_account_state(
+                                pinned.as_mut(),
+                                &uuid_owned,
+                                &format!("Failed: {e}"),
+                            );
+                            pinned.as_mut().set_status(QString::from(&msg));
+                        }
+                    }
+                });
+            })
+            .expect("spawn sync worker thread");
+    }
 
-                // Refresh sidebar + active filter so newly-pulled
-                // calendars + tasks land in the UI without forcing
-                // the user to reopen the DB.
-                if let Some(db) = &self.db {
-                    let (labels, ids, kinds, groups, colors) = build_sidebar(db);
-                    let labels_qsl = string_list_from_iter(labels.iter().map(String::as_str));
-                    let ids_qsl = string_list_from_iter(ids.iter().map(String::as_str));
-                    let groups_qsl = string_list_from_iter(groups.iter().map(String::as_str));
-                    let mut kl: QList<i32> = QList::default();
-                    for k in &kinds {
-                        kl.append(*k);
-                    }
-                    let mut cl: QList<i32> = QList::default();
-                    for c in &colors {
-                        cl.append(*c);
-                    }
-                    self.as_mut().set_sidebar_labels(labels_qsl);
-                    self.as_mut().set_sidebar_ids(ids_qsl);
-                    self.as_mut().set_sidebar_account_kinds(kl);
-                    self.as_mut().set_sidebar_groups(groups_qsl);
-                    self.as_mut().set_sidebar_colors(cl);
-                }
-                self.as_mut().reload_active_filter();
-            }
-            Err(e) => {
-                let msg = format!("Sync of {} failed: {e}", stored.label);
-                tracing::warn!("{msg}");
-                set_account_state(self.as_mut(), &uuid, &format!("Failed: {e}"));
-                self.as_mut().set_status(QString::from(&msg));
-            }
+    /// Fan out a `sync_account` dispatch to every non-OAuth, non-
+    /// local account currently in `self.accounts`. Wired to the
+    /// toolbar's manual Sync button + to the auto-sync hooks
+    /// triggered by task create / edit / delete.
+    pub fn sync_all_accounts(mut self: Pin<&mut Self>) {
+        let uuids: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|a| a.kind == KIND_CALDAV || a.kind == KIND_ETESYNC)
+            .map(|a| a.uuid.clone())
+            .collect();
+        for uuid in uuids {
+            self.as_mut().sync_account(QString::from(&uuid));
         }
     }
 
@@ -1373,7 +1395,7 @@ impl qobject::TaskListViewModel {
             &stored.username,
             secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
         );
-        let mut provider: Box<dyn Provider> = match stored.kind {
+        let mut provider: Box<dyn Provider + Send> = match stored.kind {
             KIND_CALDAV => Box::new(CalDavProvider::new(creds, stored.label.clone())),
             KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, stored.label.clone())),
             _ => {
@@ -1447,6 +1469,7 @@ impl qobject::TaskListViewModel {
                 self.as_mut().select_task(new_id);
                 self.as_mut()
                     .set_status(QString::from(&format!("Created \"{title_trim}\"")));
+                auto_sync_for_task(self.as_mut(), new_id);
             }
             Err(e) => {
                 let msg = format!("Couldn't create task: {e}");
@@ -1478,6 +1501,7 @@ impl qobject::TaskListViewModel {
                 if self.selected_id == id {
                     self.as_mut().set_selected_completed(completed);
                 }
+                auto_sync_for_task(self.as_mut(), id);
             }
             Ok(false) => {
                 self.as_mut()
@@ -1524,6 +1548,11 @@ impl qobject::TaskListViewModel {
                 };
                 self.as_mut()
                     .set_status(QString::from(&format!("Deleted {display}. Undo?")));
+                // Push the soft-delete to the server so the row's
+                // tombstone reaches its CalDAV / EteSync home. The
+                // engine's push_dirty path picks up rows whose
+                // `tasks.deleted > 0` and issues DELETE.
+                auto_sync_for_task(self.as_mut(), id);
             }
             Ok(false) => {
                 self.as_mut()
@@ -1565,6 +1594,7 @@ impl qobject::TaskListViewModel {
                 };
                 self.as_mut()
                     .set_status(QString::from(&format!("Restored {display}.")));
+                auto_sync_for_task(self.as_mut(), id);
             }
             Ok(false) => {
                 // The row wasn't deleted — clear pinned state so the
@@ -1827,6 +1857,7 @@ impl qobject::TaskListViewModel {
                 // sees their edits reflected without having to
                 // re-click the row.
                 self.as_mut().select_task(id);
+                auto_sync_for_task(self.as_mut(), id);
             }
             Ok(false) => {
                 self.as_mut()
@@ -2800,6 +2831,87 @@ fn ensure_local_default_list(path: &std::path::Path) {
 /// `tasks-core`'s helpers (currently just our `caldav_accounts`
 /// add / remove) get their own brief RW connection that closes
 /// once the call returns.
+/// Recompute the sidebar from the open DB and republish every
+/// parallel Q_PROPERTY the QML side reads. Factored out so the
+/// background sync completion path (which queues a callback onto
+/// the QML thread) can call it through a single function pointer
+/// rather than duplicating the five `set_xxx` calls.
+/// Look up the syncable owner of `task_id`. Returns `None` when:
+/// * The task has no `caldav_tasks` row (purely local, no remote
+///   to push to).
+/// * The owning account's `cda_account_type` is LOCAL (2) — the
+///   default `local-default` Inbox falls into this bucket.
+/// * Any of the joins miss (orphaned row, etc.).
+///
+/// Callers that get `Some(uuid)` dispatch a `sync_account`
+/// against it so the just-mutated row reaches the server without
+/// waiting for the user to hit the toolbar's manual Sync button.
+fn syncable_account_for_task(db: &Database, task_id: i64) -> Option<String> {
+    db.connection()
+        .query_row(
+            "SELECT cl.cdl_account FROM caldav_tasks ct \
+             JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+             JOIN caldav_accounts ca ON ca.cda_uuid = cl.cdl_account \
+             WHERE ct.cd_task = ?1 AND ca.cda_account_type != 2 \
+             LIMIT 1",
+            [task_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// Wrapper that runs `syncable_account_for_task` against the
+/// view model's open DB and dispatches `sync_account` if a
+/// non-local owner exists. No-op for tasks that belong to the
+/// local-default account (the desktop's built-in Inbox) — those
+/// don't need a network round-trip.
+fn auto_sync_for_task(mut vm: Pin<&mut qobject::TaskListViewModel>, task_id: i64) {
+    let uuid = {
+        let r = vm.as_ref();
+        let inner = r.rust();
+        inner
+            .db
+            .as_ref()
+            .and_then(|db| syncable_account_for_task(db, task_id))
+    };
+    if let Some(uuid) = uuid {
+        vm.as_mut().sync_account(QString::from(&uuid));
+    }
+}
+
+fn refresh_sidebar(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    // Compute the new arrays inside a scope that holds the
+    // immutable Rust borrow on the view model, then drop the
+    // borrow before the cxx-qt `set_*` methods take Pin<&mut Self>.
+    // Without the explicit binding, `vm.as_ref()` is a temporary
+    // that dies before `build_sidebar` finishes using it.
+    let computed = {
+        let r = vm.as_ref();
+        let inner = r.rust();
+        inner.db.as_ref().map(build_sidebar)
+    };
+    let Some((labels, ids, kinds, groups, colors)) = computed else {
+        return;
+    };
+    let labels_qsl = string_list_from_iter(labels.iter().map(String::as_str));
+    let ids_qsl = string_list_from_iter(ids.iter().map(String::as_str));
+    let groups_qsl = string_list_from_iter(groups.iter().map(String::as_str));
+    let mut kl: QList<i32> = QList::default();
+    for k in &kinds {
+        kl.append(*k);
+    }
+    let mut cl: QList<i32> = QList::default();
+    for c in &colors {
+        cl.append(*c);
+    }
+    vm.as_mut().set_sidebar_labels(labels_qsl);
+    vm.as_mut().set_sidebar_ids(ids_qsl);
+    vm.as_mut().set_sidebar_account_kinds(kl);
+    vm.as_mut().set_sidebar_groups(groups_qsl);
+    vm.as_mut().set_sidebar_colors(cl);
+}
+
 fn open_rw_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
     let flags =
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;

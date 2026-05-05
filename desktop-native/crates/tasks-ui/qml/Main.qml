@@ -371,6 +371,67 @@ ApplicationWindow {
             // `TextOnly` — the previous version used
             // `display: IconOnly` which strips text rendering, so
             // the buttons rendered as transparent click targets.
+            //
+            // Manual Sync button — fans out a sync_account dispatch
+            // against every non-OAuth account. The actual cycle
+            // runs on a worker thread; status flows through the
+            // bottom status bar ("Syncing <label>…" → "<label>:
+            // Done").
+            ToolButton {
+                id: syncAllButton
+                Layout.preferredWidth: 36
+                Layout.preferredHeight: 36
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Sync all accounts")
+                onClicked: viewModel.syncAllAccounts()
+                contentItem: Canvas {
+                    id: syncIcon
+                    implicitWidth: 18
+                    implicitHeight: 18
+                    onPaint: {
+                        // Two arrows forming a circular refresh
+                        // glyph — same Canvas approach as the
+                        // recurring-task indicator, scaled up.
+                        const ctx = getContext("2d");
+                        ctx.reset();
+                        ctx.lineWidth = 1.6;
+                        ctx.lineCap = "round";
+                        ctx.lineJoin = "round";
+                        ctx.strokeStyle = syncAllButton.Material.foreground;
+                        ctx.fillStyle = syncAllButton.Material.foreground;
+                        const cx = width / 2;
+                        const cy = height / 2;
+                        const r = Math.min(width, height) / 2 - 2;
+                        // Two ~150° arcs leaving small gaps for the
+                        // arrowheads at the right and left.
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, r, -Math.PI * 0.4, Math.PI * 0.4);
+                        ctx.stroke();
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, r, Math.PI * 0.6, Math.PI * 1.4);
+                        ctx.stroke();
+                        const head = 3.2;
+                        // Right arrowhead — points down.
+                        const xR = cx + r * Math.cos(Math.PI * 0.4);
+                        const yR = cy + r * Math.sin(Math.PI * 0.4);
+                        ctx.beginPath();
+                        ctx.moveTo(xR, yR);
+                        ctx.lineTo(xR - head, yR - head * 0.6);
+                        ctx.lineTo(xR + head * 0.4, yR - head);
+                        ctx.closePath();
+                        ctx.fill();
+                        // Left arrowhead — points up.
+                        const xL = cx + r * Math.cos(Math.PI * 1.4);
+                        const yL = cy + r * Math.sin(Math.PI * 1.4);
+                        ctx.beginPath();
+                        ctx.moveTo(xL, yL);
+                        ctx.lineTo(xL + head, yL + head * 0.6);
+                        ctx.lineTo(xL - head * 0.4, yL + head);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+                }
+            }
             ToolButton {
                 id: importButton
                 action: importBackupAction
