@@ -113,6 +113,26 @@ ColumnLayout {
 
     RowLayout {
         Layout.fillWidth: true
+        // Inline confirmation. Fades out after 3s; an explicit
+        // toast / snackbar would be heavier than this needs to be
+        // since the pane already owns the relevant real estate.
+        Label {
+            id: savedFeedback
+            text: qsTr("Defaults saved.")
+            color: "#2e7d32"   // success green, matches Test successful in AccountsPane
+            font.pointSize: Qt.application.font.pointSize - 1
+            opacity: 0
+            Behavior on opacity { NumberAnimation { duration: 200 } }
+            Timer {
+                id: savedFeedbackHide
+                interval: 3000
+                onTriggered: savedFeedback.opacity = 0
+            }
+            function flash() {
+                opacity = 1;
+                savedFeedbackHide.restart();
+            }
+        }
         Item { Layout.fillWidth: true }
         Button {
             text: qsTr("Save defaults")
@@ -127,6 +147,7 @@ ColumnLayout {
                     showCompletedBox.checked,
                     showHiddenBox.checked,
                     completedAtBottomBox.checked);
+                savedFeedback.flash();
             }
         }
     }

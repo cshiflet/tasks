@@ -66,6 +66,7 @@ ApplicationWindow {
         TabButton { text: qsTr("General") }
         TabButton { text: qsTr("List defaults") }
         TabButton { text: qsTr("Accounts") }
+        TabButton { text: qsTr("Data") }
     }
 
     // Pane wrapper anchors the Material attached context so the
@@ -95,6 +96,11 @@ ApplicationWindow {
 
             AccountsPane {
                 id: accountsPane
+                vm: settingsWindow.vm
+            }
+
+            DataSettingsPane {
+                id: dataPane
                 vm: settingsWindow.vm
             }
         }

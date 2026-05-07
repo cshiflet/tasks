@@ -470,10 +470,32 @@ ApplicationWindow {
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Sync all accounts")
                 onClicked: viewModel.syncAllAccounts()
+                // True while any account's state is "Syncing…".
+                // The icon spins while this is high; lands snapping
+                // back to its rest angle when the last in-flight
+                // account flips back to "Done" / "Idle" / an error.
+                readonly property bool syncInFlight: {
+                    if (!viewModel.accountSyncStates) { return false; }
+                    for (let i = 0; i < viewModel.accountSyncStates.length; i++) {
+                        if (viewModel.accountSyncStates[i] === "Syncing…") {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 contentItem: Canvas {
                     id: syncIcon
                     implicitWidth: 18
                     implicitHeight: 18
+                    // Spin while a sync is in flight. Counter-clockwise
+                    // matches the painted arrowhead direction and the
+                    // browser-refresh muscle memory.
+                    RotationAnimation on rotation {
+                        running: syncAllButton.syncInFlight
+                        from: 0; to: 360
+                        duration: 900
+                        loops: Animation.Infinite
+                    }
                     onPaint: {
                         // Two arrows forming a circular refresh
                         // glyph — same Canvas approach as the
@@ -515,51 +537,6 @@ ApplicationWindow {
                         ctx.lineTo(xL - head * 0.4, yL + head);
                         ctx.closePath();
                         ctx.fill();
-                    }
-                }
-            }
-            ToolButton {
-                id: importButton
-                action: importBackupAction
-                Layout.preferredWidth: 36
-                Layout.preferredHeight: 36
-                ToolTip.visible: hovered
-                ToolTip.text: qsTr("Import a Tasks.org JSON backup")
-                // Painted inbox-tray icon — same Canvas approach
-                // the magnifier uses. The U+1F4E5 📥 emoji depends
-                // on a colour-emoji font Linux hosts don't ship by
-                // default, so the original glyph rendered as an
-                // empty box. Drawing it ourselves dodges the font
-                // dependency entirely.
-                contentItem: Canvas {
-                    id: importIcon
-                    implicitWidth: 18
-                    implicitHeight: 18
-                    onPaint: {
-                        const ctx = getContext("2d");
-                        ctx.reset();
-                        ctx.lineWidth = 1.6;
-                        ctx.lineCap = "round";
-                        ctx.lineJoin = "round";
-                        ctx.strokeStyle = importButton.Material.foreground;
-                        // Down-arrow, top half.
-                        ctx.beginPath();
-                        ctx.moveTo(9, 1);
-                        ctx.lineTo(9, 11);
-                        ctx.stroke();
-                        // Arrowhead.
-                        ctx.beginPath();
-                        ctx.moveTo(5, 7);
-                        ctx.lineTo(9, 11);
-                        ctx.lineTo(13, 7);
-                        ctx.stroke();
-                        // Tray — open box across the bottom.
-                        ctx.beginPath();
-                        ctx.moveTo(2, 12);
-                        ctx.lineTo(2, 16);
-                        ctx.lineTo(16, 16);
-                        ctx.lineTo(16, 12);
-                        ctx.stroke();
                     }
                 }
             }

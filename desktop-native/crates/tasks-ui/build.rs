@@ -27,6 +27,7 @@ fn main() {
                 "qml/GeneralSettingsPane.qml",
                 "qml/ListSettingsPane.qml",
                 "qml/AccountsPane.qml",
+                "qml/DataSettingsPane.qml",
                 "qml/DatePickerButton.qml",
                 "qml/CompactTextField.qml",
                 "qml/CompactMenuItem.qml",
