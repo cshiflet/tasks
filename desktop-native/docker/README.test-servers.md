@@ -41,12 +41,28 @@ weak — never reuse on a publicly-reachable server.**
 | Radicale | `http://127.0.0.1:5232/.web/`  | `test`        | `test`                            |
 
 The Etebase service ships with `AUTO_SIGNUP=true`, so anonymous
-clients can call the public signup endpoint. The desktop client
-detects when the server URL is on a loopback address
-(`127.0.0.1` / `localhost` / `[::1]`) and falls back to
-`Account::signup` on first sign-in if the user doesn't exist
-yet — meaning **`alice` is created on demand** the first time the
-desktop client syncs against it. No Django-shell dance required.
+clients can call the public signup endpoint. **`alice` is created
+automatically** by the `etebase-bootstrap` sidecar service in the
+compose file, which runs once after the Etebase server reports
+healthy and uses the Etebase Python SDK to either log in or
+sign up the test user. The script is idempotent — re-running
+`up` after the user exists is a no-op.
+
+The desktop client also has its own auto-signup fallback (gated
+on loopback URLs) as a belt-and-braces second path, so even
+without the bootstrap sidecar the first sign-in from the
+desktop will create `alice`. The sidecar exists so CI / pre-warmed
+stacks have the user ready before any client connects, and so
+clients without a signup-fallback (e.g. mobile, third-party
+Etebase apps) can connect to the test stack without ceremony.
+
+> **Why a sidecar instead of `manage.py` shell?** Etebase's login
+> is challenge-response over a per-user keypair; only the public
+> key lives on the server, and it's uploaded by a real client
+> during signup. A `manage.py shell` `User.objects.create_user(...)`
+> creates a Django-auth row that can sign into `/admin/` but is
+> invisible to the Etebase API. Bootstrap therefore needs a
+> client SDK call, which is what the sidecar runs.
 
 ## Verify the stack is reachable
 
@@ -101,29 +117,30 @@ creates a fresh CalDAV calendar via `MKCALENDAR`.
 To add more Radicale users, edit `radicale-config/users` and
 append `htpasswd -B`-style bcrypt entries.
 
-## Adding the Etebase user manually (rarely needed)
+## Re-running the Etebase bootstrap
 
-The auto-signup fallback means most users never need this. If
-you're testing the **password-only** path (e.g. a custom
-`with_signup_fallback(false)` build), or pointing a different
-client at the server, create `alice` out-of-band:
+The `etebase-bootstrap` sidecar runs automatically on `up` and
+exits 0 after `alice` exists. To re-run manually (e.g. after
+changing the test password or migrating to a new server URL):
 
 ```sh
-docker compose -f docker-compose.test-servers.yml exec etebase \
-    /etebase/manage.py shell -c "
-from django.contrib.auth import get_user_model
-U = get_user_model()
-u, _ = U.objects.get_or_create(username='alice', defaults={'email': 'alice@example.com'})
-u.set_password('alicepw'); u.save()
-print('alice ready')
-"
+docker compose -f docker-compose.test-servers.yml run --rm etebase-bootstrap
 ```
 
-The shell path inside the locally-built image is
-`/etebase/manage.py`; it changed from `/etebase-server/manage.py`
-when we moved off the upstream Docker Hub image. If a future
-upstream bump rearranges things, check `etebase/UPSTREAM.md` for
-the current layout.
+To bootstrap a *different* user without rebuilding the sidecar
+image, override the env vars inline:
+
+```sh
+docker compose -f docker-compose.test-servers.yml run --rm \
+    -e ETEBASE_TEST_USER=bob \
+    -e ETEBASE_TEST_EMAIL=bob@example.com \
+    -e ETEBASE_TEST_PASSWORD=bobpw \
+    etebase-bootstrap
+```
+
+The script logs `bootstrap: <user> already exists and login
+works — nothing to do` when the target user is already set up,
+or `bootstrap: signed up <user>` when it created the row.
 
 ## Security caveats
 

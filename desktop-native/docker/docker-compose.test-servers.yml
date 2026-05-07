@@ -20,9 +20,10 @@
 # to the public internet:
 #
 #   Etebase    http://127.0.0.1:3735
-#              admin (Django) : admin / changeme
-#              create the test user via the management command
-#              shown in README.test-servers.md
+#              admin (Django)        : admin / changeme
+#              EteSync test user     : alice / alicepw
+#              (created automatically by the etebase-bootstrap
+#               sidecar once the server reports healthy)
 #   Radicale   http://127.0.0.1:5232
 #              user:     test / test
 #              calendar: http://127.0.0.1:5232/test/test-calendar/
@@ -46,7 +47,16 @@ services:
       ETEBASE_TEST_USER: alice
       ETEBASE_TEST_EMAIL: alice@example.com
       ETEBASE_TEST_PASSWORD: alicepw
-      ALLOWED_HOSTS: "localhost"
+      # Allow the loopback hosts the desktop client and curl
+      # actually use. With just "localhost" the dev server
+      # returns 400 "Invalid host header" for any request whose
+      # Host: header is `127.0.0.1:3735` (which is what every
+      # http://127.0.0.1:3735 client sends), and the etebase
+      # Rust crate surfaces that as `Code: null Detail: null`.
+      # Listing both names keeps either form working; the
+      # `etebase` service-name entry covers the bootstrap
+      # sidecar's intra-network call.
+      ALLOWED_HOSTS: "localhost,127.0.0.1,etebase"
       TIME_ZONE: "America/Denver"
       AUTO_SIGNUP: "true"
     ports:
@@ -67,6 +77,31 @@ services:
     volumes:
       - etebase_data:/data:rw
 
+  # One-shot sidecar that creates the Etebase test user (alice
+  # by default) once the server reports healthy. Etebase users
+  # can't be made by `manage.py` shell alone — login is crypto-
+  # challenge-based and the encryption_pubkey only lands during
+  # signup, which has to come from a real client. This sidecar
+  # runs the etebase Python SDK to do that without forcing the
+  # desktop client to be the bootstrap path.
+  #
+  # Idempotent: tries Account.login first; signup only fires if
+  # login fails. `restart: "no"` keeps it from looping; once
+  # alice exists subsequent `up` invocations exit 0 immediately.
+  etebase-bootstrap:
+    build:
+      context: ./etebase-bootstrap
+    image: tasks-test-etebase-bootstrap:local
+    container_name: tasks-test-etebase-bootstrap
+    depends_on:
+      etebase:
+        condition: service_healthy
+    environment:
+      ETEBASE_SERVER_URL: "http://etebase:3735"
+      ETEBASE_TEST_USER: "alice"
+      ETEBASE_TEST_EMAIL: "alice@example.com"
+      ETEBASE_TEST_PASSWORD: "alicepw"
+    restart: "no"
 
   radicale:
     image: tomsquest/docker-radicale:latest
