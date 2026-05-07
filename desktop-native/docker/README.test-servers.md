@@ -41,28 +41,17 @@ weak — never reuse on a publicly-reachable server.**
 | Radicale | `http://127.0.0.1:5232/.web/`  | `test`        | `test`                            |
 
 The Etebase service ships with `AUTO_SIGNUP=true`, so anonymous
-clients can call the public signup endpoint. **`alice` is created
-automatically** by the `etebase-bootstrap` sidecar service in the
-compose file, which runs once after the Etebase server reports
-healthy and uses the Etebase Python SDK to either log in or
-sign up the test user. The script is idempotent — re-running
-`up` after the user exists is a no-op.
+clients can call the public signup endpoint. The desktop
+client's `EteSyncProvider::with_signup_fallback` is enabled for
+any loopback Etebase URL (`127.0.0.1` / `localhost` / `[::1]`),
+so **`alice` is created on first sign-in from the desktop** — no
+separate bootstrap step required.
 
-The desktop client also has its own auto-signup fallback (gated
-on loopback URLs) as a belt-and-braces second path, so even
-without the bootstrap sidecar the first sign-in from the
-desktop will create `alice`. The sidecar exists so CI / pre-warmed
-stacks have the user ready before any client connects, and so
-clients without a signup-fallback (e.g. mobile, third-party
-Etebase apps) can connect to the test stack without ceremony.
-
-> **Why a sidecar instead of `manage.py` shell?** Etebase's login
-> is challenge-response over a per-user keypair; only the public
-> key lives on the server, and it's uploaded by a real client
-> during signup. A `manage.py shell` `User.objects.create_user(...)`
-> creates a Django-auth row that can sign into `/admin/` but is
-> invisible to the Etebase API. Bootstrap therefore needs a
-> client SDK call, which is what the sidecar runs.
+> Etebase users can't be created via `manage.py` shell:
+> login is crypto-challenge based and the user's public key
+> only lands during signup, which has to come from a real
+> client. A Django-auth row from `User.objects.create_user(...)`
+> can sign into `/admin/` but is invisible to the Etebase API.
 
 ## Verify the stack is reachable
 
@@ -116,31 +105,6 @@ creates a fresh CalDAV calendar via `MKCALENDAR`.
 
 To add more Radicale users, edit `radicale-config/users` and
 append `htpasswd -B`-style bcrypt entries.
-
-## Re-running the Etebase bootstrap
-
-The `etebase-bootstrap` sidecar runs automatically on `up` and
-exits 0 after `alice` exists. To re-run manually (e.g. after
-changing the test password or migrating to a new server URL):
-
-```sh
-docker compose -f docker-compose.test-servers.yml run --rm etebase-bootstrap
-```
-
-To bootstrap a *different* user without rebuilding the sidecar
-image, override the env vars inline:
-
-```sh
-docker compose -f docker-compose.test-servers.yml run --rm \
-    -e ETEBASE_TEST_USER=bob \
-    -e ETEBASE_TEST_EMAIL=bob@example.com \
-    -e ETEBASE_TEST_PASSWORD=bobpw \
-    etebase-bootstrap
-```
-
-The script logs `bootstrap: <user> already exists and login
-works — nothing to do` when the target user is already set up,
-or `bootstrap: signed up <user>` when it created the row.
 
 ## Security caveats
 
