@@ -420,12 +420,15 @@ impl Provider for GoogleTasksProvider {
 /// Returns the fresh tokens so the caller can hand them to a
 /// [`GoogleTasksProvider`] via the token store (or the
 /// `oauth_access_token` field).
-pub async fn authorize(
+pub async fn authorize<F>(
     client_id: &str,
     http: &Client,
-    open_browser: impl FnOnce(&str),
+    open_browser: F,
     timeout: Duration,
-) -> SyncResult<OAuthTokens> {
+) -> SyncResult<OAuthTokens>
+where
+    F: FnOnce(&str) + Send + 'static,
+{
     use crate::loopback::LoopbackReceiver;
 
     let receiver =
@@ -434,7 +437,20 @@ pub async fn authorize(
     let req =
         build_authorization_request(AUTHORIZATION_ENDPOINT, client_id, &[SCOPE], &redirect_uri)
             .map_err(|e| SyncError::Auth(format!("build auth url: {e}")))?;
-    open_browser(&req.authorization_url);
+
+    // Launch the browser on a dedicated blocking task so a slow
+    // launcher (snap helper / WSLg / xdg-open chain) can't block
+    // the loopback receiver from accepting the redirect that the
+    // browser will eventually hit. The receiver below is started
+    // immediately, so the kernel's accept queue has us listening
+    // by the time the browser opens. firstcontact's first version
+    // had this bug; we deliberately don't repeat it. The browser
+    // task is detached — its only side effect is the URL handoff,
+    // and the open-browser closure handles its own failures.
+    let auth_url = req.authorization_url.clone();
+    // Detached on purpose — we don't await the JoinHandle. Tokio
+    // drops it cleanly when the runtime shuts down.
+    drop(tokio::task::spawn_blocking(move || open_browser(&auth_url)));
 
     // The loopback receiver blocks a thread; keep it off the async
     // runtime by offloading to spawn_blocking.

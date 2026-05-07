@@ -363,12 +363,15 @@ impl Provider for MicrosoftToDoProvider {
 /// against Azure AD v2. Caller provides a function that opens a
 /// URL in the user's default browser; the loopback receiver picks
 /// up the redirect and we exchange for tokens.
-pub async fn authorize(
+pub async fn authorize<F>(
     client_id: &str,
     http: &Client,
-    open_browser: impl FnOnce(&str),
+    open_browser: F,
     timeout: Duration,
-) -> SyncResult<OAuthTokens> {
+) -> SyncResult<OAuthTokens>
+where
+    F: FnOnce(&str) + Send + 'static,
+{
     use crate::loopback::LoopbackReceiver;
 
     let receiver =
@@ -376,7 +379,15 @@ pub async fn authorize(
     let redirect_uri = receiver.redirect_uri();
     let req = build_authorization_request(AUTHORIZATION_ENDPOINT, client_id, SCOPES, &redirect_uri)
         .map_err(|e| SyncError::Auth(format!("build auth url: {e}")))?;
-    open_browser(&req.authorization_url);
+
+    // Detach the browser launch onto a blocking task so a slow
+    // launcher (xdg-open chain / WSLg / snap helper) can't block
+    // the loopback below from accepting the redirect. See the
+    // matching note in providers::google::authorize.
+    let auth_url = req.authorization_url.clone();
+    // Detached on purpose — we don't await the JoinHandle. Tokio
+    // drops it cleanly when the runtime shuts down.
+    drop(tokio::task::spawn_blocking(move || open_browser(&auth_url)));
 
     let state = req.state.clone();
     let redirect = tokio::task::spawn_blocking(move || receiver.wait_for_redirect(&state, timeout))

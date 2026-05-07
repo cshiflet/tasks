@@ -290,6 +290,53 @@ ApplicationWindow {
         }
     }
 
+    // Browser-launch fallback for OAuth sign-in. When the bridge
+    // can't open the system browser (kiosk / WSL without a
+    // DESKTOP env / xdg-open absent), it sets `oauthManualUrl` to
+    // the auth URL. We pop a dialog here with a Copy button so
+    // the user can paste it into a browser of their choice. The
+    // loopback receiver is already listening on 127.0.0.1, so
+    // pasting the URL anywhere with network access to localhost
+    // (same machine) completes the flow normally. Auto-dismisses
+    // when the bridge clears the property (loopback resolved or
+    // timed out).
+    Dialog {
+        id: oauthManualDialog
+        title: qsTr("Open this URL to sign in")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Cancel
+        visible: viewModel.oauthManualUrl.length > 0
+        ColumnLayout {
+            spacing: 12
+            Label {
+                Layout.maximumWidth: 520
+                wrapMode: Text.Wrap
+                text: viewModel.oauthManualLabel.length > 0
+                      ? qsTr("Couldn't launch a browser automatically. Open this URL to sign in to %1, then return here.").arg(viewModel.oauthManualLabel)
+                      : qsTr("Couldn't launch a browser automatically. Open this URL to sign in, then return here.")
+            }
+            TextField {
+                id: oauthManualUrlField
+                Layout.fillWidth: true
+                Layout.preferredWidth: 520
+                readOnly: true
+                selectByMouse: true
+                text: viewModel.oauthManualUrl
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignRight
+                Button {
+                    text: qsTr("Copy URL")
+                    onClicked: {
+                        oauthManualUrlField.selectAll();
+                        oauthManualUrlField.copy();
+                    }
+                }
+            }
+        }
+    }
+
     // Single command-bar row in the Win11 / Edge / Files style.
     // The DB path is in the window title where it belongs; the
     // toolbar holds only the actions a user reaches for during a

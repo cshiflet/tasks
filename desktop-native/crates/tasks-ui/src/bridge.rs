@@ -241,6 +241,18 @@ pub mod qobject {
         // render the verdict next to the Test button instead of
         // routing it through the status bar at the bottom.
         #[qproperty(QString, last_test_result)]
+        // Set when `webbrowser::open` fails to launch a browser
+        // during an OAuth sign-in (kiosk / WSL without DESKTOP env /
+        // missing xdg-open). The QML side watches for a non-empty
+        // value and pops a Dialog with the auth URL so the user can
+        // copy it into a browser of their choice. Cleared as soon
+        // as the loopback receiver consumes the redirect — or
+        // times out, whichever comes first.
+        #[qproperty(QString, oauth_manual_url)]
+        // Account label paired with `oauth_manual_url` so the
+        // Dialog can render "Sign in to <label>" without QML having
+        // to remember the in-flight context.
+        #[qproperty(QString, oauth_manual_label)]
         // Absolute path of the currently-open database, surfaced in
         // the window title + Browse path field so users know which
         // file they're looking at.
@@ -632,6 +644,8 @@ pub struct TaskListViewModelRust {
     // Status.
     status: QString,
     last_test_result: QString,
+    oauth_manual_url: QString,
+    oauth_manual_label: QString,
     db_path_display: QString,
     // Non-Qt bookkeeping. Held on the Rust side only; not exposed to QML.
     db_path: Option<PathBuf>,
@@ -757,6 +771,8 @@ impl Default for TaskListViewModelRust {
             last_deleted_title: String::new(),
             status: QString::default(),
             last_test_result: QString::default(),
+            oauth_manual_url: QString::default(),
+            oauth_manual_label: QString::default(),
             db_path_display: QString::default(),
             db_path: None,
             db: None,
@@ -1328,6 +1344,32 @@ impl qobject::TaskListViewModel {
                 // exchange. Disable auto-redirects so a 3xx never
                 // bounces the request elsewhere with the PKCE code.
                 let http_result = reqwest_client_for_oauth();
+                // Try to launch the system browser; if `webbrowser::open`
+                // fails (kiosk / WSL with no DESKTOP env / xdg-open
+                // missing), post the auth URL to the QML side so the
+                // user can copy/paste it into a browser of their
+                // choice. Either way, the loopback keeps listening
+                // until it receives the redirect or hits the 120 s
+                // timeout. firstcontact OAuth flow uses the same
+                // pattern (`browserAuthRequested` signal).
+                let qt_thread_for_browser = qt_thread.clone();
+                let label_for_browser = label_for_thread.clone();
+                let open_or_post = move |url: &str| {
+                    if webbrowser::open(url).is_err() {
+                        let url_owned = url.to_string();
+                        let label_owned = label_for_browser.clone();
+                        let _ = qt_thread_for_browser.queue(
+                            move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                                pinned
+                                    .as_mut()
+                                    .set_oauth_manual_url(QString::from(&url_owned));
+                                pinned
+                                    .as_mut()
+                                    .set_oauth_manual_label(QString::from(&label_owned));
+                            },
+                        );
+                    }
+                };
                 let result = match http_result {
                     Ok(http) => runtime.block_on(async move {
                         let timeout = std::time::Duration::from_secs(120);
@@ -1336,13 +1378,7 @@ impl qobject::TaskListViewModel {
                                 tasks_sync::providers::google::authorize(
                                     &client_id,
                                     &http,
-                                    |url| {
-                                        // open_browser is best-effort; if the
-                                        // user has no default browser the
-                                        // loopback receiver eventually times
-                                        // out with a clear error.
-                                        let _ = webbrowser::open(url);
-                                    },
+                                    open_or_post,
                                     timeout,
                                 )
                                 .await
@@ -1351,9 +1387,7 @@ impl qobject::TaskListViewModel {
                                 tasks_sync::providers::microsoft::authorize(
                                     &client_id,
                                     &http,
-                                    |url| {
-                                        let _ = webbrowser::open(url);
-                                    },
+                                    open_or_post,
                                     timeout,
                                 )
                                 .await
@@ -1366,6 +1400,12 @@ impl qobject::TaskListViewModel {
                     ))),
                 };
                 let _ = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    // Clear the manual-URL fallback regardless of
+                    // outcome — the dialog should auto-dismiss when
+                    // the loopback resolves (success) or the timeout
+                    // fires (failure).
+                    pinned.as_mut().set_oauth_manual_url(QString::default());
+                    pinned.as_mut().set_oauth_manual_label(QString::default());
                     match result {
                         Ok(tokens) => {
                             let uuid = uuid::Uuid::new_v4().to_string();
