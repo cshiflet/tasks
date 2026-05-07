@@ -1058,25 +1058,9 @@ impl qobject::TaskListViewModel {
         }
         publish_accounts(self.as_mut());
         // Refresh sidebar so the removed account's lists disappear.
-        if let Some(db) = &self.db {
-            let (labels, ids, kinds, groups, colors) = build_sidebar(db);
-            self.as_mut()
-                .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
-            self.as_mut()
-                .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
-            let mut kl: QList<i32> = QList::default();
-            for k in &kinds {
-                kl.append(*k);
-            }
-            self.as_mut().set_sidebar_account_kinds(kl);
-            self.as_mut()
-                .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
-            let mut cl: QList<i32> = QList::default();
-            for c in &colors {
-                cl.append(*c);
-            }
-            self.as_mut().set_sidebar_colors(cl);
-        }
+        // Goes through the throttled path so a burst of account
+        // ops collapses to one rebuild.
+        refresh_sidebar(self.as_mut());
         self.as_mut().reload_active_filter();
         self.as_mut()
             .set_status(QString::from(&format!("Removed \"{}\".", removed.label)));
@@ -1431,26 +1415,9 @@ impl qobject::TaskListViewModel {
             return;
         }
         // Refresh sidebar so the new colour drives chip + checkbox
-        // backgrounds on the next paint.
-        if let Some(db) = &self.db {
-            let (labels, ids, kinds, groups, colors) = build_sidebar(db);
-            self.as_mut()
-                .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
-            self.as_mut()
-                .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
-            let mut kl: QList<i32> = QList::default();
-            for k in &kinds {
-                kl.append(*k);
-            }
-            self.as_mut().set_sidebar_account_kinds(kl);
-            self.as_mut()
-                .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
-            let mut cl: QList<i32> = QList::default();
-            for c in &colors {
-                cl.append(*c);
-            }
-            self.as_mut().set_sidebar_colors(cl);
-        }
+        // backgrounds on the next paint. Throttled: a burst of
+        // colour edits in the picker collapses to one rebuild.
+        refresh_sidebar(self.as_mut());
         self.as_mut().reload_active_filter();
     }
 
@@ -2377,6 +2344,12 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             // before the first sidebar build so a fresh user sees a
             // usable list immediately. Idempotent.
             ensure_local_default_list(&path);
+            // Cold open: we deliberately bypass refresh_sidebar's
+            // throttle here. open_at_path is a one-shot, not part
+            // of a burst, and the throttle's leading-edge would
+            // fire immediately anyway — folding this through it
+            // would just force a Database move into rust_mut
+            // before the other property setters need to borrow it.
             let (labels, ids, kinds, groups, colors) = build_sidebar(&db);
             vm.as_mut()
                 .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));

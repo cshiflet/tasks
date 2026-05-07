@@ -155,13 +155,26 @@ impl<'a> SyncEngine<'a> {
 
         let mut pushed = 0usize;
         let mut conflicts = 0usize;
-        for task in &dirty {
+        for (task, modified_at_load) in &dirty {
             match self.provider.push_task(task).await {
                 Ok(new_etag) => {
                     let conn = open_rw(self.db_path)
                         .map_err(|e| SyncError::Local(format!("reopen db: {e}")))?;
-                    record_push_success(&conn, &task.remote_id, new_etag.as_deref(), now_ms())
-                        .map_err(|e| SyncError::Local(format!("stamp etag: {e}")))?;
+                    // Stamp `cd_last_sync` with the modified value
+                    // we read at push-start, not `now_ms()`. If the
+                    // user edited the row mid-push, `tasks.modified`
+                    // is now newer than the snapshot — leaving
+                    // `tasks.modified > cd_last_sync` and re-flagging
+                    // the row as dirty so the next cycle re-pushes
+                    // their edit. Stamping `now_ms()` would silently
+                    // "ack" the concurrent edit and lose it.
+                    record_push_success(
+                        &conn,
+                        &task.remote_id,
+                        new_etag.as_deref(),
+                        *modified_at_load,
+                    )
+                    .map_err(|e| SyncError::Local(format!("stamp etag: {e}")))?;
                     pushed += 1;
                 }
                 Err(SyncError::Conflict { remote_id, .. }) => {
@@ -211,10 +224,15 @@ fn now_ms() -> i64 {
 /// uuid of the account being synced so a CalDAV push doesn't
 /// touch Google / Microsoft / Etebase rows. `None` returns every
 /// dirty row, used by the engine's own integration tests.
+/// Returns `(RemoteTask, modified_at_load_ms)` per dirty row. The
+/// caller passes the snapshot to `record_push_success` so a
+/// concurrent edit during the push round-trip leaves the row
+/// flagged dirty for the next cycle (`tasks.modified` will be
+/// newer than the snapshotted `cd_last_sync`).
 fn load_dirty_tasks(
     conn: &Connection,
     account_filter: Option<&str>,
-) -> rusqlite::Result<Vec<RemoteTask>> {
+) -> rusqlite::Result<Vec<(RemoteTask, i64)>> {
     let base = "SELECT t._id, t.title, t.notes, t.dueDate, t.completed, \
                        t.importance, t.recurrence, t.modified, t.remoteId, \
                        ct.cd_calendar, ct.cd_remote_id, ct.cd_etag, \
@@ -242,10 +260,11 @@ fn load_dirty_tasks(
         ),
     };
     let mut stmt = conn.prepare(&sql)?;
-    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RemoteTask> {
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(RemoteTask, i64)> {
         let due_ms: i64 = r.get(3)?;
         let due_has_time = due_ms != 0 && due_ms % 60_000 != 0;
-        Ok(RemoteTask {
+        let modified_at_load: i64 = r.get(7)?;
+        let task = RemoteTask {
             remote_id: r.get::<_, String>(10)?,
             calendar_remote_id: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
             etag: r.get::<_, Option<String>>(11)?,
@@ -263,7 +282,8 @@ fn load_dirty_tasks(
             // remote_task_to_vtodo references it.
             last_modified_ms: None,
             raw_vtodo: None,
-        })
+        };
+        Ok((task, modified_at_load))
     };
     let mut out = Vec::new();
     if let Some(ref uuid) = account_uuid {
@@ -280,19 +300,22 @@ fn load_dirty_tasks(
     Ok(out)
 }
 
-/// After a successful push, stamp the new etag + last-sync
-/// timestamp so the next push_dirty call doesn't re-send the
-/// same row.
+/// After a successful push, stamp the new etag + the
+/// snapshotted `modified_at_load` value so the next push_dirty
+/// call doesn't re-send the same row. The caller is responsible
+/// for passing the `tasks.modified` value it read at load time —
+/// not `now_ms()` — so a concurrent local edit during the push
+/// round-trip leaves the row legitimately dirty for next cycle.
 fn record_push_success(
     conn: &Connection,
     remote_id: &str,
     new_etag: Option<&str>,
-    now_ms: i64,
+    cd_last_sync: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE caldav_tasks SET cd_etag = ?1, cd_last_sync = ?2 \
          WHERE cd_remote_id = ?3",
-        params![new_etag, now_ms, remote_id],
+        params![new_etag, cd_last_sync, remote_id],
     )?;
     Ok(())
 }
@@ -574,6 +597,33 @@ fn tombstone_missing_tasks(
             .ok();
         if already.unwrap_or(0) > 0 {
             continue;
+        }
+        // Skip rows the user has edited since the last sync. The
+        // server claims this row is gone, but we have local
+        // changes the server hasn't seen — soft-deleting now
+        // would silently drop the user's work. Leaving the row
+        // intact lets the next push_dirty cycle export the local
+        // edit, after which a subsequent server-side delete
+        // could be re-detected legitimately. Same shape as the
+        // relink_parents gate (Android SHA 3139b39cb).
+        let local_modified: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT t.modified, ct.cd_last_sync FROM tasks t \
+                 JOIN caldav_tasks ct ON ct.cd_task = t._id \
+                 WHERE t._id = ?1",
+                [task_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        if let Some((modified, cd_last_sync)) = local_modified {
+            if modified > cd_last_sync {
+                tracing::warn!(
+                    "tombstone_missing_tasks: keeping locally-edited {remote_id} \
+                     (modified={modified} > cd_last_sync={cd_last_sync}) — \
+                     server claims it's gone, but local edit is unsynced",
+                );
+                continue;
+            }
         }
         tx.execute(
             "UPDATE tasks SET deleted = ?1, modified = ?1 WHERE _id = ?2",
@@ -1187,7 +1237,7 @@ mod tests {
         // Sanity: load_dirty_tasks should report nothing.
         let dirty = load_dirty_tasks(&conn, None).unwrap();
         assert!(
-            dirty.iter().all(|t| t.remote_id != "fresh"),
+            dirty.iter().all(|(t, _)| t.remote_id != "fresh"),
             "freshly-pulled row should not be in the dirty set"
         );
     }
@@ -1298,5 +1348,197 @@ mod tests {
             )
             .unwrap();
         assert_eq!(modified, 2000);
+    }
+
+    /// Fix 4: `record_push_success` must stamp `cd_last_sync` with
+    /// the `tasks.modified` value snapshotted at push-start, not
+    /// `now_ms()`. If the user edits the row mid-push, the snapshot
+    /// is older than the post-edit modified, so the row stays
+    /// dirty and gets re-pushed on the next cycle. Stamping
+    /// `now_ms()` would silently ack the concurrent edit and lose
+    /// it.
+    #[tokio::test]
+    async fn push_dirty_uses_modified_snapshot_not_now_for_cd_last_sync() {
+        let (_tmp, db_path) = fresh_db();
+        let uid = seed_dirty_task(&db_path);
+        // The seed_dirty_task helper writes tasks.modified=100.
+        // After a successful push, cd_last_sync should be 100, not
+        // the current wall-clock now_ms() (which is 6+ orders of
+        // magnitude larger).
+        let mock = MockWithPushResult::default();
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        engine.push_dirty().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let last_sync: i64 = conn
+            .query_row(
+                "SELECT cd_last_sync FROM caldav_tasks WHERE cd_remote_id = ?1",
+                [&uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            last_sync, 100,
+            "cd_last_sync should match the modified value read at \
+             load time, not now_ms()"
+        );
+    }
+
+    /// Fix 4 (continued): if the user edits the row between
+    /// load_dirty_tasks and record_push_success, the post-edit
+    /// modified must still satisfy `modified > cd_last_sync` so
+    /// the next push_dirty picks the row up again.
+    #[tokio::test]
+    async fn push_dirty_leaves_concurrently_edited_row_dirty() {
+        let (_tmp, db_path) = fresh_db();
+        let uid = seed_dirty_task(&db_path);
+        // Custom mock whose push_task simulates the user editing
+        // the row mid-flight by bumping tasks.modified before
+        // returning. This is the race window the fix addresses.
+        #[derive(Clone)]
+        struct EditingMock {
+            db_path: std::path::PathBuf,
+            uid: String,
+        }
+        #[async_trait]
+        impl Provider for EditingMock {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::CalDav
+            }
+            fn account_label(&self) -> &str {
+                "editing-mock"
+            }
+            async fn connect(&mut self) -> SyncResult<()> {
+                Ok(())
+            }
+            async fn list_calendars(&mut self) -> SyncResult<Vec<RemoteCalendar>> {
+                Ok(Vec::new())
+            }
+            async fn list_tasks(&mut self, _cal: &str) -> SyncResult<Vec<RemoteTask>> {
+                Ok(Vec::new())
+            }
+            async fn push_task(&mut self, _t: &RemoteTask) -> SyncResult<Option<String>> {
+                let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                conn.execute(
+                    "UPDATE tasks SET title = 'Edited mid-push', \
+                     modified = 5000 WHERE remoteId = ?1",
+                    [&self.uid],
+                )
+                .unwrap();
+                Ok(Some("etag-new".into()))
+            }
+            async fn delete_task(&mut self, _c: &str, _id: &str) -> SyncResult<()> {
+                Ok(())
+            }
+            async fn sync_once(&mut self) -> SyncResult<SyncOutcome> {
+                Ok(SyncOutcome::default())
+            }
+        }
+        let mock = EditingMock {
+            db_path: db_path.clone(),
+            uid: uid.clone(),
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        engine.push_dirty().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (modified, last_sync): (i64, i64) = conn
+            .query_row(
+                "SELECT t.modified, ct.cd_last_sync FROM tasks t \
+                 JOIN caldav_tasks ct ON ct.cd_task = t._id \
+                 WHERE t.remoteId = ?1",
+                [&uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(modified, 5000, "concurrent edit should not be overwritten");
+        assert_eq!(
+            last_sync, 100,
+            "cd_last_sync should remain at the snapshot, not the post-edit value"
+        );
+        assert!(
+            modified > last_sync,
+            "row must remain dirty so the next cycle re-pushes the user's edit"
+        );
+
+        // Confirm the row is detected as dirty.
+        let dirty = load_dirty_tasks(&conn, None).unwrap();
+        assert!(
+            dirty.iter().any(|(t, _)| t.remote_id == uid),
+            "row must be in the dirty set after the concurrent edit"
+        );
+    }
+
+    /// `tombstone_missing_tasks` must skip rows the user has edited
+    /// since the last sync. The server claims the row is gone, but
+    /// we have unsynced local changes — soft-deleting now would
+    /// silently drop the user's work. Same shape as the
+    /// relink_parents gate (Android SHA 3139b39cb).
+    #[tokio::test]
+    async fn tombstone_skips_locally_edited_rows() {
+        // First pull: remote has tasks A + B.
+        let (_tmp, db_path) = fresh_db();
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            "cal-1".to_string(),
+            vec![task("a", "cal-1", None), task("b", "cal-1", None)],
+        );
+        let first = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(first));
+        engine.pull_all().await.unwrap();
+
+        // Simulate the user editing B locally — bump tasks.modified
+        // past cd_last_sync so the dirty-check fires.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET title = 'B (edited locally)', \
+             modified = (SELECT cd_last_sync FROM caldav_tasks \
+                         WHERE cd_remote_id = 'b') + 10000 \
+             WHERE remoteId = 'b'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Second pull: only A remains on the server. The B row
+        // should be preserved because it has unsynced local edits.
+        let mut tasks2 = HashMap::new();
+        tasks2.insert("cal-1".to_string(), vec![task("a", "cal-1", None)]);
+        let second = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks: tasks2,
+            ..Default::default()
+        };
+        let mut engine2 = SyncEngine::new(&db_path, Box::new(second));
+        engine2.pull_all().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let b_deleted: i64 = conn
+            .query_row("SELECT deleted FROM tasks WHERE remoteId = 'b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            b_deleted, 0,
+            "locally-edited row must not be tombstoned by a server-quiet removal"
+        );
+        let b_caldav_deleted: i64 = conn
+            .query_row(
+                "SELECT cd_deleted FROM caldav_tasks WHERE cd_remote_id = 'b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_caldav_deleted, 0);
+        let b_title: String = conn
+            .query_row("SELECT title FROM tasks WHERE remoteId = 'b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(b_title, "B (edited locally)");
     }
 }
