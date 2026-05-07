@@ -2,11 +2,13 @@
 # (default `alice / alicepw`) once the etebase service is up.
 # Idempotent — re-runs are no-ops once the user exists.
 #
-# We pin a thin Python base so the etebase wheel install is fast
-# and the resulting image stays small. python:3.12-slim ships
-# glibc, which avoids the musl-wheel-compatibility hazard the
-# Alpine variant has for native-extension wheels.
-FROM python:3.12-slim
+# Pin Python 3.11. The `etebase` PyPI package is a maturin-built
+# wheel last released in 2021 with cp37–cp311 binaries; Python
+# 3.12 forces a source build that needs the Rust toolchain +
+# libsodium headers, which we'd rather not drag into a 50 MB
+# bootstrap image. 3.11-slim has glibc (vs musl on Alpine) so
+# the wheel installs cleanly without compatibility tags drama.
+FROM python:3.11-slim
 
 # Quieter pip output + no .pyc droppings in the layer.
 ENV PYTHONDONTWRITEBYTECODE=1 \
