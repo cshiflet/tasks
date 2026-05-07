@@ -56,6 +56,13 @@ fn lock_session(state: &Mutex<Option<Account>>) -> SyncResult<MutexGuard<'_, Opt
 pub struct EteSyncProvider {
     credentials: AccountCredentials,
     account_label: String,
+    // When `true`, `connect()` falls back to `Account::signup` if
+    // login fails — useful against test servers running with
+    // `AUTO_SIGNUP=true` so the desktop can materialise its test
+    // user on first connect. Off by default; turn on per-account
+    // via `with_signup_fallback(true)` when the server URL points
+    // at a known auto-signup deployment.
+    allow_signup: bool,
     // Held behind Arc<Mutex<_>> so spawn_blocking closures can
     // clone the handle and take the lock on the worker thread.
     // Account itself isn't Clone; mutex access is the cheapest
@@ -69,8 +76,18 @@ impl EteSyncProvider {
         Self {
             credentials,
             account_label: account_label.into(),
+            allow_signup: false,
             state: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Builder-style toggle for the auto-signup fallback. The
+    /// bridge passes `true` for known test-server URLs (e.g.
+    /// `http://127.0.0.1:3735`) so first-time connect against the
+    /// docker-compose stack creates the account on the fly.
+    pub fn with_signup_fallback(mut self, allow: bool) -> Self {
+        self.allow_signup = allow;
+        self
     }
 }
 
@@ -106,14 +123,45 @@ impl Provider for EteSyncProvider {
             .ok_or_else(|| SyncError::Auth("EteSync requires a password".into()))?;
 
         let state = self.state.clone();
+        let allow_signup = self.allow_signup;
         let joined = tokio::task::spawn_blocking(move || -> SyncResult<()> {
             let client = Client::new("tasks-desktop-native", &server_url)
                 .map_err(|e| map_err("Client::new", e))?;
             // Single spot where the password leaves its secret
             // wrapper and crosses into the `etebase` FFI; the
             // wrapper stays live until this closure returns.
-            let account = Account::login(client, &username, password.expose_secret())
-                .map_err(|e| SyncError::Auth(format!("login: {e}")))?;
+            let pwd = password.expose_secret().to_string();
+            let account = match Account::login(client, &username, &pwd) {
+                Ok(a) => a,
+                Err(login_err) if allow_signup => {
+                    // The server's `AUTO_SIGNUP=true` flag opens
+                    // `/api/v1/authentication/signup/`; clients can
+                    // pre-create the account at first connect rather
+                    // than requiring an out-of-band setup step.
+                    // Build a fresh client + try signup with the
+                    // same credentials; on any failure surface the
+                    // *original* login error so the user sees the
+                    // primary problem rather than a secondary
+                    // signup-already-exists noise.
+                    let client2 = Client::new("tasks-desktop-native", &server_url)
+                        .map_err(|e| map_err("Client::new (signup retry)", e))?;
+                    let user = etebase::User::new(
+                        &username,
+                        // Etebase requires a non-empty email; if we
+                        // don't have one, synthesize a deterministic
+                        // localhost address rather than rejecting
+                        // the signup. Real deployments should set a
+                        // real email via the Accounts pane.
+                        &format!("{username}@localhost"),
+                    );
+                    Account::signup(client2, &user, &pwd).map_err(|signup_err| {
+                        SyncError::Auth(format!(
+                            "login: {login_err} (signup fallback also failed: {signup_err})"
+                        ))
+                    })?
+                }
+                Err(e) => return Err(SyncError::Auth(format!("login: {e}"))),
+            };
             *lock_session(&state)? = Some(account);
             Ok(())
         })
@@ -309,6 +357,55 @@ impl Provider for EteSyncProvider {
             method: "sync_once (use SyncEngine::sync_now)",
         })
     }
+
+    async fn create_calendar(
+        &mut self,
+        name: &str,
+        color: Option<i32>,
+    ) -> SyncResult<RemoteCalendar> {
+        let state = self.state.clone();
+        let name_owned = name.to_string();
+        tokio::task::spawn_blocking(move || -> SyncResult<RemoteCalendar> {
+            let guard = lock_session(&state)?;
+            let account = guard
+                .as_ref()
+                .ok_or_else(|| SyncError::Auth("EteSync: connect() first".into()))?;
+            let col_mgr = account
+                .collection_manager()
+                .map_err(|e| map_err("collection_manager", e))?;
+            let mut meta = ItemMetadata::new();
+            meta.set_name(Some(&name_owned));
+            meta.set_mtime(Some(now_ms_blocking()));
+            // Apple-style #RRGGBBAA serialization keeps parity with
+            // the CalDAV provider's MKCALENDAR body. 0 (or None) =
+            // "no colour".
+            if let Some(c) = color {
+                let argb = c as u32;
+                let alpha = ((argb >> 24) & 0xff) as u8;
+                let red = ((argb >> 16) & 0xff) as u8;
+                let green = ((argb >> 8) & 0xff) as u8;
+                let blue = (argb & 0xff) as u8;
+                meta.set_color(Some(&format!("#{red:02X}{green:02X}{blue:02X}{alpha:02X}")));
+            }
+            let collection = col_mgr
+                .create(COLLECTION_TYPE_VTODO, &meta, b"")
+                .map_err(|e| map_err("collection_manager.create", e))?;
+            col_mgr
+                .upload(&collection, None)
+                .map_err(|e| map_err("collection_manager.upload", e))?;
+            collection_to_remote_calendar(&collection)
+        })
+        .await
+        .map_err(|e| SyncError::Other(format!("spawn_blocking: {e}")))?
+    }
+}
+
+fn now_ms_blocking() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn collection_to_remote_calendar(col: &Collection) -> SyncResult<RemoteCalendar> {

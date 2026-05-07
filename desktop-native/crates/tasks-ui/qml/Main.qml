@@ -209,6 +209,16 @@ ApplicationWindow {
         text: qsTr("About Tasks Desktop")
         onTriggered: aboutDialog.open()
     }
+    // Ctrl+R kicks off a manual sync across every configured
+    // account. Same handler the toolbar's Sync button calls; the
+    // shortcut just gives keyboard users a one-handed equivalent
+    // and matches the "refresh" muscle memory from browsers.
+    Action {
+        id: syncAllAction
+        text: qsTr("Sync now")
+        shortcut: "Ctrl+R"
+        onTriggered: viewModel.syncAllAccounts()
+    }
 
     // ---------- Transient status auto-clear ----------
     //

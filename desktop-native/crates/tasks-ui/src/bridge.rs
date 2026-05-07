@@ -595,6 +595,10 @@ pub struct TaskListViewModelRust {
     /// with the spawned thread via `Arc`. `None` when no watcher is
     /// currently active.
     watcher_stop: Option<Arc<AtomicBool>>,
+    /// Flag the periodic-sync thread polls to know when to stop.
+    /// Re-set on every DB open + on view-model drop; the spawned
+    /// thread shares a clone and exits the next time it sees `true`.
+    auto_sync_stop: Option<Arc<AtomicBool>>,
     /// Multi-threaded tokio runtime hosting `tasks-sync` calls.
     /// Built lazily on first sync_account invocation; one Runtime
     /// instance is shared across every Sync now click for the
@@ -696,6 +700,7 @@ impl Default for TaskListViewModelRust {
                 ..QueryPreferences::default()
             },
             watcher_stop: None,
+            auto_sync_stop: None,
             runtime: None,
         }
     }
@@ -703,8 +708,11 @@ impl Default for TaskListViewModelRust {
 
 impl Drop for TaskListViewModelRust {
     fn drop(&mut self) {
-        // Ensure the watcher thread exits when the view model does.
+        // Ensure background threads exit when the view model does.
         if let Some(stop) = self.watcher_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(stop) = self.auto_sync_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
     }
@@ -1115,10 +1123,13 @@ impl qobject::TaskListViewModel {
         }
         self.as_mut()
             .set_last_test_result(QString::from("Testing connection…"));
+        let allow_signup = is_local_etebase_url(&server_s);
         let creds = AccountCredentials::new_password(&server_s, &username_s, password_s);
         let mut provider: Box<dyn Provider + Send> = match kind {
             KIND_CALDAV => Box::new(CalDavProvider::new(creds, "test")),
-            KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, "test")),
+            KIND_ETESYNC => {
+                Box::new(EteSyncProvider::new(creds, "test").with_signup_fallback(allow_signup))
+            }
             _ => unreachable!("kind validated above"),
         };
         let result = self
@@ -1156,11 +1167,27 @@ impl qobject::TaskListViewModel {
     /// "Sync of <label> failed: …" on completion.
     pub fn sync_account(mut self: Pin<&mut Self>, cda_uuid: QString) {
         let uuid = cda_uuid.to_string();
-        let Some(stored) = self.accounts.iter().find(|a| a.uuid == uuid).cloned() else {
+        let Some(idx) = self.accounts.iter().position(|a| a.uuid == uuid) else {
             self.as_mut()
                 .set_status(QString::from(&format!("No account with uuid {uuid}")));
             return;
         };
+        // Same-account re-entrancy guard: if a sync against this
+        // account is already in flight, drop the new request silently.
+        // Auto-trigger paths (task create / edit / delete +
+        // periodic timer) can fire several times in a row; without
+        // this guard they'd stack as concurrent syncs that fight
+        // for the same SQLite write lock.
+        if self
+            .account_states
+            .get(idx)
+            .map(String::as_str)
+            .unwrap_or("")
+            == "Syncing…"
+        {
+            return;
+        }
+        let stored = self.accounts[idx].clone();
         let Some(db_path) = self.db_path.clone() else {
             self.as_mut()
                 .set_status(QString::from("Open a database before syncing."));
@@ -1195,9 +1222,12 @@ impl qobject::TaskListViewModel {
             secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
         );
         let label = stored.label.clone();
+        let allow_signup = is_local_etebase_url(&stored.server);
         let provider: Box<dyn Provider + Send> = match stored.kind {
             KIND_CALDAV => Box::new(CalDavProvider::new(creds, label.clone())),
-            KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, label.clone())),
+            KIND_ETESYNC => Box::new(
+                EteSyncProvider::new(creds, label.clone()).with_signup_fallback(allow_signup),
+            ),
             _ => {
                 self.as_mut().set_status(QString::from(
                     "OAuth providers (Google / Microsoft) need the sign-in flow to land first.",
@@ -1390,6 +1420,7 @@ impl qobject::TaskListViewModel {
             }
         }
 
+        let allow_signup = is_local_etebase_url(&stored.server);
         let creds = AccountCredentials::new_password(
             &stored.server,
             &stored.username,
@@ -1397,7 +1428,10 @@ impl qobject::TaskListViewModel {
         );
         let mut provider: Box<dyn Provider + Send> = match stored.kind {
             KIND_CALDAV => Box::new(CalDavProvider::new(creds, stored.label.clone())),
-            KIND_ETESYNC => Box::new(EteSyncProvider::new(creds, stored.label.clone())),
+            KIND_ETESYNC => Box::new(
+                EteSyncProvider::new(creds, stored.label.clone())
+                    .with_signup_fallback(allow_signup),
+            ),
             _ => {
                 self.as_mut().set_status(QString::from(
                     "Creating lists on this provider isn't supported yet.",
@@ -2349,6 +2383,12 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             }
             vm.as_mut().reload_active_filter();
             start_watcher(vm.as_mut(), path);
+            // Kick off the periodic background sync. The starter
+            // fires `sync_all_accounts` once up front so launch
+            // implies a fresh pull, then loops with a 15-minute
+            // interval. No-op when no sync providers are configured
+            // — `sync_all_accounts` short-circuits on an empty list.
+            start_auto_sync(vm.as_mut());
         }
         Err(e) => {
             let msg = format!("Couldn't open {path_display}: {e}");
@@ -2846,6 +2886,18 @@ fn ensure_local_default_list(path: &std::path::Path) {
 /// Callers that get `Some(uuid)` dispatch a `sync_account`
 /// against it so the just-mutated row reaches the server without
 /// waiting for the user to hit the toolbar's manual Sync button.
+/// Whether `server_url` points at a local-loopback Etebase
+/// instance (the docker-compose test stack). The Etebase provider
+/// turns on its `Account::signup` fallback when this is true so a
+/// fresh test user materialises on first connect against a server
+/// running with `AUTO_SIGNUP=true`. Production / public Etebase
+/// servers don't get the fallback — auto-signup with bad creds
+/// would silently create an empty account.
+fn is_local_etebase_url(server_url: &str) -> bool {
+    let lower = server_url.to_ascii_lowercase();
+    lower.contains("://127.0.0.1") || lower.contains("://localhost") || lower.contains("://[::1]")
+}
+
 fn syncable_account_for_task(db: &Database, task_id: i64) -> Option<String> {
     db.connection()
         .query_row(
@@ -2942,10 +2994,72 @@ fn string_list_from_iter<'a>(iter: impl Iterator<Item = &'a str>) -> QStringList
 
 /// Tell any previously-running watcher thread to exit. The thread
 /// observes the shared atomic on its next 500 ms tick and returns.
+/// Also stops the auto-sync thread — both are tied to the lifetime
+/// of an open database, so reopening always starts both fresh.
 fn stop_prior_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     if let Some(stop) = vm.as_mut().rust_mut().watcher_stop.take() {
         stop.store(true, Ordering::Relaxed);
     }
+    stop_auto_sync(vm.as_mut());
+}
+
+/// 15-minute interval between automatic background syncs. Hard-
+/// coded for now; mirrors jetpack-desktop's `syncInterval` so a
+/// user with both clients open sees roughly the same cadence.
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// How often the sync thread wakes to check the stop flag. Smaller
+/// = faster shutdown, but a slow restart loop spends more cycles
+/// in spurious wakes. 1 s is a reasonable balance.
+const AUTO_SYNC_POLL: Duration = Duration::from_millis(1_000);
+
+/// Tell any previously-running auto-sync thread to exit. Safe to
+/// call when no thread is running.
+fn stop_auto_sync(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if let Some(stop) = vm.as_mut().rust_mut().auto_sync_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spawn the periodic-sync thread. Fires `sync_all_accounts` once
+/// up front (so launch implies an initial sync) and then loops
+/// with a 15-minute sleep, breaking out early when the shared
+/// atomic is set. Each cycle posts back onto the QML thread via
+/// `qt_thread.queue` so the actual `sync_account` dispatch runs
+/// with exclusive pinned-mut access.
+fn start_auto_sync(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    vm.as_mut().rust_mut().auto_sync_stop = Some(stop);
+    let qt_thread = vm.as_ref().qt_thread();
+    std::thread::Builder::new()
+        .name("tasks-auto-sync".into())
+        .spawn(move || {
+            // Initial sync as soon as the DB is open.
+            let _ = qt_thread.queue(|pinned: Pin<&mut qobject::TaskListViewModel>| {
+                pinned.sync_all_accounts();
+            });
+            loop {
+                let started = std::time::Instant::now();
+                while started.elapsed() < AUTO_SYNC_INTERVAL {
+                    if stop_thread.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(AUTO_SYNC_POLL);
+                }
+                if stop_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                if qt_thread
+                    .queue(|pinned: Pin<&mut qobject::TaskListViewModel>| {
+                        pinned.sync_all_accounts();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .expect("spawn auto-sync thread");
 }
 
 /// Spawn a background thread that watches the directory containing
