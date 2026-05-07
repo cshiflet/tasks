@@ -49,9 +49,9 @@ ScrollView {
         { index: 0, label: qsTr("CalDAV"), requiresOAuth: false,
           description: qsTr("Radicale, Nextcloud, Fastmail, iCloud, any RFC 4791 server.") },
         { index: 1, label: qsTr("Google Tasks"), requiresOAuth: true,
-          description: qsTr("Browser-based sign-in for Google Tasks will land in a future release.") },
+          description: qsTr("Browser-based sign-in. Requires TASKS_DESKTOP_GOOGLE_CLIENT_ID.") },
         { index: 2, label: qsTr("Microsoft To Do"), requiresOAuth: true,
-          description: qsTr("Browser-based sign-in for Microsoft To Do will land in a future release.") },
+          description: qsTr("Browser-based sign-in. Requires TASKS_DESKTOP_MICROSOFT_CLIENT_ID.") },
         { index: 3, label: qsTr("EteSync"), requiresOAuth: false,
           description: qsTr("End-to-end encrypted sync. Use your EteSync server + login password.") },
     ]
@@ -166,15 +166,16 @@ ScrollView {
                     }
                 }
 
-                // CalDAV / EteSync rows get a Sync now button. OAuth
-                // providers (kind 1 / 2) hide it because their sign-in
-                // path isn't wired yet.
+                // Every sync-capable row gets a Sync now button. For
+                // OAuth providers without tokens (e.g. fresh launch
+                // before the user re-signs-in) the bridge surfaces
+                // "Re-sign-in required for <label>" and skips —
+                // hiding the button entirely would leave the user
+                // with no way to retry once they re-auth.
                 Button {
                     text: qsTr("Sync now")
                     flat: true
-                    visible: pane.vm
-                             && (pane.vm.accountKinds[row.index] === 0
-                                 || pane.vm.accountKinds[row.index] === 3)
+                    visible: pane.vm && pane.vm.accountKinds[row.index] !== undefined
                     onClicked: {
                         if (!pane.vm) { return; }
                         pane.vm.syncAccount(pane.vm.accountUuids[row.index]);
@@ -184,7 +185,9 @@ ScrollView {
                 // CalDAV / EteSync rows get a "New list" button that
                 // pops a dialog asking for a name + creates the
                 // calendar on the server. Hidden for OAuth providers
-                // until their sign-in flow lands.
+                // because the create_account_calendar bridge path
+                // doesn't have a Google / Microsoft branch yet
+                // (separate follow-up).
                 Button {
                     text: qsTr("New list")
                     flat: true
@@ -359,12 +362,16 @@ ScrollView {
                   ? qsTr("Sign in…")
                   : qsTr("Add account")
             highlighted: true
-            enabled: !pane.providerKinds[kindBox.currentIndex].requiresOAuth
-            ToolTip.visible: hovered && !enabled
-            ToolTip.text: qsTr("Browser-based sign-in for this provider is pending and will land in a future release.")
             onClicked: {
                 if (!pane.vm) { return; }
                 const kind = pane.providerKinds[kindBox.currentIndex].index;
+                if (pane.providerKinds[kindBox.currentIndex].requiresOAuth) {
+                    // OAuth path — only the label is meaningful; the
+                    // bridge spawns the browser-based sign-in and
+                    // posts status back via the status bar.
+                    pane.vm.beginOAuthSignIn(kind, labelField.text);
+                    return;
+                }
                 pane.vm.addPasswordAccount(
                     kind,
                     labelField.text,

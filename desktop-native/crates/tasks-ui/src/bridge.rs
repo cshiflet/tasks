@@ -393,6 +393,19 @@ pub mod qobject {
             password: QString,
         );
 
+        /// Drive the browser-based OAuth sign-in flow for an OAuth
+        /// provider (`kind == 1` Google Tasks, `kind == 2`
+        /// Microsoft To Do). Opens the system browser at the
+        /// authorization URL, waits for the loopback redirect on
+        /// localhost, exchanges the code for tokens, persists the
+        /// `caldav_accounts` row + stashes the tokens in the
+        /// session's [`tasks_sync::TokenStore`]. Status flows
+        /// through the status bar — both the in-flight
+        /// "Opening browser…" notice and the success / failure
+        /// outcome.
+        #[qinvokable]
+        fn begin_oauth_sign_in(self: Pin<&mut TaskListViewModel>, kind: i32, label: QString);
+
         /// Drive a one-shot pull-then-push cycle against the account
         /// identified by `cda_uuid`. Returns immediately — the
         /// actual cycle runs on a background worker thread, and a
@@ -477,8 +490,11 @@ use tasks_core::query::{
 };
 use tasks_core::recurrence::humanize_rrule;
 use tasks_core::watch::DatabaseWatcher;
-use tasks_sync::providers::{caldav::CalDavProvider, etesync::EteSyncProvider};
-use tasks_sync::{AccountCredentials, Provider, SyncEngine};
+use tasks_sync::providers::{
+    caldav::CalDavProvider, etesync::EteSyncProvider, google::GoogleTasksProvider,
+    microsoft::MicrosoftToDoProvider,
+};
+use tasks_sync::{AccountCredentials, Provider, ProviderKind, SyncEngine};
 
 /// Provider kind tags that match `tasks_sync::ProviderKind` in
 /// numeric order. Kept as bare integers at the bridge boundary so
@@ -639,6 +655,12 @@ pub struct TaskListViewModelRust {
     /// instance is shared across every Sync now click for the
     /// lifetime of the view model.
     runtime: Option<tokio::runtime::Runtime>,
+    /// OAuth tokens for Google / Microsoft accounts, keyed on
+    /// `(ProviderKind, cda_uuid)`. In-memory only today — tokens
+    /// don't survive a restart, so the user has to re-sign-in on
+    /// each launch. Disk-backed (libsecret / Keychain / Credential
+    /// Manager) is the follow-up tracked in PLAN_UPDATES §11.
+    token_store: Arc<dyn tasks_sync::TokenStore>,
     /// Throttle bookkeeping for `refresh_sidebar`. A burst of
     /// in-process mutation triggers (account-add, list-rename, sync
     /// completion, …) used to fan out as one full rebuild per call;
@@ -750,6 +772,7 @@ impl Default for TaskListViewModelRust {
             watcher_stop: None,
             auto_sync_stop: None,
             runtime: None,
+            token_store: Arc::new(tasks_sync::InMemoryTokenStore::new()),
             last_sidebar_refresh: None,
             pending_sidebar_refresh: false,
         }
@@ -926,11 +949,8 @@ impl qobject::TaskListViewModel {
     ) {
         if kind != KIND_CALDAV && kind != KIND_ETESYNC {
             let msg = match kind {
-                KIND_GOOGLE_TASKS => {
-                    "Google Tasks sign-in lands with the OAuth flow (PLAN_UPDATES \u{00A7}11)."
-                }
-                KIND_MICROSOFT_TODO => {
-                    "Microsoft To Do sign-in lands with the OAuth flow (PLAN_UPDATES \u{00A7}11)."
+                KIND_GOOGLE_TASKS | KIND_MICROSOFT_TODO => {
+                    "Use Sign in\u{2026} for Google Tasks / Microsoft To Do; password auth doesn't apply."
                 }
                 _ => "Unknown account type.",
             };
@@ -1210,6 +1230,213 @@ impl qobject::TaskListViewModel {
         }
     }
 
+    /// Drive the browser-based OAuth sign-in for a Google / Microsoft
+    /// account. Posts an "Opening browser…" status, kicks off a
+    /// dedicated worker thread (mirrors `sync_account`'s threading
+    /// model — `block_on` inside `std::thread::spawn` so the !Sync
+    /// transaction-borrow inside the engine never crosses thread
+    /// boundaries), runs `authorize()`, and rejoins the QML thread
+    /// to insert the `caldav_accounts` row + stash the tokens. On
+    /// failure the row is not inserted and the error surfaces on
+    /// the status bar.
+    pub fn begin_oauth_sign_in(mut self: Pin<&mut Self>, kind: i32, label: QString) {
+        if kind != KIND_GOOGLE_TASKS && kind != KIND_MICROSOFT_TODO {
+            self.as_mut().set_status(QString::from(
+                "OAuth sign-in only supports Google Tasks / Microsoft To Do.",
+            ));
+            return;
+        }
+        let label_s = label.to_string().trim().to_string();
+        if label_s.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Label is required for OAuth sign-in."));
+            return;
+        }
+        if self.db_path.is_none() {
+            self.as_mut().set_status(QString::from(
+                "Open a database before signing in to a sync account.",
+            ));
+            return;
+        }
+        // The env-var-missing path can't be unit-tested in
+        // isolation: the invokable demands `Pin<&mut Self>` of a
+        // cxx-qt QObject, which only materialises inside a running
+        // Qt event loop. The branch is exercised end-to-end by the
+        // smoke-run (`QT_QPA_PLATFORM=offscreen cargo run`).
+        let env_var = match kind {
+            KIND_GOOGLE_TASKS => "TASKS_DESKTOP_GOOGLE_CLIENT_ID",
+            KIND_MICROSOFT_TODO => "TASKS_DESKTOP_MICROSOFT_CLIENT_ID",
+            _ => unreachable!("kind validated above"),
+        };
+        // Bail before opening the browser when the env var is unset
+        // — popping a sign-in window with no client_id is a guaranteed
+        // dead end and the resulting Google / Azure error page is
+        // confusing.
+        let client_id = match std::env::var(env_var) {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                let msg = match kind {
+                    KIND_GOOGLE_TASKS => {
+                        "Set TASKS_DESKTOP_GOOGLE_CLIENT_ID before signing in to Google Tasks."
+                    }
+                    KIND_MICROSOFT_TODO => {
+                        "Set TASKS_DESKTOP_MICROSOFT_CLIENT_ID before signing in to Microsoft To Do."
+                    }
+                    _ => unreachable!(),
+                };
+                self.as_mut().set_status(QString::from(msg));
+                return;
+            }
+        };
+
+        if self.runtime.is_none() {
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("tasks-sync")
+                .build()
+            {
+                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
+                Err(e) => {
+                    self.as_mut()
+                        .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
+                    return;
+                }
+            }
+        }
+
+        self.as_mut()
+            .set_status(QString::from("Opening browser to sign in\u{2026}"));
+
+        let qt_thread = self.as_ref().qt_thread();
+        let runtime = self
+            .as_mut()
+            .rust_mut()
+            .runtime
+            .as_ref()
+            .expect("runtime constructed above")
+            .handle()
+            .clone();
+        let token_store = Arc::clone(&self.as_ref().token_store);
+        let db_path = self.db_path.clone().expect("db_path checked above");
+        let label_for_thread = label_s.clone();
+
+        std::thread::Builder::new()
+            .name(format!("oauth:{label_s}"))
+            .spawn(move || {
+                // Build a dedicated reqwest Client for the token
+                // exchange. Disable auto-redirects so a 3xx never
+                // bounces the request elsewhere with the PKCE code.
+                let http_result = reqwest_client_for_oauth();
+                let result = match http_result {
+                    Ok(http) => runtime.block_on(async move {
+                        let timeout = std::time::Duration::from_secs(120);
+                        match kind {
+                            KIND_GOOGLE_TASKS => {
+                                tasks_sync::providers::google::authorize(
+                                    &client_id,
+                                    &http,
+                                    |url| {
+                                        // open_browser is best-effort; if the
+                                        // user has no default browser the
+                                        // loopback receiver eventually times
+                                        // out with a clear error.
+                                        let _ = webbrowser::open(url);
+                                    },
+                                    timeout,
+                                )
+                                .await
+                            }
+                            KIND_MICROSOFT_TODO => {
+                                tasks_sync::providers::microsoft::authorize(
+                                    &client_id,
+                                    &http,
+                                    |url| {
+                                        let _ = webbrowser::open(url);
+                                    },
+                                    timeout,
+                                )
+                                .await
+                            }
+                            _ => unreachable!("kind validated above"),
+                        }
+                    }),
+                    Err(e) => Err(tasks_sync::SyncError::Network(format!(
+                        "reqwest build: {e}"
+                    ))),
+                };
+                let _ = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    match result {
+                        Ok(tokens) => {
+                            let uuid = uuid::Uuid::new_v4().to_string();
+                            let cda_account_type = match kind {
+                                KIND_GOOGLE_TASKS => 7, // tasks_core::AccountType::GOOGLE_TASKS
+                                KIND_MICROSOFT_TODO => 6, // tasks_core::AccountType::MICROSOFT
+                                _ => unreachable!(),
+                            };
+                            // Persist a row with empty server / username /
+                            // password — OAuth providers don't use any of
+                            // those columns; the token store handles
+                            // secrets.
+                            let res = open_rw_conn(&db_path).and_then(|conn| {
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO caldav_accounts \
+                                     (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+                                      cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+                                     VALUES (?1, ?2, '', '', '', NULL, ?3, 0, -1, 0)",
+                                    rusqlite::params![uuid, label_for_thread, cda_account_type],
+                                )
+                                .map(|_| ())
+                            });
+                            if let Err(e) = res {
+                                pinned.as_mut().set_status(QString::from(&format!(
+                                    "Sign-in failed: DB write: {e}"
+                                )));
+                                return;
+                            }
+                            let provider_kind = match kind {
+                                KIND_GOOGLE_TASKS => ProviderKind::GoogleTasks,
+                                KIND_MICROSOFT_TODO => ProviderKind::MicrosoftToDo,
+                                _ => unreachable!(),
+                            };
+                            // Token store is keyed by (provider_kind, cda_uuid)
+                            // so the per-account `sync_account` lookup is
+                            // unambiguous even if the user signs into the
+                            // same provider twice.
+                            if let Err(e) = token_store.put(provider_kind, &uuid, &tokens) {
+                                pinned.as_mut().set_status(QString::from(&format!(
+                                    "Sign-in failed: token store: {e}"
+                                )));
+                                return;
+                            }
+                            {
+                                let mut inner = pinned.as_mut().rust_mut();
+                                inner.accounts.push(StoredAccount {
+                                    uuid: uuid.clone(),
+                                    kind,
+                                    label: label_for_thread.clone(),
+                                    server: String::new(),
+                                    username: String::new(),
+                                    password: SecretString::from(String::new()),
+                                });
+                                inner.account_states.push(String::from("Idle"));
+                            }
+                            publish_accounts(pinned.as_mut());
+                            pinned.as_mut().set_status(QString::from(&format!(
+                                "Signed in to {label_for_thread} (session-local tokens)."
+                            )));
+                        }
+                        Err(e) => {
+                            pinned
+                                .as_mut()
+                                .set_status(QString::from(&format!("Sign-in failed: {e}")));
+                        }
+                    }
+                });
+            })
+            .expect("spawn oauth worker thread");
+    }
+
     /// Run a single sync cycle (pull + push) against the account
     /// keyed by `cda_uuid`. Synchronous wrt. the QML caller — the
     /// app freezes until the cycle finishes. Acceptable for a
@@ -1277,22 +1504,79 @@ impl qobject::TaskListViewModel {
         // Build the right Provider before we leave the QML thread
         // — the credential plumbing reads from `self.accounts` and
         // needs the `&self` borrow.
-        let creds = AccountCredentials::new_password(
-            &stored.server,
-            &stored.username,
-            secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
-        );
         let label = stored.label.clone();
         let allow_signup = is_local_etebase_url(&stored.server);
+        let token_store = Arc::clone(&self.as_ref().token_store);
         let provider: Box<dyn Provider + Send> = match stored.kind {
-            KIND_CALDAV => Box::new(CalDavProvider::new(creds, label.clone())),
-            KIND_ETESYNC => Box::new(
-                EteSyncProvider::new(creds, label.clone()).with_signup_fallback(allow_signup),
-            ),
+            KIND_CALDAV => {
+                let creds = AccountCredentials::new_password(
+                    &stored.server,
+                    &stored.username,
+                    secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+                );
+                Box::new(CalDavProvider::new(creds, label.clone()))
+            }
+            KIND_ETESYNC => {
+                let creds = AccountCredentials::new_password(
+                    &stored.server,
+                    &stored.username,
+                    secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+                );
+                Box::new(
+                    EteSyncProvider::new(creds, label.clone()).with_signup_fallback(allow_signup),
+                )
+            }
+            KIND_GOOGLE_TASKS | KIND_MICROSOFT_TODO => {
+                let provider_kind = if stored.kind == KIND_GOOGLE_TASKS {
+                    ProviderKind::GoogleTasks
+                } else {
+                    ProviderKind::MicrosoftToDo
+                };
+                // Refuse to sync without tokens rather than silently
+                // re-popping the browser — that would surprise the
+                // user and conflict with their intent (e.g. periodic
+                // background sync triggers).
+                if token_store.get(provider_kind, &uuid).is_none() {
+                    self.as_mut()
+                        .set_status(QString::from(&format!("Re-sign-in required for {label}")));
+                    set_account_state(self.as_mut(), &uuid, "Idle");
+                    return;
+                }
+                let env_var = if stored.kind == KIND_GOOGLE_TASKS {
+                    "TASKS_DESKTOP_GOOGLE_CLIENT_ID"
+                } else {
+                    "TASKS_DESKTOP_MICROSOFT_CLIENT_ID"
+                };
+                let client_id = match std::env::var(env_var) {
+                    Ok(v) if !v.trim().is_empty() => v,
+                    _ => {
+                        self.as_mut().set_status(QString::from(&format!(
+                            "Set {env_var} before syncing {label}."
+                        )));
+                        set_account_state(self.as_mut(), &uuid, "Idle");
+                        return;
+                    }
+                };
+                // Empty AccountCredentials so the provider falls
+                // through to the TokenStore for tokens; the engine
+                // borrows the same store the OAuth flow wrote into,
+                // keyed by `cda_uuid`.
+                let creds = AccountCredentials::default();
+                if stored.kind == KIND_GOOGLE_TASKS {
+                    Box::new(
+                        GoogleTasksProvider::new(creds, uuid.clone(), client_id)
+                            .with_token_store(Arc::clone(&token_store)),
+                    )
+                } else {
+                    Box::new(
+                        MicrosoftToDoProvider::new(creds, uuid.clone(), client_id)
+                            .with_token_store(Arc::clone(&token_store)),
+                    )
+                }
+            }
             _ => {
-                self.as_mut().set_status(QString::from(
-                    "OAuth providers (Google / Microsoft) need the sign-in flow to land first.",
-                ));
+                self.as_mut()
+                    .set_status(QString::from("Unknown account kind."));
                 set_account_state(self.as_mut(), &uuid, "Idle");
                 return;
             }
@@ -1375,10 +1659,19 @@ impl qobject::TaskListViewModel {
     /// toolbar's manual Sync button + to the auto-sync hooks
     /// triggered by task create / edit / delete.
     pub fn sync_all_accounts(mut self: Pin<&mut Self>) {
+        // OAuth accounts join the fan-out: `sync_account` short-
+        // circuits with "Re-sign-in required" if the in-memory
+        // token store doesn't carry a row for the account, so the
+        // periodic-sync timer never accidentally re-pops a browser.
         let uuids: Vec<String> = self
             .accounts
             .iter()
-            .filter(|a| a.kind == KIND_CALDAV || a.kind == KIND_ETESYNC)
+            .filter(|a| {
+                a.kind == KIND_CALDAV
+                    || a.kind == KIND_ETESYNC
+                    || a.kind == KIND_GOOGLE_TASKS
+                    || a.kind == KIND_MICROSOFT_TODO
+            })
             .map(|a| a.uuid.clone())
             .collect();
         for uuid in uuids {
@@ -2660,19 +2953,20 @@ fn current_caldav_meta_for(db: &Database, task_id: i64) -> (String, i32) {
     }
 }
 
-/// Load every password-auth `caldav_accounts` row (kinds 0 = CALDAV
-/// and 5 = ETEBASE) into the bridge's in-memory `accounts` list so
-/// the Accounts pane reflects whatever the DB carries — both rows
-/// the user added in a prior session and rows brought in by the
-/// JSON-import path. OAuth providers stay invisible here until
-/// their sign-in flow lands; their tokens won't be in `cda_password`
-/// anyway.
+/// Load every sync-capable `caldav_accounts` row into the bridge's
+/// in-memory `accounts` list so the Accounts pane reflects whatever
+/// the DB carries — both rows the user added in a prior session and
+/// rows brought in by the JSON-import path. OAuth providers
+/// (kinds 6 / 7) appear here too; their tokens are session-local
+/// (`InMemoryTokenStore`), so on a fresh launch the row materialises
+/// without tokens and `sync_account` will surface
+/// "Re-sign-in required" until the user re-runs the OAuth flow.
 fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
     let mut out = Vec::new();
     let Ok(mut stmt) = db.connection().prepare(
         "SELECT cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_account_type \
          FROM caldav_accounts \
-         WHERE cda_account_type IN (0, 5) \
+         WHERE cda_account_type IN (0, 5, 6, 7) \
          ORDER BY cda_account_type, cda_name",
     ) else {
         return out;
@@ -2697,6 +2991,8 @@ fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
             let kind = match kind_in_db {
                 0 => KIND_CALDAV,
                 5 => KIND_ETESYNC,
+                6 => KIND_MICROSOFT_TODO,
+                7 => KIND_GOOGLE_TASKS,
                 _ => continue,
             };
             out.push(StoredAccount {
@@ -2943,6 +3239,19 @@ fn ensure_local_default_list(path: &std::path::Path) {
 /// running with `AUTO_SIGNUP=true`. Production / public Etebase
 /// servers don't get the fallback — auto-signup with bad creds
 /// would silently create an empty account.
+/// Build the reqwest Client we hand to the OAuth `authorize()` and
+/// (later) the per-provider sync paths. Mirrors the per-provider
+/// connect()-side builder: rustls, 30-second timeout, redirects
+/// disabled so a 3xx never silently bounces a Bearer token to a
+/// third-party host.
+fn reqwest_client_for_oauth() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent("tasks-desktop-native/0.1")
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 fn is_local_etebase_url(server_url: &str) -> bool {
     let lower = server_url.to_ascii_lowercase();
     lower.contains("://127.0.0.1") || lower.contains("://localhost") || lower.contains("://[::1]")
