@@ -1090,6 +1090,7 @@ impl qobject::TaskListViewModel {
             return;
         }
 
+        let uuid_for_sync = uuid.clone();
         {
             let mut inner = self.as_mut().rust_mut();
             inner.accounts.push(StoredAccount {
@@ -1105,6 +1106,10 @@ impl qobject::TaskListViewModel {
         publish_accounts(self.as_mut());
         self.as_mut()
             .set_status(QString::from("Account saved (session-local)."));
+        // First sync immediately so the sidebar populates without
+        // a manual click. sync_account is non-blocking (spawns a
+        // worker thread) so the QML add-form returns instantly.
+        self.as_mut().sync_account(QString::from(&uuid_for_sync));
     }
 
     /// H-4: update the search query and reload. Empty string
@@ -1566,6 +1571,11 @@ impl qobject::TaskListViewModel {
                             pinned.as_mut().set_status(QString::from(&format!(
                                 "Signed in to {label_for_thread} (session-local tokens)."
                             )));
+                            // Pull immediately so the sidebar populates without
+                            // requiring the user to click Sync. sync_account
+                            // spawns its own worker thread, so this returns
+                            // straight away and the QML thread is free.
+                            pinned.as_mut().sync_account(QString::from(&uuid));
                         }
                         Err(e) => {
                             tracing::warn!("oauth: completion handler reporting Err: {e}");

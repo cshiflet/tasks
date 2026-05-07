@@ -34,21 +34,43 @@ pub struct LoopbackReceiver {
     /// `127.0.0.1` regardless — the host string only affects
     /// the URL we hand the authorization server.
     redirect_host: String,
+    /// Path component of the redirect URI. Google accepts any
+    /// loopback path (`/cb` is conventional); Microsoft requires
+    /// the path of the *sent* redirect URI to match the path of
+    /// the *registered* redirect URI exactly (case-sensitive).
+    /// Microsoft's recommended public-client registration is
+    /// `http://localhost` with no path, so the loopback receiver
+    /// for that provider has to advertise `/` (root) and accept
+    /// requests to `/`.
+    redirect_path: String,
 }
 
 impl LoopbackReceiver {
     /// Bind to a random high port on the loopback interface and
     /// advertise the redirect URI as `http://127.0.0.1:<port>/cb`.
     pub fn bind() -> Result<Self, OAuthError> {
-        Self::bind_with_host("127.0.0.1")
+        Self::bind_with_redirect("127.0.0.1", "/cb")
     }
 
     /// Bind to a random high port on the loopback interface and
-    /// advertise the redirect URI with the given host name. Use
-    /// this for providers that don't accept `127.0.0.1` as a
-    /// redirect host (notably Microsoft, which requires
-    /// `localhost`).
+    /// advertise the redirect URI with the given host name. The
+    /// path stays `/cb`; for providers that need a different path
+    /// use [`bind_with_redirect`].
     pub fn bind_with_host(host: &str) -> Result<Self, OAuthError> {
+        Self::bind_with_redirect(host, "/cb")
+    }
+
+    /// Bind to a random high port on the loopback interface with
+    /// fully-configurable host + path components. The path must
+    /// start with `/`; use `"/"` for providers (Microsoft) that
+    /// require the redirect URI to have no extra path so it
+    /// matches a registration of `http://localhost`.
+    pub fn bind_with_redirect(host: &str, path: &str) -> Result<Self, OAuthError> {
+        let path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| OAuthError::Random(format!("bind loopback: {e}")))?;
         let addr = listener
@@ -58,6 +80,7 @@ impl LoopbackReceiver {
             listener,
             addr,
             redirect_host: host.to_string(),
+            redirect_path: path,
         })
     }
 
@@ -66,7 +89,21 @@ impl LoopbackReceiver {
     }
 
     pub fn redirect_uri(&self) -> String {
-        format!("http://{}:{}/cb", self.redirect_host, self.addr.port())
+        // Strip the trailing `/` when the path is bare `/` so the
+        // sent URI is `http://host:port` rather than
+        // `http://host:port/`. Microsoft's matcher is happier
+        // with the unrooted form for `http://localhost`-style
+        // registrations.
+        if self.redirect_path == "/" {
+            format!("http://{}:{}", self.redirect_host, self.addr.port())
+        } else {
+            format!(
+                "http://{}:{}{}",
+                self.redirect_host,
+                self.addr.port(),
+                self.redirect_path
+            )
+        }
     }
 
     /// Block until the browser hits us. The first valid HTTP
@@ -96,6 +133,7 @@ impl LoopbackReceiver {
         let deadline = std::time::Instant::now() + timeout;
         let bound_port = self.addr.port();
         let expected_host = format!("{}:{}", self.redirect_host, bound_port);
+        let expected_path = self.redirect_path.clone();
 
         // We can't use TcpListener::accept_timeout directly; poll
         // set_read_timeout on a peer stream instead. The idiom:
@@ -120,7 +158,7 @@ impl LoopbackReceiver {
             }
             match self.listener.accept() {
                 Ok((stream, _peer)) => {
-                    match handle_stream(stream, expected_state, &expected_host) {
+                    match handle_stream(stream, expected_state, &expected_host, &expected_path) {
                         Ok(params) => return Ok(params),
                         Err(OAuthError::MalformedRedirect(msg)) => {
                             tracing::debug!("ignoring malformed loopback hit: {msg}");
@@ -157,6 +195,7 @@ fn handle_stream(
     mut stream: TcpStream,
     expected_state: &str,
     expected_host: &str,
+    expected_path: &str,
 ) -> Result<RedirectParams, OAuthError> {
     stream.set_read_timeout(Some(STREAM_DEADLINE)).ok();
     stream.set_write_timeout(Some(STREAM_DEADLINE)).ok();
@@ -216,7 +255,7 @@ fn handle_stream(
     // loopback port during dev-tools auto-discovery) could feed
     // the receiver an attacker-shaped URL.
     let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
-    if path_only != "/cb" {
+    if path_only != expected_path {
         let _ = write_bad_request(&mut stream);
         return Err(OAuthError::MalformedRedirect(format!(
             "unexpected path {path_only}"

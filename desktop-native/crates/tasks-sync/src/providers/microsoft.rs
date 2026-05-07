@@ -376,13 +376,16 @@ where
     use crate::loopback::LoopbackReceiver;
 
     let receiver =
-        // Microsoft's redirect-URI matcher treats `localhost` and
-        // `127.0.0.1` as distinct strings even though both
-        // resolve to the same socket. Azure's recommended public-
-        // client registration is `http://localhost`, which lets
-        // it accept any port; using the IP literal in the URI we
-        // submit triggers `invalid_request: redirect_uri ...`.
-        LoopbackReceiver::bind_with_host("localhost")
+        // Microsoft public-client redirect URIs need both:
+        //   - host == "localhost" (the IP literal `127.0.0.1`
+        //     isn't accepted under an `http://localhost`
+        //     registration);
+        //   - path matching the registered URI's path exactly.
+        //     Azure's recommended public-client registration is
+        //     `http://localhost` (no path), so the URI we *send*
+        //     must also have no extra path. Using the conventional
+        //     `/cb` triggers `invalid_request: redirect_uri ...`.
+        LoopbackReceiver::bind_with_redirect("localhost", "/")
             .map_err(|e| SyncError::Auth(format!("loopback bind: {e}")))?;
     let redirect_uri = receiver.redirect_uri();
     let req = build_authorization_request(AUTHORIZATION_ENDPOINT, client_id, SCOPES, &redirect_uri)
