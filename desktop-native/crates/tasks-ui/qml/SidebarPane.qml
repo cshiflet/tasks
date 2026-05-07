@@ -245,8 +245,23 @@ Pane {
                 width: sidebarList.width
 
                 property string myGroup: root.vm ? root._groupOfIndex(row.index) : ""
-                property string myId: root.vm ? root.vm.sidebarIds[row.index] : ""
-                property string myLabel: root.vm ? root.vm.sidebarLabels[row.index] : ""
+                // sidebarIds / sidebarLabels are parallel QStringLists
+                // rebuilt by the bridge whenever the sidebar shape
+                // changes (account add/remove, list create, sync
+                // refresh). The ListView delegate keeps its `index`
+                // through that rebuild but for one frame the array
+                // length and the count may disagree — guard the
+                // lookup so an out-of-range read coalesces to "" and
+                // QML doesn't warn "Unable to assign [undefined] to
+                // QString".
+                property string myId: (root.vm
+                    && row.index < root.vm.sidebarIds.length)
+                    ? root.vm.sidebarIds[row.index]
+                    : ""
+                property string myLabel: (root.vm
+                    && row.index < root.vm.sidebarLabels.length)
+                    ? root.vm.sidebarLabels[row.index]
+                    : ""
                 // True when the row is itself an account-section
                 // header (id `account:<uuid>`). These render as a
                 // tinted strip and toggle their group's collapse
@@ -323,7 +338,13 @@ Pane {
                     id: accountHeader
                     visible: row._isAccountHeader
                     width: row.width
-                    implicitHeight: visible ? 26 : 0
+                    // Header height grows from 26 to 32 to give the
+                    // per-account sync button a more clickable target
+                    // without scrunching the icon. The collapse arrow
+                    // and label both centre vertically inside the
+                    // RowLayout, so the extra ~6 px is invisible aside
+                    // from a slightly larger hit area for the button.
+                    implicitHeight: visible ? 32 : 0
                     height: implicitHeight
                     topPadding: 0
                     bottomPadding: 0
@@ -380,8 +401,8 @@ Pane {
                         ToolButton {
                             id: rowSyncButton
                             visible: !accountHeader._isLocalAccount
-                            Layout.preferredWidth: 22
-                            Layout.preferredHeight: 22
+                            Layout.preferredWidth: 28
+                            Layout.preferredHeight: 28
                             ToolTip.visible: hovered
                             ToolTip.text: qsTr("Sync %1").arg(row.myLabel)
                             // Stop propagation so the click doesn't
@@ -416,8 +437,8 @@ Pane {
                                 && root.vm.accountSyncStates[_accountIndex] === "Syncing…"
                             contentItem: Canvas {
                                 id: rowSyncIcon
-                                implicitWidth: 14
-                                implicitHeight: 14
+                                implicitWidth: 18
+                                implicitHeight: 18
                                 RotationAnimation on rotation {
                                     running: rowSyncButton._syncing
                                     from: 0; to: 360
