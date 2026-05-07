@@ -52,6 +52,126 @@ Room migrations land, bump both constants together and re-run
 `cargo test`. A CI job (`tests/schema_guard.rs`) flags drift on PRs
 that touch either file.
 
+## Sync providers — OAuth setup
+
+CalDAV (Radicale, Fastmail, iCloud-with-app-password, Nextcloud, ...)
+and EteSync work out of the box: add the account from
+**Settings → Accounts** with the server URL + username + password
+the provider gave you. No further configuration.
+
+Google Tasks and Microsoft To Do use OAuth 2.0 with PKCE. Tasks.org
+deliberately does **not** ship its own client IDs — every install
+needs to bring its own so neither provider can cap or revoke "the"
+desktop client behind everyone's back. The flow is the same for
+both providers:
+
+1. **Get a client ID from the provider**.
+2. **Drop it in `oauth.json`** under your config directory, or set
+   the matching environment variable.
+3. **Click *Sign in…* in Settings → Accounts**.
+
+### Where the client IDs live
+
+The desktop client looks in two places, in priority order:
+
+1. **Environment variables** (override; useful for CI / dev):
+   - `TASKS_DESKTOP_GOOGLE_CLIENT_ID`
+   - `TASKS_DESKTOP_MICROSOFT_CLIENT_ID`
+2. **`oauth.json` in the per-OS config directory**:
+   - Linux: `~/.config/tasks-desktop/oauth.json`
+   - macOS: `~/Library/Application Support/tasks-desktop/oauth.json`
+   - Windows: `%APPDATA%\tasks-desktop\oauth.json`
+
+Schema (both fields optional — fill in only the providers you use):
+
+```json
+{
+  "google_client_id": "1234567890-abc...apps.googleusercontent.com",
+  "microsoft_client_id": "12345678-aaaa-bbbb-cccc-1234567890ab"
+}
+```
+
+The file is hand-managed; the app never writes to it. Keep it out
+of version control — these client IDs aren't full secrets but they
+identify your install to the provider and don't belong on a public
+shared ref.
+
+### Getting a Google Tasks client ID
+
+1. Go to the **[Google Cloud Console][gcloud]** and create a project
+   (or pick an existing one).
+2. **APIs & Services → Library** — enable *Google Tasks API*.
+3. **APIs & Services → OAuth consent screen** — create one. User
+   type *External* is fine for personal use; published-status
+   *Testing* is enough as long as you add your own Google account
+   under *Test users*. The desktop client doesn't need *Production*
+   verification.
+4. **APIs & Services → Credentials → Create credentials → OAuth
+   client ID**. Application type: **Desktop application**. Name it
+   anything; the value the user sees during sign-in is the
+   consent-screen app name from step 3.
+5. Copy the *Client ID* string (the *Client secret* is unused —
+   PKCE replaces it). Drop it into `oauth.json` or
+   `TASKS_DESKTOP_GOOGLE_CLIENT_ID`.
+
+The desktop client uses the loopback redirect
+(`http://127.0.0.1:<random-port>/cb`) so you don't have to register
+a redirect URI — Google Desktop OAuth allows arbitrary loopback
+ports without listing them.
+
+[gcloud]: https://console.cloud.google.com/
+
+### Getting a Microsoft To Do client ID
+
+1. Sign in to the **[Azure portal][aportal]** (a free personal MSA
+   account works).
+2. **Microsoft Entra ID → App registrations → New registration**.
+3. Supported account types: choose *Personal Microsoft accounts
+   only* if you'll sign in with an `@outlook.com` / `@live.com` /
+   `@hotmail.com` account, or *Both personal and work/school* if you
+   need both.
+4. **Redirect URI**: choose **Public client/native (mobile &
+   desktop)** and enter `http://localhost`. The desktop client uses
+   a random loopback port; Azure's native-client policy treats any
+   `http://localhost:<port>/...` as matching.
+5. After creation, copy the **Application (client) ID** from the
+   overview tab.
+6. **API permissions → Add a permission → Microsoft Graph →
+   Delegated → Tasks.ReadWrite** (and **offline_access** if it
+   isn't already there). For personal-only registrations no admin
+   consent is required.
+7. Drop the client ID into `oauth.json` or
+   `TASKS_DESKTOP_MICROSOFT_CLIENT_ID`.
+
+If your Azure tenant rejects the `/common` authority used by
+default, you'll see a tenant-mismatch error. Per-tenant endpoint
+override is a follow-up; for now use a personal MSA registration.
+
+[aportal]: https://portal.azure.com/
+
+### Verifying the setup
+
+After you've placed the client ID:
+
+1. Restart the app (env var changes need a fresh process; `oauth.json`
+   is re-read on every sign-in attempt).
+2. **Settings → Accounts → Provider → Google Tasks** (or
+   *Microsoft To Do*).
+3. Type a label (e.g. *Personal Google*) and click **Sign in…**.
+   The status bar shows "Opening browser to sign in…" and your
+   default browser opens to the provider's consent screen. If the
+   browser can't be launched (kiosk / WSL / `xdg-open` missing), a
+   dialog pops up with the URL and a *Copy URL* button — paste it
+   into any browser on the same machine.
+4. Approve, the browser shows "You're signed in. You can close this
+   tab", and the new account appears in the sidebar with a per-row
+   sync button.
+
+If sign-in fails, the status bar gets a one-line diagnosis. The
+tokens live in-memory only today — restarting the app forces a
+re-sign-in. Disk-backed token storage (libsecret / Keychain /
+Credential Manager) is a tracked follow-up.
+
 ## Roadmap
 
 Milestone 1 (read-only companion):
