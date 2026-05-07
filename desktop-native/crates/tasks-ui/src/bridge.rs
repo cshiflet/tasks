@@ -685,6 +685,12 @@ pub struct TaskListViewModelRust {
     /// Re-set on every DB open + on view-model drop; the spawned
     /// thread shares a clone and exits the next time it sees `true`.
     auto_sync_stop: Option<Arc<AtomicBool>>,
+    /// Cancellation flag handed to the OAuth loopback receiver
+    /// so closing the window aborts an in-flight sign-in instead
+    /// of leaving the worker thread parked inside its 120 s
+    /// timeout. Set on view-model Drop; the LoopbackReceiver
+    /// polls it at 25 ms cadence and bails out cleanly.
+    oauth_stop: Option<Arc<AtomicBool>>,
     /// Multi-threaded tokio runtime hosting `tasks-sync` calls.
     /// Built lazily on first sync_account invocation; one Runtime
     /// instance is shared across every Sync now click for the
@@ -815,6 +821,7 @@ impl Default for TaskListViewModelRust {
             },
             watcher_stop: None,
             auto_sync_stop: None,
+            oauth_stop: None,
             runtime: None,
             token_store: Arc::new(tasks_sync::InMemoryTokenStore::new()),
             last_sidebar_refresh: None,
@@ -831,6 +838,12 @@ impl Drop for TaskListViewModelRust {
             stop.store(true, Ordering::Relaxed);
         }
         if let Some(stop) = self.auto_sync_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        // OAuth worker may be parked inside its 120 s loopback
+        // wait when the user closes the window; setting the flag
+        // wakes it up on the next 25 ms accept poll.
+        if let Some(stop) = self.oauth_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
         // Drop pending alarm tasks. The runtime itself is also
@@ -1314,13 +1327,13 @@ impl qobject::TaskListViewModel {
             ));
             return;
         }
-        // Resolve the OAuth client ID. Env var wins for CI / dev /
-        // one-off overrides; falls back to oauth.json so most users
-        // never touch their shell environment. Bail before opening
-        // the browser when neither source carries a value — popping
-        // a sign-in window with no client_id is a guaranteed dead
-        // end and the resulting Google / Azure error page is
-        // confusing.
+        // Resolve the OAuth client ID (and, for Google, the
+        // client secret). Env vars win for CI / dev / one-off
+        // overrides; oauth.json is the per-user fallback. Bail
+        // before opening the browser when anything required is
+        // missing — popping a sign-in window that's guaranteed to
+        // dead-end on Google's / Azure's error page is worse than
+        // a clear status message.
         let client_id = match kind {
             KIND_GOOGLE_TASKS => crate::preferences::google_oauth_client_id(),
             KIND_MICROSOFT_TODO => crate::preferences::microsoft_oauth_client_id(),
@@ -1344,6 +1357,26 @@ impl qobject::TaskListViewModel {
                 self.as_mut().set_status(QString::from(&msg));
                 return;
             }
+        };
+        // Google additionally requires the client secret on the
+        // token-exchange POST. Microsoft public-client PKCE
+        // flows don't carry one.
+        let client_secret: Option<String> = match kind {
+            KIND_GOOGLE_TASKS => match crate::preferences::google_oauth_client_secret() {
+                Some(v) => Some(v),
+                None => {
+                    let path = crate::preferences::oauth_config_path_display();
+                    self.as_mut().set_status(QString::from(&format!(
+                        "Set google_client_secret in {path} (or \
+                         TASKS_DESKTOP_GOOGLE_CLIENT_SECRET) before signing in to \
+                         Google Tasks. Google's token endpoint requires it even \
+                         though PKCE is in use."
+                    )));
+                    return;
+                }
+            },
+            KIND_MICROSOFT_TODO => None,
+            _ => unreachable!(),
         };
 
         if self.runtime.is_none() {
@@ -1377,6 +1410,19 @@ impl qobject::TaskListViewModel {
         let token_store = Arc::clone(&self.as_ref().token_store);
         let db_path = self.db_path.clone().expect("db_path checked above");
         let label_for_thread = label_s.clone();
+        // Cancel flag — set by the view model's Drop so closing
+        // the window aborts an in-flight loopback wait. Replace
+        // any prior in-flight flag (if the user kicks off a
+        // second sign-in, the first one's wait is moot anyway).
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(prev) = self
+            .as_mut()
+            .rust_mut()
+            .oauth_stop
+            .replace(Arc::clone(&cancel))
+        {
+            prev.store(true, Ordering::Relaxed);
+        }
 
         std::thread::Builder::new()
             .name(format!("oauth:{label_s}"))
@@ -1417,11 +1463,16 @@ impl qobject::TaskListViewModel {
                         let timeout = std::time::Duration::from_secs(120);
                         match kind {
                             KIND_GOOGLE_TASKS => {
+                                let secret = client_secret
+                                    .as_deref()
+                                    .expect("client_secret required for Google");
                                 tasks_sync::providers::google::authorize(
                                     &client_id,
+                                    secret,
                                     &http,
                                     open_or_post,
                                     timeout,
+                                    Some(Arc::clone(&cancel)),
                                 )
                                 .await
                             }
@@ -1431,6 +1482,7 @@ impl qobject::TaskListViewModel {
                                     &http,
                                     open_or_post,
                                     timeout,
+                                    Some(Arc::clone(&cancel)),
                                 )
                                 .await
                             }
@@ -1658,14 +1710,34 @@ impl qobject::TaskListViewModel {
                         return;
                     }
                 };
+                // Google additionally requires the client secret on
+                // the refresh-token POST. Bail with a clear message
+                // if it's missing rather than letting the engine
+                // surface a generic 400 mid-sync.
+                let google_secret: Option<String> = if stored.kind == KIND_GOOGLE_TASKS {
+                    match crate::preferences::google_oauth_client_secret() {
+                        Some(v) => Some(v),
+                        None => {
+                            let path = crate::preferences::oauth_config_path_display();
+                            self.as_mut().set_status(QString::from(&format!(
+                                "Set google_client_secret in {path} before syncing {label}."
+                            )));
+                            set_account_state(self.as_mut(), &uuid, "Idle");
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 // Empty AccountCredentials so the provider falls
                 // through to the TokenStore for tokens; the engine
                 // borrows the same store the OAuth flow wrote into,
                 // keyed by `cda_uuid`.
                 let creds = AccountCredentials::default();
                 if stored.kind == KIND_GOOGLE_TASKS {
+                    let secret = google_secret.expect("checked above for Google");
                     Box::new(
-                        GoogleTasksProvider::new(creds, uuid.clone(), client_id)
+                        GoogleTasksProvider::new(creds, uuid.clone(), client_id, secret)
                             .with_token_store(Arc::clone(&token_store)),
                     )
                 } else {

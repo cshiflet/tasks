@@ -12,6 +12,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::oauth::{parse_redirect, OAuthError, RedirectParams};
@@ -22,18 +24,41 @@ use crate::oauth::{parse_redirect, OAuthError, RedirectParams};
 pub struct LoopbackReceiver {
     listener: TcpListener,
     addr: SocketAddr,
+    /// Host name advertised in [`redirect_uri`] and validated in
+    /// the inbound `Host:` header. Two values matter today:
+    /// `"127.0.0.1"` (Google's preference — IP literal sidesteps
+    /// DNS-rebinding risk) and `"localhost"` (Microsoft requires
+    /// it; their redirect-URI matcher treats `localhost` and
+    /// `127.0.0.1` as distinct strings even though both resolve
+    /// to the same socket). The bind address is always
+    /// `127.0.0.1` regardless — the host string only affects
+    /// the URL we hand the authorization server.
+    redirect_host: String,
 }
 
 impl LoopbackReceiver {
-    /// Bind to a random high port on the loopback interface.
-    /// Returns the bound port for embedding in the redirect URI.
+    /// Bind to a random high port on the loopback interface and
+    /// advertise the redirect URI as `http://127.0.0.1:<port>/cb`.
     pub fn bind() -> Result<Self, OAuthError> {
+        Self::bind_with_host("127.0.0.1")
+    }
+
+    /// Bind to a random high port on the loopback interface and
+    /// advertise the redirect URI with the given host name. Use
+    /// this for providers that don't accept `127.0.0.1` as a
+    /// redirect host (notably Microsoft, which requires
+    /// `localhost`).
+    pub fn bind_with_host(host: &str) -> Result<Self, OAuthError> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| OAuthError::Random(format!("bind loopback: {e}")))?;
         let addr = listener
             .local_addr()
             .map_err(|e| OAuthError::Random(format!("local_addr: {e}")))?;
-        Ok(Self { listener, addr })
+        Ok(Self {
+            listener,
+            addr,
+            redirect_host: host.to_string(),
+        })
     }
 
     pub fn port(&self) -> u16 {
@@ -41,7 +66,7 @@ impl LoopbackReceiver {
     }
 
     pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}/cb", self.addr.port())
+        format!("http://{}:{}/cb", self.redirect_host, self.addr.port())
     }
 
     /// Block until the browser hits us. The first valid HTTP
@@ -51,17 +76,26 @@ impl LoopbackReceiver {
     /// response and the listener accepts again until `timeout`
     /// elapses.
     ///
-    /// Returns `Err(OAuthError::MalformedRedirect)` on timeout.
+    /// Returns `Err(OAuthError::MalformedRedirect)` on timeout
+    /// or cancel.
+    ///
+    /// `cancel` is checked at the same 25 ms cadence as the
+    /// accept poll. Set it from outside (e.g. from a view-model
+    /// Drop) so closing the app while a sign-in is in flight
+    /// aborts the wait promptly instead of hanging until the
+    /// 120 s timeout fires.
     pub fn wait_for_redirect(
         self,
         expected_state: &str,
         timeout: Duration,
+        cancel: Option<Arc<AtomicBool>>,
     ) -> Result<RedirectParams, OAuthError> {
         self.listener
             .set_nonblocking(false)
             .map_err(|e| OAuthError::Random(format!("set_nonblocking: {e}")))?;
         let deadline = std::time::Instant::now() + timeout;
         let bound_port = self.addr.port();
+        let expected_host = format!("{}:{}", self.redirect_host, bound_port);
 
         // We can't use TcpListener::accept_timeout directly; poll
         // set_read_timeout on a peer stream instead. The idiom:
@@ -72,25 +106,34 @@ impl LoopbackReceiver {
             .map_err(|e| OAuthError::Random(format!("set_nonblocking: {e}")))?;
 
         loop {
+            if let Some(c) = cancel.as_ref() {
+                if c.load(Ordering::Relaxed) {
+                    return Err(OAuthError::MalformedRedirect(
+                        "loopback receiver cancelled".into(),
+                    ));
+                }
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(OAuthError::MalformedRedirect(
                     "loopback receiver timed out".into(),
                 ));
             }
             match self.listener.accept() {
-                Ok((stream, _peer)) => match handle_stream(stream, expected_state, bound_port) {
-                    Ok(params) => return Ok(params),
-                    Err(OAuthError::MalformedRedirect(msg)) => {
-                        tracing::debug!("ignoring malformed loopback hit: {msg}");
-                        // Keep accepting until timeout. A slow
-                        // client that never completes its request
-                        // within the per-stream 1 s deadline
-                        // (H-3 / slow-loris — also covers L-4)
-                        // lands here too.
-                        continue;
+                Ok((stream, _peer)) => {
+                    match handle_stream(stream, expected_state, &expected_host) {
+                        Ok(params) => return Ok(params),
+                        Err(OAuthError::MalformedRedirect(msg)) => {
+                            tracing::debug!("ignoring malformed loopback hit: {msg}");
+                            // Keep accepting until timeout. A slow
+                            // client that never completes its request
+                            // within the per-stream 1 s deadline
+                            // (H-3 / slow-loris — also covers L-4)
+                            // lands here too.
+                            continue;
+                        }
+                        Err(other) => return Err(other),
                     }
-                    Err(other) => return Err(other),
-                },
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(25));
                     continue;
@@ -113,7 +156,7 @@ const STREAM_DEADLINE: Duration = Duration::from_secs(1);
 fn handle_stream(
     mut stream: TcpStream,
     expected_state: &str,
-    bound_port: u16,
+    expected_host: &str,
 ) -> Result<RedirectParams, OAuthError> {
     stream.set_read_timeout(Some(STREAM_DEADLINE)).ok();
     stream.set_write_timeout(Some(STREAM_DEADLINE)).ok();
@@ -180,12 +223,14 @@ fn handle_stream(
         )));
     }
 
-    // Require the Host header to match our bound loopback port.
-    // DNS rebinding and a drive-by browser hitting the same port
-    // from a public origin both rely on a Host header the server
-    // didn't expect; reject anything that isn't exactly
-    // `127.0.0.1:<bound_port>`.
-    let expected_host = format!("127.0.0.1:{bound_port}");
+    // Require the Host header to match the host we advertised in
+    // the redirect URI. DNS rebinding and a drive-by browser
+    // hitting the same port from a public origin both rely on a
+    // Host header the server didn't expect; reject anything that
+    // isn't exactly `<advertised_host>:<bound_port>`. The host
+    // string is whatever was passed to `bind_with_host` —
+    // `127.0.0.1` for Google's IP-literal flow, `localhost` for
+    // Microsoft's redirect-URI matcher.
     let host_header = lines
         .clone()
         .find_map(|l| {
@@ -314,7 +359,7 @@ mod tests {
         });
 
         let params = receiver
-            .wait_for_redirect("xyz", Duration::from_secs(2))
+            .wait_for_redirect("xyz", Duration::from_secs(2), None)
             .unwrap();
         assert_eq!(params.code, "abc");
         assert_eq!(params.state, "xyz");
@@ -325,7 +370,7 @@ mod tests {
     fn wait_for_redirect_times_out_on_silent_port() {
         let receiver = LoopbackReceiver::bind().unwrap();
         let err = receiver
-            .wait_for_redirect("anything", Duration::from_millis(200))
+            .wait_for_redirect("anything", Duration::from_millis(200), None)
             .unwrap_err();
         assert!(matches!(err, OAuthError::MalformedRedirect(_)));
     }
@@ -344,7 +389,7 @@ mod tests {
             let _ = s.read(&mut buf);
         });
         let err = receiver
-            .wait_for_redirect("expected", Duration::from_secs(2))
+            .wait_for_redirect("expected", Duration::from_secs(2), None)
             .unwrap_err();
         assert!(matches!(err, OAuthError::StateMismatch { .. }));
         handle.join().unwrap();
@@ -367,7 +412,7 @@ mod tests {
         });
         // Receiver stays up until timeout — there's no valid /cb hit.
         let err = receiver
-            .wait_for_redirect("state", Duration::from_millis(500))
+            .wait_for_redirect("state", Duration::from_millis(500), None)
             .unwrap_err();
         assert!(matches!(err, OAuthError::MalformedRedirect(_)));
         handle.join().unwrap();
@@ -389,7 +434,7 @@ mod tests {
             assert!(response.contains("400"), "response: {response}");
         });
         let err = receiver
-            .wait_for_redirect("ok", Duration::from_millis(500))
+            .wait_for_redirect("ok", Duration::from_millis(500), None)
             .unwrap_err();
         assert!(matches!(err, OAuthError::MalformedRedirect(_)));
         handle.join().unwrap();
@@ -420,7 +465,7 @@ mod tests {
         // wall-clock deadline a short while later.
         let start = std::time::Instant::now();
         let err = receiver
-            .wait_for_redirect("state", Duration::from_millis(2500))
+            .wait_for_redirect("state", Duration::from_millis(2500), None)
             .unwrap_err();
         let elapsed = start.elapsed();
         assert!(matches!(err, OAuthError::MalformedRedirect(_)));

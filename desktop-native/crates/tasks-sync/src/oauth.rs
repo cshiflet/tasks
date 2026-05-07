@@ -214,8 +214,19 @@ pub fn parse_redirect(url: &str, expected_state: &str) -> OAuthResult<RedirectPa
 /// token endpoint POST. Caller sets the `Content-Type` + POSTs;
 /// response parsing lives in the network commit since it's just
 /// serde_json over the standard OAuth2 token response shape.
+///
+/// `client_secret` is `None` for true public clients (Microsoft's
+/// "Public client / native" registrations, etc.) and `Some` for
+/// providers that require it even on installed-app PKCE flows.
+/// Google notably falls in the second bucket: their "Desktop
+/// app" credentials publish a client_secret that has to be sent
+/// on the token exchange (and refresh) — Google treats it as a
+/// public identifier rather than a true secret, but the endpoint
+/// returns 400 `invalid_request: client_secret is missing` when
+/// you omit it.
 pub fn build_token_request_body(
     client_id: &str,
+    client_secret: Option<&str>,
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
@@ -224,6 +235,10 @@ pub fn build_token_request_body(
     body.push_str("grant_type=authorization_code");
     body.push_str("&client_id=");
     body.push_str(&percent_encode(client_id));
+    if let Some(secret) = client_secret {
+        body.push_str("&client_secret=");
+        body.push_str(&percent_encode(secret));
+    }
     body.push_str("&code=");
     body.push_str(&percent_encode(code));
     body.push_str("&redirect_uri=");
@@ -235,15 +250,24 @@ pub fn build_token_request_body(
 
 /// Build the body for a refresh-token request. Returns the new
 /// access token (and possibly a rotated refresh token) from the
-/// same token endpoint.
-pub fn build_refresh_request_body(client_id: &str, refresh_token: &str) -> String {
-    format!(
-        "grant_type=refresh_token\
-         &client_id={}\
-         &refresh_token={}",
-        percent_encode(client_id),
-        percent_encode(refresh_token),
-    )
+/// same token endpoint. See [`build_token_request_body`] for the
+/// `client_secret` semantics.
+pub fn build_refresh_request_body(
+    client_id: &str,
+    client_secret: Option<&str>,
+    refresh_token: &str,
+) -> String {
+    let mut body = String::new();
+    body.push_str("grant_type=refresh_token");
+    body.push_str("&client_id=");
+    body.push_str(&percent_encode(client_id));
+    if let Some(secret) = client_secret {
+        body.push_str("&client_secret=");
+        body.push_str(&percent_encode(secret));
+    }
+    body.push_str("&refresh_token=");
+    body.push_str(&percent_encode(refresh_token));
+    body
 }
 
 // ---------- helpers ----------
@@ -410,20 +434,45 @@ mod tests {
     }
 
     #[test]
-    fn token_body_has_every_param() {
-        let body = build_token_request_body("cid", "the-code", "http://127.0.0.1:1/cb", "verifier");
+    fn token_body_without_secret_has_every_param() {
+        let body =
+            build_token_request_body("cid", None, "the-code", "http://127.0.0.1:1/cb", "verifier");
         assert!(body.starts_with("grant_type=authorization_code"));
         assert!(body.contains("&client_id=cid"));
+        assert!(!body.contains("client_secret"));
         assert!(body.contains("&code=the%2Dcode"));
         assert!(body.contains("&redirect_uri=http%3A%2F%2F127%2E0%2E0%2E1%3A1%2Fcb"));
         assert!(body.contains("&code_verifier=verifier"));
     }
 
     #[test]
-    fn refresh_body_shape() {
-        let body = build_refresh_request_body("cid", "refresh-tok-123");
+    fn token_body_with_secret_includes_it() {
+        // Google's "Desktop app" credentials publish a public
+        // client_secret that's still required at the token
+        // endpoint — the absence of which produced the original
+        // `invalid_request: client_secret is missing` 400.
+        let body = build_token_request_body(
+            "cid",
+            Some("public-secret-from-google"),
+            "the-code",
+            "http://127.0.0.1:1/cb",
+            "verifier",
+        );
+        assert!(body.contains("&client_secret=public%2Dsecret%2Dfrom%2Dgoogle"));
+    }
+
+    #[test]
+    fn refresh_body_without_secret() {
+        let body = build_refresh_request_body("cid", None, "refresh-tok-123");
         assert!(body.contains("grant_type=refresh_token"));
         assert!(body.contains("client_id=cid"));
+        assert!(!body.contains("client_secret"));
         assert!(body.contains("refresh_token=refresh%2Dtok%2D123"));
+    }
+
+    #[test]
+    fn refresh_body_with_secret() {
+        let body = build_refresh_request_body("cid", Some("public-secret"), "refresh-tok-123");
+        assert!(body.contains("&client_secret=public%2Dsecret"));
     }
 }

@@ -71,9 +71,14 @@ pub struct GoogleTasksProvider {
     credentials: AccountCredentials,
     account_label: String,
     /// OAuth2 client id registered in the Google Cloud console.
-    /// For a desktop client the secret is omitted (Google's
-    /// "installed app" flow is PKCE-only).
     client_id: String,
+    /// OAuth2 client secret published alongside the client id for
+    /// "Desktop application" credentials. Google requires it on
+    /// the token-exchange and refresh POSTs even though PKCE is
+    /// used; the absence yields `400 invalid_request:
+    /// client_secret is missing`. Treated as a public identifier
+    /// rather than a true secret per Google's installed-app docs.
+    client_secret: String,
     /// Optional token store; if present, `connect()` reads + writes
     /// tokens here. If None, tokens live only for the process
     /// lifetime.
@@ -86,11 +91,13 @@ impl GoogleTasksProvider {
         credentials: AccountCredentials,
         account_label: impl Into<String>,
         client_id: impl Into<String>,
+        client_secret: impl Into<String>,
     ) -> Self {
         Self {
             credentials,
             account_label: account_label.into(),
             client_id: client_id.into(),
+            client_secret: client_secret.into(),
             token_store: None,
             session: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -115,8 +122,13 @@ impl GoogleTasksProvider {
             // One expose_secret() per refresh — the raw token only
             // leaves the wrapper to go into the POST body and is
             // immediately rewrapped below.
-            let new =
-                refresh_access_token(&s.http, &self.client_id, refresh.expose_secret()).await?;
+            let new = refresh_access_token(
+                &s.http,
+                &self.client_id,
+                &self.client_secret,
+                refresh.expose_secret(),
+            )
+            .await?;
             // Google doesn't always rotate the refresh token; preserve
             // the existing one if the response omits it.
             let rotated_refresh = new.refresh_token.clone().or(Some(refresh));
@@ -422,9 +434,11 @@ impl Provider for GoogleTasksProvider {
 /// `oauth_access_token` field).
 pub async fn authorize<F>(
     client_id: &str,
+    client_secret: &str,
     http: &Client,
     open_browser: F,
     timeout: Duration,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> SyncResult<OAuthTokens>
 where
     F: FnOnce(&str) + Send + 'static,
@@ -455,13 +469,19 @@ where
     // The loopback receiver blocks a thread; keep it off the async
     // runtime by offloading to spawn_blocking.
     let state = req.state.clone();
-    let redirect = tokio::task::spawn_blocking(move || receiver.wait_for_redirect(&state, timeout))
-        .await
-        .map_err(|e| SyncError::Auth(format!("loopback task: {e}")))?
-        .map_err(|e| SyncError::Auth(format!("loopback: {e}")))?;
+    let redirect =
+        tokio::task::spawn_blocking(move || receiver.wait_for_redirect(&state, timeout, cancel))
+            .await
+            .map_err(|e| SyncError::Auth(format!("loopback task: {e}")))?
+            .map_err(|e| SyncError::Auth(format!("loopback: {e}")))?;
 
-    let body =
-        build_token_request_body(client_id, &redirect.code, &redirect_uri, &req.pkce_verifier);
+    let body = build_token_request_body(
+        client_id,
+        Some(client_secret),
+        &redirect.code,
+        &redirect_uri,
+        &req.pkce_verifier,
+    );
     let resp = http
         .post(TOKEN_ENDPOINT)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -482,9 +502,10 @@ where
 async fn refresh_access_token(
     http: &Client,
     client_id: &str,
+    client_secret: &str,
     refresh_token: &str,
 ) -> SyncResult<OAuthTokens> {
-    let body = build_refresh_request_body(client_id, refresh_token);
+    let body = build_refresh_request_body(client_id, Some(client_secret), refresh_token);
     let resp = http
         .post(TOKEN_ENDPOINT)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -578,6 +599,7 @@ mod tests {
             AccountCredentials::default(),
             "alice@gmail.com",
             "client-id-abc",
+            "client-secret-abc",
         );
         assert_eq!(p.kind(), ProviderKind::GoogleTasks);
         assert_eq!(p.account_label(), "alice@gmail.com");

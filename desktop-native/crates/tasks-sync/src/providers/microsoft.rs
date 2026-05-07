@@ -368,6 +368,7 @@ pub async fn authorize<F>(
     http: &Client,
     open_browser: F,
     timeout: Duration,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> SyncResult<OAuthTokens>
 where
     F: FnOnce(&str) + Send + 'static,
@@ -375,7 +376,14 @@ where
     use crate::loopback::LoopbackReceiver;
 
     let receiver =
-        LoopbackReceiver::bind().map_err(|e| SyncError::Auth(format!("loopback bind: {e}")))?;
+        // Microsoft's redirect-URI matcher treats `localhost` and
+        // `127.0.0.1` as distinct strings even though both
+        // resolve to the same socket. Azure's recommended public-
+        // client registration is `http://localhost`, which lets
+        // it accept any port; using the IP literal in the URI we
+        // submit triggers `invalid_request: redirect_uri ...`.
+        LoopbackReceiver::bind_with_host("localhost")
+            .map_err(|e| SyncError::Auth(format!("loopback bind: {e}")))?;
     let redirect_uri = receiver.redirect_uri();
     let req = build_authorization_request(AUTHORIZATION_ENDPOINT, client_id, SCOPES, &redirect_uri)
         .map_err(|e| SyncError::Auth(format!("build auth url: {e}")))?;
@@ -390,13 +398,21 @@ where
     drop(tokio::task::spawn_blocking(move || open_browser(&auth_url)));
 
     let state = req.state.clone();
-    let redirect = tokio::task::spawn_blocking(move || receiver.wait_for_redirect(&state, timeout))
-        .await
-        .map_err(|e| SyncError::Auth(format!("loopback task: {e}")))?
-        .map_err(|e| SyncError::Auth(format!("loopback: {e}")))?;
+    let redirect =
+        tokio::task::spawn_blocking(move || receiver.wait_for_redirect(&state, timeout, cancel))
+            .await
+            .map_err(|e| SyncError::Auth(format!("loopback task: {e}")))?
+            .map_err(|e| SyncError::Auth(format!("loopback: {e}")))?;
 
-    let body =
-        build_token_request_body(client_id, &redirect.code, &redirect_uri, &req.pkce_verifier);
+    // Microsoft "Public client / native" registrations are
+    // genuinely secret-less; PKCE is the only auth proof.
+    let body = build_token_request_body(
+        client_id,
+        None,
+        &redirect.code,
+        &redirect_uri,
+        &req.pkce_verifier,
+    );
     let resp = http
         .post(TOKEN_ENDPOINT)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -419,7 +435,7 @@ async fn refresh_access_token(
     client_id: &str,
     refresh_token: &str,
 ) -> SyncResult<OAuthTokens> {
-    let body = build_refresh_request_body(client_id, refresh_token);
+    let body = build_refresh_request_body(client_id, None, refresh_token);
     let resp = http
         .post(TOKEN_ENDPOINT)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")

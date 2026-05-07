@@ -157,6 +157,15 @@ fn config_path() -> Option<PathBuf> {
 pub struct OAuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub google_client_id: Option<String>,
+    /// Required for Google. Despite PKCE being part of the
+    /// flow, Google's token endpoint returns
+    /// `400 invalid_request: client_secret is missing` when
+    /// this is omitted on a "Desktop application" credential.
+    /// Treated as a public identifier per Google's installed-
+    /// app docs — bundles with the app rather than being kept
+    /// confidential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_client_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub microsoft_client_id: Option<String>,
 }
@@ -217,9 +226,28 @@ pub fn google_oauth_client_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Resolve the Google Tasks OAuth client *secret*. Env var
+/// `TASKS_DESKTOP_GOOGLE_CLIENT_SECRET` wins over the
+/// `google_client_secret` field in `oauth.json`. Required by
+/// Google's token endpoint even on installed-app PKCE flows.
+pub fn google_oauth_client_secret() -> Option<String> {
+    if let Ok(v) = std::env::var("TASKS_DESKTOP_GOOGLE_CLIENT_SECRET") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    OAuthConfig::load()
+        .google_client_secret
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Microsoft To Do equivalent of [`google_oauth_client_id`].
 /// Env var `TASKS_DESKTOP_MICROSOFT_CLIENT_ID` overrides the
-/// `microsoft_client_id` field in `oauth.json`.
+/// `microsoft_client_id` field in `oauth.json`. No client
+/// secret — Microsoft "Public client / native" registrations
+/// are PKCE-only.
 pub fn microsoft_oauth_client_id() -> Option<String> {
     if let Ok(v) = std::env::var("TASKS_DESKTOP_MICROSOFT_CLIENT_ID") {
         let t = v.trim();

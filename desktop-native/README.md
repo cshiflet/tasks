@@ -88,14 +88,19 @@ The desktop client looks in two places, in priority order:
    - macOS: `~/Library/Application Support/tasks-desktop/oauth.json`
    - Windows: `%APPDATA%\tasks-desktop\oauth.json`
 
-Schema (both fields optional — fill in only the providers you use):
+Schema (all fields optional — fill in only the providers you use;
+Google needs both id + secret, Microsoft needs only the id):
 
 ```json
 {
   "google_client_id": "1234567890-abc...apps.googleusercontent.com",
+  "google_client_secret": "GOCSPX-...",
   "microsoft_client_id": "12345678-aaaa-bbbb-cccc-1234567890ab"
 }
 ```
+
+Matching env-var overrides (env wins): `TASKS_DESKTOP_GOOGLE_CLIENT_ID`,
+`TASKS_DESKTOP_GOOGLE_CLIENT_SECRET`, `TASKS_DESKTOP_MICROSOFT_CLIENT_ID`.
 
 The file is hand-managed; the app never writes to it. Keep it out
 of version control — these client IDs aren't full secrets but they
@@ -116,9 +121,18 @@ shared ref.
    client ID**. Application type: **Desktop application**. Name it
    anything; the value the user sees during sign-in is the
    consent-screen app name from step 3.
-5. Copy the *Client ID* string (the *Client secret* is unused —
-   PKCE replaces it). Drop it into `oauth.json` or
-   `TASKS_DESKTOP_GOOGLE_CLIENT_ID`.
+5. Copy **both** the *Client ID* and the *Client secret*. Despite
+   PKCE being part of the flow, Google's token endpoint still
+   requires the client secret — omitting it returns `400
+   invalid_request: client_secret is missing`. Google treats the
+   secret on a "Desktop application" credential as a public
+   identifier (it ships with the binary) rather than confidential,
+   so committing it to `oauth.json` is in line with their docs.
+
+   Drop both into `oauth.json` (`google_client_id`,
+   `google_client_secret`) or set the env vars
+   `TASKS_DESKTOP_GOOGLE_CLIENT_ID` and
+   `TASKS_DESKTOP_GOOGLE_CLIENT_SECRET`.
 
 The desktop client uses the loopback redirect
 (`http://127.0.0.1:<random-port>/cb`) so you don't have to register
