@@ -180,6 +180,14 @@ pub struct RemoteTask {
     pub priority: i32,
     pub recurrence: Option<String>,
     pub parent_remote_id: Option<String>,
+    /// Server-supplied modification stamp (`LAST-MODIFIED` for
+    /// CalDAV, `updated` for Google / Microsoft). When present,
+    /// the engine prefers this over a synthesised stamp so a
+    /// `pull → push` no-op cycle doesn't keep re-marking the
+    /// row dirty. `None` when the wire didn't carry one — the
+    /// engine falls back to a synthesis based on
+    /// `due_ms` / `completed_ms` in that case.
+    pub last_modified_ms: Option<i64>,
     /// iCalendar VTODO serialization (CalDAV only) — held so
     /// partial-update PUTs can merge fields back without losing
     /// attachments or alarms the desktop can't yet edit.

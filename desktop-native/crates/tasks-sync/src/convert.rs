@@ -77,6 +77,7 @@ pub fn vtodo_to_remote_task(
         priority,
         recurrence: vtodo.rrule.clone(),
         parent_remote_id: parent,
+        last_modified_ms: vtodo.last_modified_ms,
         raw_vtodo,
     }
 }

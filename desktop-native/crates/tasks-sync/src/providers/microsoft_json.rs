@@ -156,6 +156,10 @@ pub fn task_to_remote(task: &TodoTaskJson, calendar_remote_id: &str) -> RemoteTa
         // at the API; linked tasks live under
         // /me/todo/lists/{id}/tasks/{id}/linkedResources.
         parent_remote_id: None,
+        last_modified_ms: task
+            .last_modified
+            .as_deref()
+            .and_then(|s| parse_graph_datetime(s, "UTC")),
         raw_vtodo: None,
     }
 }
@@ -351,6 +355,7 @@ mod tests {
             priority: 1,
             recurrence: None,
             parent_remote_id: None,
+            last_modified_ms: None,
             raw_vtodo: None,
         };
         let v = remote_to_task_json(&rt);

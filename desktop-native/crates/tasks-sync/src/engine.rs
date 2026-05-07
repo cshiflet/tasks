@@ -93,9 +93,9 @@ impl<'a> SyncEngine<'a> {
             let tasks = self.provider.list_tasks(&cal.remote_id).await?;
             let mut seen_remote_ids: Vec<String> = Vec::with_capacity(tasks.len());
             for t in &tasks {
-                let task_id = upsert_task(&tx, t)
+                let (task_id, chosen_modified) = upsert_task(&tx, t)
                     .map_err(|e| SyncError::Local(format!("task {}: {e}", t.remote_id)))?;
-                upsert_caldav_task(&tx, task_id, t)
+                upsert_caldav_task(&tx, task_id, t, chosen_modified)
                     .map_err(|e| SyncError::Local(format!("caldav_task {}: {e}", t.remote_id)))?;
                 tasks_pulled += 1;
                 seen_remote_ids.push(t.remote_id.clone());
@@ -257,6 +257,11 @@ fn load_dirty_tasks(
             priority: r.get::<_, i32>(5)?,
             recurrence: r.get::<_, Option<String>>(6)?,
             parent_remote_id: r.get::<_, Option<String>>(12)?,
+            // Push path doesn't read the remote stamp — push uses
+            // the local `tasks.modified` directly. Leaving this
+            // None keeps the round-trip honest: nothing in
+            // remote_task_to_vtodo references it.
+            last_modified_ms: None,
             raw_vtodo: None,
         })
     };
@@ -375,7 +380,22 @@ fn upsert_calendar(
     Ok(())
 }
 
-fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Result<i64> {
+/// Insert or update the `tasks` row for a remote task.
+///
+/// Returns `(local_id, chosen_modified_ms)`. The caller threads
+/// `chosen_modified_ms` into `caldav_tasks.cd_last_sync` so a
+/// freshly-pulled row doesn't immediately re-qualify as "dirty"
+/// in the next push cycle (Android SHA `4928091a7`).
+///
+/// The chosen stamp prefers the remote `LAST-MODIFIED` when the
+/// provider supplied one (`t.last_modified_ms`, Android SHA
+/// `0c60d7ee3`); future-dated remote stamps are clamped to the
+/// local clock so a misconfigured server can't poison the
+/// dirtiness query. When the wire didn't carry a stamp, fall
+/// back to the legacy synthesis (`completed_ms.max(due_ms).max(1)`)
+/// so completed/scheduled tasks still sort sensibly in the
+/// "recently modified" view.
+fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Result<(i64, i64)> {
     let existing: Option<i64> = tx
         .query_row(
             "SELECT _id FROM tasks WHERE remoteId = ?1",
@@ -383,7 +403,11 @@ fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Resu
             |r| r.get(0),
         )
         .optional()?;
-    let now_ms = t.completed_ms.max(t.due_ms).max(1);
+    let now = now_ms();
+    let chosen_modified = match t.last_modified_ms {
+        Some(stamp) => stamp.min(now), // clamp future-dated remote stamps
+        None => t.completed_ms.max(t.due_ms).max(1),
+    };
     let due_ms = encode_due_with_has_time(t.due_ms, t.due_has_time);
     let title_arg: Option<&str> = t.title.as_deref();
     let notes_arg: Option<&str> = t.notes.as_deref();
@@ -401,11 +425,11 @@ fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Resu
                 t.completed_ms,
                 t.priority,
                 recurrence_arg,
-                now_ms,
+                chosen_modified,
                 id,
             ],
         )?;
-        Ok(id)
+        Ok((id, chosen_modified))
     } else {
         tx.execute(
             "INSERT INTO tasks \
@@ -419,14 +443,14 @@ fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Resu
                 title_arg,
                 t.priority,
                 due_ms,
-                now_ms,
+                chosen_modified,
                 t.completed_ms,
                 notes_arg,
                 recurrence_arg,
                 t.remote_id,
             ],
         )?;
-        Ok(tx.last_insert_rowid())
+        Ok((tx.last_insert_rowid(), chosen_modified))
     }
 }
 
@@ -450,6 +474,7 @@ fn upsert_caldav_task(
     tx: &rusqlite::Transaction<'_>,
     task_id: i64,
     t: &RemoteTask,
+    chosen_modified: i64,
 ) -> rusqlite::Result<()> {
     let existing: Option<i64> = tx
         .query_row(
@@ -459,10 +484,15 @@ fn upsert_caldav_task(
         )
         .optional()?;
     if let Some(_id) = existing {
+        // Stamp `cd_last_sync` with the same value we just wrote
+        // to `tasks.modified` so the next push_dirty cycle doesn't
+        // see the freshly-pulled row as a local edit (Android SHA
+        // `4928091a7`).
         tx.execute(
             "UPDATE caldav_tasks SET cd_task = ?1, cd_calendar = ?2, \
-             cd_etag = ?3, cd_object = ?4, cd_remote_parent = ?5 \
-             WHERE cd_remote_id = ?6",
+             cd_etag = ?3, cd_object = ?4, cd_remote_parent = ?5, \
+             cd_last_sync = ?6 \
+             WHERE cd_remote_id = ?7",
             params![
                 task_id,
                 t.calendar_remote_id,
@@ -471,6 +501,7 @@ fn upsert_caldav_task(
                     .as_deref()
                     .map(|_| format!("{}.ics", t.remote_id)),
                 t.parent_remote_id,
+                chosen_modified,
                 t.remote_id,
             ],
         )?;
@@ -480,13 +511,14 @@ fn upsert_caldav_task(
              (cd_task, cd_calendar, cd_remote_id, cd_etag, cd_object, \
               cd_last_sync, cd_deleted, cd_remote_parent, gt_moved, \
               gt_remote_order) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, 0, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, 0, 0)",
             params![
                 task_id,
                 t.calendar_remote_id,
                 t.remote_id,
                 t.etag,
                 format!("{}.ics", t.remote_id),
+                chosen_modified,
                 t.parent_remote_id,
             ],
         )?;
@@ -588,11 +620,24 @@ fn relink_parents(tx: &rusqlite::Transaction<'_>, tasks: &[RemoteTask]) -> rusql
                 local_id_by_remote.get(t.remote_id.as_str()),
                 local_id_by_remote.get(parent_remote),
             ) {
-                tx.execute(
-                    "UPDATE tasks SET parent = ?1 WHERE _id = ?2",
+                // Only backfill the parent on rows the user hasn't
+                // touched since the last sync. Without this guard
+                // we'd silently overwrite a locally-edited parent
+                // with the server's value, and we wouldn't bump
+                // `modified` either, so the user's change would
+                // never get pushed back. Mirrors Android's
+                // `CaldavDao.updateParents` (SHAs `3139b39cb` +
+                // `7b7697842`).
+                let updated = tx.execute(
+                    "UPDATE tasks SET parent = ?1 \
+                     WHERE _id = ?2 \
+                       AND modified <= (SELECT cd_last_sync FROM caldav_tasks \
+                                        WHERE cd_task = ?2)",
                     params![parent_id, child_id],
                 )?;
-                linked += 1;
+                if updated > 0 {
+                    linked += 1;
+                }
             }
         }
     }
@@ -676,6 +721,7 @@ mod tests {
             priority: 0,
             recurrence: None,
             parent_remote_id: parent.map(str::to_string),
+            last_modified_ms: None,
             raw_vtodo: None,
         }
     }
@@ -1003,5 +1049,254 @@ mod tests {
         let (_tmp, db_path) = fresh_db();
         let p = CalDavProvider::new(AccountCredentials::default(), "test");
         let _engine = SyncEngine::new(&db_path, Box::new(p));
+    }
+
+    /// Fix 1 (Android SHA `0c60d7ee3`): when the wire carried a
+    /// `LAST-MODIFIED` we already parsed into `last_modified_ms`,
+    /// the engine has to write *that* value into `tasks.modified`
+    /// — not a synthesised stamp. Otherwise a pull-then-push
+    /// no-op cycle keeps re-marking the row dirty.
+    #[tokio::test]
+    async fn pull_uses_remote_last_modified_when_present() {
+        let (_tmp, db_path) = fresh_db();
+        let remote_stamp = 1_700_000_000_000_i64; // well in the past
+        let mut t = task("u-1", "cal-1", None);
+        t.last_modified_ms = Some(remote_stamp);
+        let mut tasks = HashMap::new();
+        tasks.insert("cal-1".to_string(), vec![t]);
+        let mock = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        engine.pull_all().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let modified: i64 = conn
+            .query_row(
+                "SELECT modified FROM tasks WHERE remoteId = 'u-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            modified, remote_stamp,
+            "pull should preserve the remote LAST-MODIFIED on tasks.modified"
+        );
+        // And cd_last_sync should land on the same value so the
+        // next push_dirty cycle doesn't see this row as a local
+        // edit (Fix 3, SHA `4928091a7`).
+        let last_sync: i64 = conn
+            .query_row(
+                "SELECT cd_last_sync FROM caldav_tasks WHERE cd_remote_id = 'u-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_sync, remote_stamp);
+    }
+
+    /// Fix 1 follow-up: a server with a skewed clock (or a buggy
+    /// provider that emits a far-future LAST-MODIFIED) must not
+    /// poison the local "modified" column. We clamp to the local
+    /// `now()` so the dirtiness query still works.
+    #[tokio::test]
+    async fn pull_clamps_future_last_modified_to_now() {
+        let (_tmp, db_path) = fresh_db();
+        // Year 2999 stamp — way past any plausible local clock.
+        let future_stamp = 32_503_680_000_000_i64;
+        let before = now_ms();
+        let mut t = task("u-future", "cal-1", None);
+        t.last_modified_ms = Some(future_stamp);
+        let mut tasks = HashMap::new();
+        tasks.insert("cal-1".to_string(), vec![t]);
+        let mock = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        engine.pull_all().await.unwrap();
+        let after = now_ms();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let modified: i64 = conn
+            .query_row(
+                "SELECT modified FROM tasks WHERE remoteId = 'u-future'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            modified < future_stamp,
+            "future stamp {future_stamp} should have been clamped, got {modified}"
+        );
+        assert!(
+            modified >= before && modified <= after,
+            "clamped stamp {modified} should be within [before={before}, after={after}]"
+        );
+        // cd_last_sync mirrors tasks.modified.
+        let last_sync: i64 = conn
+            .query_row(
+                "SELECT cd_last_sync FROM caldav_tasks WHERE cd_remote_id = 'u-future'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_sync, modified);
+    }
+
+    /// Fix 3 (Android SHA `4928091a7`): freshly-pulled rows must
+    /// land with `tasks.modified == caldav_tasks.cd_last_sync` so
+    /// the dirtiness query (`modified > cd_last_sync OR
+    /// cd_last_sync = 0`) doesn't fire for them.
+    #[tokio::test]
+    async fn pull_writes_matching_modified_and_cd_last_sync_for_inserts() {
+        let (_tmp, db_path) = fresh_db();
+        // No remote LAST-MODIFIED — exercise the fallback path
+        // that synthesises from completed/due so the insert
+        // doesn't accidentally use a different stamp than the
+        // caldav_tasks row.
+        let mut tasks = HashMap::new();
+        tasks.insert("cal-1".to_string(), vec![task("fresh", "cal-1", None)]);
+        let mock = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        engine.pull_all().await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (modified, last_sync): (i64, i64) = conn
+            .query_row(
+                "SELECT t.modified, ct.cd_last_sync FROM tasks t \
+                 JOIN caldav_tasks ct ON ct.cd_task = t._id \
+                 WHERE t.remoteId = 'fresh'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(modified > 0);
+        assert_eq!(
+            modified, last_sync,
+            "freshly-pulled row should not look dirty: modified ({modified}) must equal cd_last_sync ({last_sync})"
+        );
+
+        // Sanity: load_dirty_tasks should report nothing.
+        let dirty = load_dirty_tasks(&conn, None).unwrap();
+        assert!(
+            dirty.iter().all(|t| t.remote_id != "fresh"),
+            "freshly-pulled row should not be in the dirty set"
+        );
+    }
+
+    /// Fix 2 (Android SHAs `3139b39cb` + `7b7697842`):
+    /// `relink_parents` must not overwrite the parent column on
+    /// rows the user has touched locally since the last sync.
+    /// Otherwise we silently lose the user's edit (and don't bump
+    /// `modified` to re-export it either).
+    #[test]
+    fn relink_parents_skips_locally_modified_rows() {
+        let (_tmp, db_path) = fresh_db();
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        // Seed: parent + child task. cd_last_sync = 1000 on the
+        // child; tasks.modified = 2000 → user edited the child
+        // since the last sync.
+        conn.execute(
+            "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
+             modified, completed, deleted, estimatedSeconds, elapsedSeconds, \
+             timerStart, notificationFlags, lastNotified, repeat_from, \
+             collapsed, parent, read_only, remoteId) \
+             VALUES ('parent-old', 0, 0, 0, 1, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'p-old')",
+            [],
+        )
+        .unwrap();
+        let parent_old_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
+             modified, completed, deleted, estimatedSeconds, elapsedSeconds, \
+             timerStart, notificationFlags, lastNotified, repeat_from, \
+             collapsed, parent, read_only, remoteId) \
+             VALUES ('parent-new', 0, 0, 0, 1, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'p-new')",
+            [],
+        )
+        .unwrap();
+        let parent_new_id = conn.last_insert_rowid();
+        // The child currently has parent = p-old locally (rowid).
+        // The user has edited the child (modified=2000 > cd_last_sync=1000).
+        conn.execute(
+            "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
+             modified, completed, deleted, estimatedSeconds, elapsedSeconds, \
+             timerStart, notificationFlags, lastNotified, repeat_from, \
+             collapsed, parent, read_only, remoteId) \
+             VALUES ('child', 0, 0, 0, 1, 2000, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?1, 0, 'c')",
+            [parent_old_id],
+        )
+        .unwrap();
+        let child_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'cal-1', 'c', 1000, 0, 0, 0)",
+            [child_id],
+        )
+        .unwrap();
+        // Parents need caldav_tasks rows too so the relink lookup
+        // resolves their remote ids.
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'cal-1', 'p-old', 1000, 0, 0, 0)",
+            [parent_old_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'cal-1', 'p-new', 1000, 0, 0, 0)",
+            [parent_new_id],
+        )
+        .unwrap();
+
+        // Server says the child's parent is now `p-new`.
+        let remote = vec![
+            task("p-old", "cal-1", None),
+            task("p-new", "cal-1", None),
+            task("c", "cal-1", Some("p-new")),
+        ];
+        let tx = conn.transaction().unwrap();
+        let linked = relink_parents(&tx, &remote).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            linked, 0,
+            "the only candidate child has been locally edited; relink should skip it"
+        );
+
+        // Local parent should still point at p-old.
+        let actual_parent: i64 = conn
+            .query_row("SELECT parent FROM tasks WHERE _id = ?1", [child_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            actual_parent, parent_old_id,
+            "locally-edited child should keep its local parent"
+        );
+
+        // And the modified stamp should not have been bumped — the
+        // user's edit is still authoritative.
+        let modified: i64 = conn
+            .query_row(
+                "SELECT modified FROM tasks WHERE _id = ?1",
+                [child_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(modified, 2000);
     }
 }

@@ -103,6 +103,7 @@ pub fn task_to_remote(task: &TaskJson, calendar_remote_id: &str) -> RemoteTask {
     };
 
     let due_ms = task.due.as_deref().and_then(rfc3339_to_ms).unwrap_or(0);
+    let last_modified_ms = task.updated.as_deref().and_then(rfc3339_to_ms);
 
     RemoteTask {
         remote_id: task.id.clone(),
@@ -119,6 +120,7 @@ pub fn task_to_remote(task: &TaskJson, calendar_remote_id: &str) -> RemoteTask {
         priority: 3,
         recurrence: None, // not supported by Google Tasks API
         parent_remote_id: task.parent.clone(),
+        last_modified_ms,
         raw_vtodo: None,
     }
 }
@@ -342,6 +344,7 @@ mod tests {
             priority: 3,
             recurrence: None,
             parent_remote_id: Some("root".into()),
+            last_modified_ms: None,
             raw_vtodo: None,
         };
         let v = remote_to_task_json(&rt);
