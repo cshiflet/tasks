@@ -13,6 +13,7 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Dialogs
 import QtQuick.Layouts
+import QtQuick.Window
 
 import com.tasks.desktop
 
@@ -60,7 +61,35 @@ ApplicationWindow {
     // OS-default data path. There's no UI to point at a different
     // file — `openDefaultDatabase` creates the file on first launch
     // and reopens it on every subsequent run.
-    Component.onCompleted: viewModel.openDefaultDatabase()
+    //
+    // Window geometry: bridge seeds `windowWidth`/`windowHeight`
+    // from the saved Preferences blob. A positive saved width/height
+    // overrides the default 1100x720; positive x/y restore the prior
+    // top-left corner (0/0 is the "no saved position" sentinel —
+    // leave the window manager to place the window). Maximised wins
+    // over an explicit size: the unmaximise gesture falls back to the
+    // most recent unmaximised width/height on the bridge side.
+    Component.onCompleted: {
+        if (viewModel.windowWidth > 0) { root.width = viewModel.windowWidth; }
+        if (viewModel.windowHeight > 0) { root.height = viewModel.windowHeight; }
+        if (viewModel.windowX > 0 && viewModel.windowY > 0) {
+            root.x = viewModel.windowX;
+            root.y = viewModel.windowY;
+        }
+        if (viewModel.windowMaximized) {
+            root.visibility = Window.Maximized;
+        }
+        viewModel.openDefaultDatabase();
+    }
+
+    // Persist on close only — drag/resize fires too often to write
+    // through to disk on every event, and we don't want the prefs
+    // file to churn during normal interaction.
+    onClosing: {
+        viewModel.saveWindowGeometry(
+            root.width, root.height, root.x, root.y,
+            root.visibility === Window.Maximized);
+    }
 
     FileDialog {
         id: importDialog

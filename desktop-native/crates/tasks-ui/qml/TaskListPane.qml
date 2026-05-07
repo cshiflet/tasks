@@ -401,6 +401,7 @@ Pane {
                             Layout.maximumWidth: 120
                             visible: root.vm
                                      && root.vm.taskListNames[index].length > 0
+                                     && root.vm.caldavCalendarUuids.length > 1
                             text: root.vm ? root.vm.taskListNames[index] : ""
                             color: root.vm
                                 ? root.chipTextFor(root.vm.taskListColors[index] | 0)

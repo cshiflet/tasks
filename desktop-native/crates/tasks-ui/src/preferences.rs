@@ -33,10 +33,29 @@ pub struct Preferences {
     pub show_hidden: bool,
     #[serde(default)]
     pub completed_at_bottom: bool,
+    #[serde(default = "default_window_width")]
+    pub window_width: i32,
+    #[serde(default = "default_window_height")]
+    pub window_height: i32,
+    /// 0 = "no saved position; let the window manager place it".
+    #[serde(default)]
+    pub window_x: i32,
+    #[serde(default)]
+    pub window_y: i32,
+    #[serde(default)]
+    pub window_maximized: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_window_width() -> i32 {
+    1100
+}
+
+fn default_window_height() -> i32 {
+    720
 }
 
 impl Default for Preferences {
@@ -48,6 +67,11 @@ impl Default for Preferences {
             show_completed: false,
             show_hidden: false,
             completed_at_bottom: false,
+            window_width: default_window_width(),
+            window_height: default_window_height(),
+            window_x: 0,
+            window_y: 0,
+            window_maximized: false,
         }
     }
 }

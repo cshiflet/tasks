@@ -164,6 +164,16 @@ pub mod qobject {
         // Surfaced in Settings → General → Appearance and read by
         // Main.qml's `appearanceTheme` binding.
         #[qproperty(i32, theme_mode)]
+        // Persisted ApplicationWindow geometry. Loaded once at
+        // construction; written back via `saveWindowGeometry` from
+        // Main.qml's `onClosing` so we don't churn the prefs file
+        // during drag/resize. `window_x`/`window_y` of 0 mean "no
+        // saved position; let the WM place it".
+        #[qproperty(i32, window_width)]
+        #[qproperty(i32, window_height)]
+        #[qproperty(i32, window_x)]
+        #[qproperty(i32, window_y)]
+        #[qproperty(bool, window_maximized)]
         // Sidebar: parallel label / identifier arrays. Identifier format:
         //   "__all__" | "__today__" | "__recent__"  (built-in filters)
         //   "caldav:<uuid>"                          (CalDAV calendar)
@@ -275,6 +285,22 @@ pub mod qobject {
         /// QML calls this from Settings → General → Appearance.
         #[qinvokable]
         fn update_theme_mode(self: Pin<&mut TaskListViewModel>, mode: i32);
+
+        /// Persist the ApplicationWindow's geometry. Called from
+        /// Main.qml's `onClosing` so we don't churn the prefs file
+        /// during drag/resize. Pass `width`/`height` in logical
+        /// pixels and `x`/`y` as the top-left corner; `maximized`
+        /// captures whether the window was maximised at close so the
+        /// next launch can restore that state.
+        #[qinvokable]
+        fn save_window_geometry(
+            self: Pin<&mut TaskListViewModel>,
+            width: i32,
+            height: i32,
+            x: i32,
+            y: i32,
+            maximized: bool,
+        );
 
         #[qinvokable]
         fn toggle_task_completion(self: Pin<&mut TaskListViewModel>, id: i64, completed: bool);
@@ -543,6 +569,15 @@ pub struct TaskListViewModelRust {
     pref_show_hidden: bool,
     pref_completed_at_bottom: bool,
     theme_mode: i32,
+    // Persisted ApplicationWindow geometry. 0/0 for x/y is the
+    // "no saved position" sentinel — Main.qml only assigns x/y when
+    // both are positive so the WM keeps its default placement on
+    // first launch.
+    window_width: i32,
+    window_height: i32,
+    window_x: i32,
+    window_y: i32,
+    window_maximized: bool,
     // Sidebar state.
     sidebar_labels: QStringList,
     sidebar_ids: QStringList,
@@ -604,6 +639,14 @@ pub struct TaskListViewModelRust {
     /// instance is shared across every Sync now click for the
     /// lifetime of the view model.
     runtime: Option<tokio::runtime::Runtime>,
+    /// Throttle bookkeeping for `refresh_sidebar`. A burst of
+    /// in-process mutation triggers (account-add, list-rename, sync
+    /// completion, …) used to fan out as one full rebuild per call;
+    /// we now collapse them to a 1 s leading-edge debounce with a
+    /// trailing-edge flush so the last skipped call's effect still
+    /// lands.
+    last_sidebar_refresh: Option<std::time::Instant>,
+    pending_sidebar_refresh: bool,
 }
 
 impl Default for TaskListViewModelRust {
@@ -668,6 +711,11 @@ impl Default for TaskListViewModelRust {
             pref_show_hidden: saved.show_hidden,
             pref_completed_at_bottom: saved.completed_at_bottom,
             theme_mode: saved.theme_mode,
+            window_width: saved.window_width,
+            window_height: saved.window_height,
+            window_x: saved.window_x,
+            window_y: saved.window_y,
+            window_maximized: saved.window_maximized,
             sidebar_labels: QStringList::default(),
             sidebar_ids: QStringList::default(),
             sidebar_account_kinds: QList::default(),
@@ -702,6 +750,8 @@ impl Default for TaskListViewModelRust {
             watcher_stop: None,
             auto_sync_stop: None,
             runtime: None,
+            last_sidebar_refresh: None,
+            pending_sidebar_refresh: false,
         }
     }
 }
@@ -832,6 +882,33 @@ impl qobject::TaskListViewModel {
     pub fn update_theme_mode(mut self: Pin<&mut Self>, mode: i32) {
         let clamped = mode.clamp(0, 2);
         self.as_mut().set_theme_mode(clamped);
+        persist_prefs(self.as_ref().get_ref());
+    }
+
+    /// Persist window geometry so the next launch reopens at the
+    /// same size + position. Maximised wins over an explicit size:
+    /// if the window was maximised we keep the prior `window_width`
+    /// / `window_height` untouched so unmaximising on the next run
+    /// returns to the user's chosen size.
+    pub fn save_window_geometry(
+        mut self: Pin<&mut Self>,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+        maximized: bool,
+    ) {
+        if !maximized {
+            if width > 0 {
+                self.as_mut().set_window_width(width);
+            }
+            if height > 0 {
+                self.as_mut().set_window_height(height);
+            }
+            self.as_mut().set_window_x(x.max(0));
+            self.as_mut().set_window_y(y.max(0));
+        }
+        self.as_mut().set_window_maximized(maximized);
         persist_prefs(self.as_ref().get_ref());
     }
 
@@ -2932,7 +3009,64 @@ fn auto_sync_for_task(mut vm: Pin<&mut qobject::TaskListViewModel>, task_id: i64
     }
 }
 
+/// Cooldown for `refresh_sidebar`'s leading-edge debounce. Every
+/// in-process mutation hook calls `refresh_sidebar` synchronously;
+/// account-add / list-rename / sync completion can fire dozens of
+/// times in a burst, and a full `build_sidebar` per call dominates
+/// the QML thread.
+const SIDEBAR_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// Rebuild the sidebar Q_PROPERTYs from the current DB. Throttled
+/// to one rebuild per `SIDEBAR_REFRESH_COOLDOWN`: the first call in
+/// a burst runs synchronously, subsequent calls inside the window
+/// flag a pending refresh and let a worker thread flush it once
+/// the cooldown elapses, so the last skipped call's effect still
+/// lands.
 fn refresh_sidebar(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    let now = std::time::Instant::now();
+    let should_run = match vm.as_ref().rust().last_sidebar_refresh {
+        None => true,
+        Some(prev) => now.duration_since(prev) >= SIDEBAR_REFRESH_COOLDOWN,
+    };
+    if !should_run {
+        let already_pending = vm.as_ref().rust().pending_sidebar_refresh;
+        if already_pending {
+            return;
+        }
+        vm.as_mut().rust_mut().pending_sidebar_refresh = true;
+        let last = vm.as_ref().rust().last_sidebar_refresh.unwrap_or(now);
+        let elapsed = now.duration_since(last);
+        let wait = SIDEBAR_REFRESH_COOLDOWN.saturating_sub(elapsed);
+        let qt_thread = vm.as_ref().qt_thread();
+        std::thread::Builder::new()
+            .name("sidebar-debounce".into())
+            .spawn(move || {
+                std::thread::sleep(wait);
+                let _ = qt_thread.queue(|pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    flush_sidebar_refresh(pinned);
+                });
+            })
+            .ok();
+        return;
+    }
+    do_refresh_sidebar(vm.as_mut());
+    vm.as_mut().rust_mut().last_sidebar_refresh = Some(now);
+    vm.as_mut().rust_mut().pending_sidebar_refresh = false;
+}
+
+/// Trailing-edge flush invoked from the debounce worker thread.
+/// Clears the pending flag and runs the rebuild only if a call
+/// arrived during the cooldown.
+fn flush_sidebar_refresh(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if !vm.as_ref().rust().pending_sidebar_refresh {
+        return;
+    }
+    vm.as_mut().rust_mut().pending_sidebar_refresh = false;
+    do_refresh_sidebar(vm.as_mut());
+    vm.as_mut().rust_mut().last_sidebar_refresh = Some(std::time::Instant::now());
+}
+
+fn do_refresh_sidebar(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     // Compute the new arrays inside a scope that holds the
     // immutable Rust borrow on the view model, then drop the
     // borrow before the cxx-qt `set_*` methods take Pin<&mut Self>.
@@ -2980,6 +3114,11 @@ fn persist_prefs(vm: &qobject::TaskListViewModel) {
         show_completed: vm.pref_show_completed,
         show_hidden: vm.pref_show_hidden,
         completed_at_bottom: vm.pref_completed_at_bottom,
+        window_width: vm.window_width,
+        window_height: vm.window_height,
+        window_x: vm.window_x,
+        window_y: vm.window_y,
+        window_maximized: vm.window_maximized,
     };
     prefs.save();
 }
