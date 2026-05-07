@@ -334,6 +334,10 @@ Pane {
                         color: Material.foreground
                         opacity: 0.10
                     }
+                    // True for the built-in Local account (non-sync,
+                    // can't sync — hide the sync button there).
+                    readonly property bool _isLocalAccount:
+                        root._accountUuidOf(row.myGroup) === "local-default"
                     contentItem: RowLayout {
                         spacing: 6
                         Canvas {
@@ -364,6 +368,101 @@ Pane {
                             font.bold: true
                             font.pointSize: Qt.application.font.pointSize - 1
                             elide: Text.ElideRight
+                        }
+                        // Per-account sync affordance, mirrors the
+                        // command-bar Sync button. Hidden for the
+                        // built-in Local account (nothing to sync)
+                        // and for any in-flight sync of *this*
+                        // account (the icon spins while the bridge's
+                        // accountSyncStates entry is "Syncing…").
+                        // Right-click → Sync now still works as the
+                        // keyboard-equivalent path for completeness.
+                        ToolButton {
+                            id: rowSyncButton
+                            visible: !accountHeader._isLocalAccount
+                            Layout.preferredWidth: 22
+                            Layout.preferredHeight: 22
+                            ToolTip.visible: hovered
+                            ToolTip.text: qsTr("Sync %1").arg(row.myLabel)
+                            // Stop propagation so the click doesn't
+                            // also collapse/expand the section.
+                            onClicked: {
+                                if (!root.vm) { return; }
+                                root.vm.syncAccount(
+                                    root._accountUuidOf(row.myGroup));
+                            }
+                            // Map this row's account to its index in
+                            // the bridge's parallel accounts arrays
+                            // so we can read its current sync state.
+                            // accountSyncStates is indexed alongside
+                            // accountUuids; both populated from the
+                            // same load_password_accounts pass.
+                            readonly property int _accountIndex: {
+                                if (!root.vm || !root.vm.accountUuids) {
+                                    return -1;
+                                }
+                                const u = root._accountUuidOf(row.myGroup);
+                                for (let i = 0; i < root.vm.accountUuids.length; i++) {
+                                    if (root.vm.accountUuids[i] === u) {
+                                        return i;
+                                    }
+                                }
+                                return -1;
+                            }
+                            readonly property bool _syncing:
+                                _accountIndex >= 0
+                                && root.vm
+                                && root.vm.accountSyncStates
+                                && root.vm.accountSyncStates[_accountIndex] === "Syncing…"
+                            contentItem: Canvas {
+                                id: rowSyncIcon
+                                implicitWidth: 14
+                                implicitHeight: 14
+                                RotationAnimation on rotation {
+                                    running: rowSyncButton._syncing
+                                    from: 0; to: 360
+                                    duration: 900
+                                    loops: Animation.Infinite
+                                }
+                                onPaint: {
+                                    // Same two-arc refresh glyph the
+                                    // command-bar button uses, scaled
+                                    // down for the sidebar row height.
+                                    const ctx = getContext("2d");
+                                    ctx.reset();
+                                    ctx.lineWidth = 1.4;
+                                    ctx.lineCap = "round";
+                                    ctx.lineJoin = "round";
+                                    ctx.strokeStyle = rowSyncButton.Material.foreground;
+                                    ctx.fillStyle = rowSyncButton.Material.foreground;
+                                    const cx = width / 2;
+                                    const cy = height / 2;
+                                    const r = Math.min(width, height) / 2 - 2;
+                                    ctx.beginPath();
+                                    ctx.arc(cx, cy, r, -Math.PI * 0.4, Math.PI * 0.4);
+                                    ctx.stroke();
+                                    ctx.beginPath();
+                                    ctx.arc(cx, cy, r, Math.PI * 0.6, Math.PI * 1.4);
+                                    ctx.stroke();
+                                    const head = 2.5;
+                                    const xR = cx + r * Math.cos(Math.PI * 0.4);
+                                    const yR = cy + r * Math.sin(Math.PI * 0.4);
+                                    ctx.beginPath();
+                                    ctx.moveTo(xR, yR);
+                                    ctx.lineTo(xR - head, yR - head * 0.6);
+                                    ctx.lineTo(xR + head * 0.4, yR - head);
+                                    ctx.closePath();
+                                    ctx.fill();
+                                    const xL = cx + r * Math.cos(Math.PI * 1.4);
+                                    const yL = cy + r * Math.sin(Math.PI * 1.4);
+                                    ctx.beginPath();
+                                    ctx.moveTo(xL, yL);
+                                    ctx.lineTo(xL + head, yL + head * 0.6);
+                                    ctx.lineTo(xL - head * 0.4, yL + head);
+                                    ctx.closePath();
+                                    ctx.fill();
+                                }
+                            }
                         }
                     }
 

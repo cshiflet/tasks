@@ -1123,22 +1123,13 @@ impl qobject::TaskListViewModel {
             self.as_mut().rust_mut().account_states.remove(idx);
         }
         if let Some(path) = self.db_path.clone() {
-            if let Ok(conn) = open_rw_conn(&path) {
-                // Tear down child rows first so a missing FK CASCADE
-                // doesn't leave orphans in the lists / tasks tables.
-                let _ = conn.execute(
-                    "DELETE FROM caldav_tasks WHERE cd_calendar IN \
-                     (SELECT cdl_uuid FROM caldav_lists WHERE cdl_account = ?1)",
-                    rusqlite::params![removed.uuid],
-                );
-                let _ = conn.execute(
-                    "DELETE FROM caldav_lists WHERE cdl_account = ?1",
-                    rusqlite::params![removed.uuid],
-                );
-                let _ = conn.execute(
-                    "DELETE FROM caldav_accounts WHERE cda_uuid = ?1",
-                    rusqlite::params![removed.uuid],
-                );
+            if let Ok(mut conn) = open_rw_conn(&path) {
+                if let Err(e) = delete_account_cascade(&mut conn, &removed.uuid) {
+                    tracing::warn!(
+                        "remove_account: cascade delete failed for {}: {e}",
+                        removed.uuid
+                    );
+                }
             }
         }
         publish_accounts(self.as_mut());
@@ -1323,33 +1314,34 @@ impl qobject::TaskListViewModel {
             ));
             return;
         }
-        // The env-var-missing path can't be unit-tested in
-        // isolation: the invokable demands `Pin<&mut Self>` of a
-        // cxx-qt QObject, which only materialises inside a running
-        // Qt event loop. The branch is exercised end-to-end by the
-        // smoke-run (`QT_QPA_PLATFORM=offscreen cargo run`).
-        let env_var = match kind {
-            KIND_GOOGLE_TASKS => "TASKS_DESKTOP_GOOGLE_CLIENT_ID",
-            KIND_MICROSOFT_TODO => "TASKS_DESKTOP_MICROSOFT_CLIENT_ID",
+        // Resolve the OAuth client ID. Env var wins for CI / dev /
+        // one-off overrides; falls back to oauth.json so most users
+        // never touch their shell environment. Bail before opening
+        // the browser when neither source carries a value — popping
+        // a sign-in window with no client_id is a guaranteed dead
+        // end and the resulting Google / Azure error page is
+        // confusing.
+        let client_id = match kind {
+            KIND_GOOGLE_TASKS => crate::preferences::google_oauth_client_id(),
+            KIND_MICROSOFT_TODO => crate::preferences::microsoft_oauth_client_id(),
             _ => unreachable!("kind validated above"),
         };
-        // Bail before opening the browser when the env var is unset
-        // — popping a sign-in window with no client_id is a guaranteed
-        // dead end and the resulting Google / Azure error page is
-        // confusing.
-        let client_id = match std::env::var(env_var) {
-            Ok(v) if !v.trim().is_empty() => v,
-            _ => {
+        let client_id = match client_id {
+            Some(v) => v,
+            None => {
+                let path = crate::preferences::oauth_config_path_display();
                 let msg = match kind {
-                    KIND_GOOGLE_TASKS => {
-                        "Set TASKS_DESKTOP_GOOGLE_CLIENT_ID before signing in to Google Tasks."
-                    }
-                    KIND_MICROSOFT_TODO => {
-                        "Set TASKS_DESKTOP_MICROSOFT_CLIENT_ID before signing in to Microsoft To Do."
-                    }
+                    KIND_GOOGLE_TASKS => format!(
+                        "Set google_client_id in {path} (or TASKS_DESKTOP_GOOGLE_CLIENT_ID) \
+                         before signing in to Google Tasks."
+                    ),
+                    KIND_MICROSOFT_TODO => format!(
+                        "Set microsoft_client_id in {path} (or TASKS_DESKTOP_MICROSOFT_CLIENT_ID) \
+                         before signing in to Microsoft To Do."
+                    ),
                     _ => unreachable!(),
                 };
-                self.as_mut().set_status(QString::from(msg));
+                self.as_mut().set_status(QString::from(&msg));
                 return;
             }
         };
@@ -1631,16 +1623,22 @@ impl qobject::TaskListViewModel {
                     set_account_state(self.as_mut(), &uuid, "Idle");
                     return;
                 }
-                let env_var = if stored.kind == KIND_GOOGLE_TASKS {
-                    "TASKS_DESKTOP_GOOGLE_CLIENT_ID"
+                let client_id = if stored.kind == KIND_GOOGLE_TASKS {
+                    crate::preferences::google_oauth_client_id()
                 } else {
-                    "TASKS_DESKTOP_MICROSOFT_CLIENT_ID"
+                    crate::preferences::microsoft_oauth_client_id()
                 };
-                let client_id = match std::env::var(env_var) {
-                    Ok(v) if !v.trim().is_empty() => v,
-                    _ => {
+                let client_id = match client_id {
+                    Some(v) => v,
+                    None => {
+                        let field = if stored.kind == KIND_GOOGLE_TASKS {
+                            "google_client_id"
+                        } else {
+                            "microsoft_client_id"
+                        };
+                        let path = crate::preferences::oauth_config_path_display();
                         self.as_mut().set_status(QString::from(&format!(
-                            "Set {env_var} before syncing {label}."
+                            "Set {field} in {path} before syncing {label}."
                         )));
                         set_account_state(self.as_mut(), &uuid, "Idle");
                         return;
@@ -2748,6 +2746,19 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             // before the first sidebar build so a fresh user sees a
             // usable list immediately. Idempotent.
             ensure_local_default_list(&path);
+            // One-shot orphan vacuum on open: rows from CalDAV
+            // accounts removed before the cascade-delete fix
+            // landed are still in the `tasks` table even though
+            // their calendar / account is gone, and "All active"
+            // happily surfaces them. Sweep them out so the user's
+            // first open after the upgrade is clean.
+            if let Ok(mut conn) = open_rw_conn(&path) {
+                match vacuum_orphan_tasks(&mut conn) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("vacuumed {n} orphan task(s) from removed accounts"),
+                    Err(e) => tracing::warn!("orphan vacuum failed: {e}"),
+                }
+            }
             // Cold open: we deliberately bypass refresh_sidebar's
             // throttle here. open_at_path is a one-shot, not part
             // of a burst, and the throttle's leading-edge would
@@ -3494,6 +3505,133 @@ fn do_refresh_sidebar(mut vm: Pin<&mut qobject::TaskListViewModel>) {
     vm.as_mut().set_sidebar_account_kinds(kl);
     vm.as_mut().set_sidebar_groups(groups_qsl);
     vm.as_mut().set_sidebar_colors(cl);
+}
+
+/// Cascade-delete every row tied to the given account UUID.
+///
+/// Runs in a single transaction. Tears down rows in dependency
+/// order so even though we don't have ON DELETE CASCADE FKs
+/// declared, no children survive their parent:
+///
+///   alarms[task]  → tasks[_id]  → caldav_tasks[cd_task]  →
+///   caldav_lists[cdl_uuid]  → caldav_accounts[cda_uuid]
+///
+/// The earlier remove_account path only swept caldav_tasks /
+/// caldav_lists / caldav_accounts and left the underlying
+/// `tasks` rows (plus their `alarms` and `tags`) behind, which
+/// is why "All active" still showed tasks from removed
+/// accounts. Mirrors the Android client's CaldavDao deletion
+/// shape.
+fn delete_account_cascade(conn: &mut rusqlite::Connection, cda_uuid: &str) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    // Capture the affected task IDs before we tear down the
+    // join rows that point at them.
+    let mut task_ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT ct.cd_task FROM caldav_tasks ct \
+             JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+             WHERE cl.cdl_account = ?1",
+        )?;
+        let rows = stmt.query_map([cda_uuid], |r| r.get::<_, i64>(0))?;
+        for r in rows {
+            task_ids.push(r?);
+        }
+    }
+    if !task_ids.is_empty() {
+        // SQLite's parameter limit (default 999) caps how many
+        // ?N we can splat. We're well under in practice but
+        // chunk anyway in case the user is wiping a hoarder
+        // account.
+        for chunk in task_ids.chunks(500) {
+            let placeholders: String = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            tx.execute(
+                &format!("DELETE FROM alarms WHERE task IN ({placeholders})"),
+                params.as_slice(),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM tags WHERE task IN ({placeholders})"),
+                params.as_slice(),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM tasks WHERE _id IN ({placeholders})"),
+                params.as_slice(),
+            )?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM caldav_tasks WHERE cd_calendar IN \
+         (SELECT cdl_uuid FROM caldav_lists WHERE cdl_account = ?1)",
+        [cda_uuid],
+    )?;
+    tx.execute(
+        "DELETE FROM caldav_lists WHERE cdl_account = ?1",
+        [cda_uuid],
+    )?;
+    tx.execute(
+        "DELETE FROM caldav_accounts WHERE cda_uuid = ?1",
+        [cda_uuid],
+    )?;
+    tx.commit()
+}
+
+/// Sweep `tasks` rows whose only join row points at a calendar
+/// whose owning account is gone. This is the cleanup pass that
+/// recovers from the pre-fix bug where remove_account dropped
+/// the join rows + lists + account but left task bodies behind
+/// — those bodies still surface in "All active". Runs once per
+/// open_at_path; idempotent.
+fn vacuum_orphan_tasks(conn: &mut rusqlite::Connection) -> rusqlite::Result<usize> {
+    let tx = conn.transaction()?;
+    // An orphan = caldav_tasks row whose cd_calendar isn't in
+    // caldav_lists, OR whose calendar's cdl_account isn't in
+    // caldav_accounts.
+    let mut task_ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT ct.cd_task FROM caldav_tasks ct \
+             LEFT JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+             LEFT JOIN caldav_accounts ca ON ca.cda_uuid = cl.cdl_account \
+             WHERE cl.cdl_uuid IS NULL OR ca.cda_uuid IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        for r in rows {
+            task_ids.push(r?);
+        }
+    }
+    let removed = task_ids.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+    for chunk in task_ids.chunks(500) {
+        let placeholders: String = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        tx.execute(
+            &format!("DELETE FROM alarms WHERE task IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM tags WHERE task IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM tasks WHERE _id IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM caldav_tasks WHERE cd_task IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed)
 }
 
 fn open_rw_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
