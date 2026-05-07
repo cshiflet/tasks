@@ -36,7 +36,7 @@ weak — never reuse on a publicly-reachable server.**
 | Service  | Endpoint                       | Account       | Password                          |
 |----------|--------------------------------|---------------|-----------------------------------|
 | Etebase  | `http://127.0.0.1:3735`        | `alice`       | `alicepw`                         |
-| Etebase  | `http://127.0.0.1:3735/admin/` | `admin` (Django superuser) | `pEjQEwKLd%o^gcLUP#VncOl@&LBn6@` |
+| Etebase  | `http://127.0.0.1:3735/admin/` | `admin` (Django superuser) | `changeme`                        |
 | Radicale | `http://127.0.0.1:5232/test/`  | `test`        | `test`                            |
 | Radicale | `http://127.0.0.1:5232/.web/`  | `test`        | `test`                            |
 

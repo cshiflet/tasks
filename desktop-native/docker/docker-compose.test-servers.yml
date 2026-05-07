@@ -42,7 +42,7 @@ services:
       DEBUG_DJANGO: "true"
       SERVER: http-socket
       SUPER_USER: admin
-      SUPER_PASS: "pEjQEwKLd%o^gcLUP#VncOl@&LBn6@"
+      SUPER_PASS: "changeme"
       ETEBASE_TEST_USER: alice
       ETEBASE_TEST_EMAIL: alice@example.com
       ETEBASE_TEST_PASSWORD: alicepw
