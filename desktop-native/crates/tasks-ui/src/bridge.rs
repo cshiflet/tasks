@@ -1411,6 +1411,7 @@ impl qobject::TaskListViewModel {
                         );
                     }
                 };
+                tracing::info!("oauth: worker thread started for {label_for_thread}");
                 let result = match http_result {
                     Ok(http) => runtime.block_on(async move {
                         let timeout = std::time::Duration::from_secs(120);
@@ -1440,7 +1441,13 @@ impl qobject::TaskListViewModel {
                         "reqwest build: {e}"
                     ))),
                 };
-                let _ = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                match &result {
+                    Ok(_) => {
+                        tracing::info!("oauth: authorize() returned tokens for {label_for_thread}")
+                    }
+                    Err(e) => tracing::warn!("oauth: authorize() failed for {label_for_thread}: {e}"),
+                }
+                let queue_result = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
                     // Clear the manual-URL fallback regardless of
                     // outcome — the dialog should auto-dismiss when
                     // the loopback resolves (success) or the timeout
@@ -1503,17 +1510,24 @@ impl qobject::TaskListViewModel {
                                 inner.account_states.push(String::from("Idle"));
                             }
                             publish_accounts(pinned.as_mut());
+                            tracing::info!("oauth: account row + token store updated for {label_for_thread}");
                             pinned.as_mut().set_status(QString::from(&format!(
                                 "Signed in to {label_for_thread} (session-local tokens)."
                             )));
                         }
                         Err(e) => {
+                            tracing::warn!("oauth: completion handler reporting Err: {e}");
                             pinned
                                 .as_mut()
                                 .set_status(QString::from(&format!("Sign-in failed: {e}")));
                         }
                     }
                 });
+                if let Err(e) = queue_result {
+                    tracing::warn!(
+                        "oauth: failed to post completion to Qt thread: {e}"
+                    );
+                }
             })
             .expect("spawn oauth worker thread");
     }
