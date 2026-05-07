@@ -25,7 +25,11 @@ secrecy = { workspace = true }
 # `rt-multi-thread` feature so providers can spawn their own
 # fan-out work without blocking the UI thread; the bridge owns
 # exactly one Runtime instance shared across every Sync now click.
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+# `time` powers the alarm scheduler's `sleep_until` calls; `sync`
+# is needed for the `oneshot::channel` the smoke test uses to
+# observe a fired notification without depending on a desktop
+# notification daemon.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
 # Generate cda_uuid values for accounts created via the
 # Accounts pane. Mirrors the `uuid` dep pattern used by tasks-core.
 uuid = { version = "1", features = ["v4"] }
@@ -49,6 +53,14 @@ webbrowser = "1"
 # tasks-sync. Pinned to the same major + features as tasks-sync so
 # Cargo unifies the build into a single rustls-backed reqwest.
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+# OS-native notifications for task alarms. Abstracts
+# org.freedesktop.Notifications on Linux, NSUserNotification on
+# macOS (requires a packaged .app bundle to actually render), and
+# the Windows Toast Notification Manager on Windows 10+. Pinned to
+# the 4.x line; the scheduler task in `notifier.rs` is the only
+# call-site, and notification failures are logged + swallowed so a
+# flaky daemon can't take the app down.
+notify-rust = "4"
 
 # The Win32 dark-title-bar shim is implemented with bare
 # `extern "system"` declarations in `src/win_dark_titlebar.rs` —
@@ -59,3 +71,11 @@ reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"
 
 [build-dependencies]
 cxx-qt-build = { workspace = true }
+
+[dev-dependencies]
+# Notifier smoke test materialises a real SQLite file so the
+# scheduler can read its alarms; `tempfile` keeps the fixture
+# scoped to the test run.
+tempfile = "3"
+# `tokio::test` macro for the async smoke test.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }

@@ -44,6 +44,13 @@ pub struct Preferences {
     pub window_y: i32,
     #[serde(default)]
     pub window_maximized: bool,
+    /// Master toggle for the OS-level reminder notifications fired
+    /// by `notifier::AlarmScheduler`. Default-on so an existing
+    /// preferences file from before the feature landed picks up
+    /// notifications automatically. The General Settings pane
+    /// surfaces it as "Show OS notifications for task reminders".
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -72,6 +79,7 @@ impl Default for Preferences {
             window_x: 0,
             window_y: 0,
             window_maximized: false,
+            notifications_enabled: true,
         }
     }
 }

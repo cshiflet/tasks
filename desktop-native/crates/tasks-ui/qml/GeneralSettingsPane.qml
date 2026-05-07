@@ -31,6 +31,7 @@ ColumnLayout {
         themeBox.currentIndex = (vm.themeMode | 0).toString().length > 0
             ? Math.max(0, Math.min(2, vm.themeMode | 0))
             : 0;
+        notificationsBox.checked = !!vm.notificationsEnabled;
     }
 
     Component.onCompleted: loadFromVm()
@@ -59,6 +60,24 @@ ColumnLayout {
                 if (pane.appWindow) {
                     pane.appWindow.appearanceTheme = currentIndex;
                 }
+            }
+        }
+
+        // OS-level reminder notifications. Default-on for new
+        // installs; the bridge re-arms or cancels the alarm
+        // scheduler synchronously on each toggle so the user
+        // doesn't need to restart for the change to land.
+        Label {
+            text: qsTr("Notifications")
+            opacity: 0.7
+        }
+        CheckBox {
+            id: notificationsBox
+            Layout.fillWidth: true
+            text: qsTr("Show OS notifications for task reminders")
+            onToggled: {
+                if (!pane.vm) { return; }
+                pane.vm.updateNotificationsEnabled(checked);
             }
         }
     }

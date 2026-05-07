@@ -164,6 +164,12 @@ pub mod qobject {
         // Surfaced in Settings → General → Appearance and read by
         // Main.qml's `appearanceTheme` binding.
         #[qproperty(i32, theme_mode)]
+        // OS-level reminder notifications master toggle. Persisted
+        // alongside the other prefs; surfaced in Settings → General
+        // as a checkbox. Flipping it on calls `reschedule_all`,
+        // flipping it off calls `cancel_all` so the change takes
+        // effect without waiting for the next event loop tick.
+        #[qproperty(bool, notifications_enabled)]
         // Persisted ApplicationWindow geometry. Loaded once at
         // construction; written back via `saveWindowGeometry` from
         // Main.qml's `onClosing` so we don't churn the prefs file
@@ -297,6 +303,13 @@ pub mod qobject {
         /// QML calls this from Settings → General → Appearance.
         #[qinvokable]
         fn update_theme_mode(self: Pin<&mut TaskListViewModel>, mode: i32);
+
+        /// Update + persist the OS-notifications master toggle.
+        /// On flip-on the bridge immediately re-reads the alarms
+        /// table and re-arms the scheduler; flip-off cancels every
+        /// pending handle so the change is felt without waiting.
+        #[qinvokable]
+        fn update_notifications_enabled(self: Pin<&mut TaskListViewModel>, enabled: bool);
 
         /// Persist the ApplicationWindow's geometry. Called from
         /// Main.qml's `onClosing` so we don't churn the prefs file
@@ -601,6 +614,10 @@ pub struct TaskListViewModelRust {
     pref_show_hidden: bool,
     pref_completed_at_bottom: bool,
     theme_mode: i32,
+    /// Master toggle for OS reminder notifications. Mirrors the
+    /// `Preferences::notifications_enabled` blob. Flipping it
+    /// re-arms or cancels the scheduler synchronously.
+    notifications_enabled: bool,
     // Persisted ApplicationWindow geometry. 0/0 for x/y is the
     // "no saved position" sentinel — Main.qml only assigns x/y when
     // both are positive so the WM keeps its default placement on
@@ -687,6 +704,12 @@ pub struct TaskListViewModelRust {
     /// lands.
     last_sidebar_refresh: Option<std::time::Instant>,
     pending_sidebar_refresh: bool,
+    /// OS-notification scheduler for task alarms. Wraps a tokio
+    /// task per pending alarm; the runtime above hosts them. The
+    /// scheduler is created up front so the four reschedule hook
+    /// sites (open / watcher reload / sync / task edit) can call
+    /// it without a None check.
+    notifier: Arc<crate::notifier::AlarmScheduler>,
 }
 
 impl Default for TaskListViewModelRust {
@@ -751,6 +774,7 @@ impl Default for TaskListViewModelRust {
             pref_show_hidden: saved.show_hidden,
             pref_completed_at_bottom: saved.completed_at_bottom,
             theme_mode: saved.theme_mode,
+            notifications_enabled: saved.notifications_enabled,
             window_width: saved.window_width,
             window_height: saved.window_height,
             window_x: saved.window_x,
@@ -795,6 +819,7 @@ impl Default for TaskListViewModelRust {
             token_store: Arc::new(tasks_sync::InMemoryTokenStore::new()),
             last_sidebar_refresh: None,
             pending_sidebar_refresh: false,
+            notifier: Arc::new(crate::notifier::AlarmScheduler::new()),
         }
     }
 }
@@ -808,6 +833,11 @@ impl Drop for TaskListViewModelRust {
         if let Some(stop) = self.auto_sync_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
+        // Drop pending alarm tasks. The runtime itself is also
+        // dropped right after this, but aborting first avoids the
+        // brief spin-up where a fire-time-now task races the runtime
+        // shutdown.
+        self.notifier.cancel_all();
     }
 }
 
@@ -926,6 +956,21 @@ impl qobject::TaskListViewModel {
         let clamped = mode.clamp(0, 2);
         self.as_mut().set_theme_mode(clamped);
         persist_prefs(self.as_ref().get_ref());
+    }
+
+    /// Apply + persist the OS-notification master toggle. Flipping
+    /// it on synchronously re-arms the scheduler against the
+    /// currently-open DB; flipping it off cancels every pending
+    /// handle so a long-future alarm doesn't surprise the user
+    /// after they thought they'd silenced it.
+    pub fn update_notifications_enabled(mut self: Pin<&mut Self>, enabled: bool) {
+        self.as_mut().set_notifications_enabled(enabled);
+        persist_prefs(self.as_ref().get_ref());
+        if enabled {
+            reschedule_alarms(self.as_mut());
+        } else {
+            self.as_ref().notifier.cancel_all();
+        }
     }
 
     /// Persist window geometry so the next launch reopens at the
@@ -1681,6 +1726,13 @@ impl qobject::TaskListViewModel {
                                 .set_status(QString::from(&format!("{label_owned}: Done")));
                             refresh_sidebar(pinned.as_mut());
                             pinned.as_mut().reload_active_filter();
+                            // Sync may have pulled new alarms or
+                            // shifted existing ones (REL_END/
+                            // REL_START anchors move when dueDate
+                            // / hideUntil changes server-side).
+                            // Re-arm the scheduler so the new
+                            // schedule takes effect immediately.
+                            reschedule_alarms(pinned.as_mut());
                         }
                         Err(e) => {
                             let msg = format!("Sync of {label_owned} failed: {e}");
@@ -1916,6 +1968,10 @@ impl qobject::TaskListViewModel {
                 if self.selected_id == id {
                     self.as_mut().set_selected_completed(completed);
                 }
+                // Marking complete (or restoring) shifts which
+                // alarms are eligible to fire — the scheduler's
+                // query filters out completed tasks.
+                reschedule_alarms(self.as_mut());
                 auto_sync_for_task(self.as_mut(), id);
             }
             Ok(false) => {
@@ -1963,6 +2019,11 @@ impl qobject::TaskListViewModel {
                 };
                 self.as_mut()
                     .set_status(QString::from(&format!("Deleted {display}. Undo?")));
+                // The scheduler's query filters out deleted tasks,
+                // so removing the row needs to cancel any pending
+                // handles for it. Reconciling the whole map is
+                // simpler than tracking ids.
+                reschedule_alarms(self.as_mut());
                 // Push the soft-delete to the server so the row's
                 // tombstone reaches its CalDAV / EteSync home. The
                 // engine's push_dirty path picks up rows whose
@@ -2009,6 +2070,9 @@ impl qobject::TaskListViewModel {
                 };
                 self.as_mut()
                     .set_status(QString::from(&format!("Restored {display}.")));
+                // Restored task may have alarms that should fire
+                // again now that `deleted` is back to 0.
+                reschedule_alarms(self.as_mut());
                 auto_sync_for_task(self.as_mut(), id);
             }
             Ok(false) => {
@@ -2272,6 +2336,9 @@ impl qobject::TaskListViewModel {
                 // sees their edits reflected without having to
                 // re-click the row.
                 self.as_mut().select_task(id);
+                // Edit dialog can add, remove, or retime alarms;
+                // reconcile the scheduler against the new state.
+                reschedule_alarms(self.as_mut());
                 auto_sync_for_task(self.as_mut(), id);
             }
             Ok(false) => {
@@ -2770,6 +2837,11 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             }
             vm.as_mut().reload_active_filter();
             start_watcher(vm.as_mut(), path);
+            // Re-arm the OS-notification scheduler against the
+            // freshly-opened DB. Pulls the alarms table end-to-
+            // end and spawns a tokio sleep_until per supported
+            // alarm. No-op when notifications are disabled.
+            reschedule_alarms(vm.as_mut());
             // Kick off the periodic background sync. The starter
             // fires `sync_all_accounts` once up front so launch
             // implies a fresh pull, then loops with a 15-minute
@@ -3445,8 +3517,51 @@ fn persist_prefs(vm: &qobject::TaskListViewModel) {
         window_x: vm.window_x,
         window_y: vm.window_y,
         window_maximized: vm.window_maximized,
+        notifications_enabled: vm.notifications_enabled,
     };
     prefs.save();
+}
+
+/// Ensure the bridge's tokio Runtime is up, then ask the alarm
+/// scheduler to reconcile against the currently-open DB. No-ops
+/// when notifications are disabled in prefs or no DB is open.
+/// Logs once at warn if the Runtime can't be constructed and
+/// disables further attempts for this view-model lifetime by
+/// leaving `runtime: None` — the next reschedule call will retry,
+/// which matches the bridge's existing "runtime is built lazily
+/// on first sync" behaviour.
+fn reschedule_alarms(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if !vm.as_ref().notifications_enabled {
+        return;
+    }
+    let path = match vm.as_ref().db_path.clone() {
+        Some(p) => p,
+        None => return,
+    };
+    if vm.as_ref().rust().runtime.is_none() {
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("tasks-runtime")
+            .build()
+        {
+            Ok(rt) => vm.as_mut().rust_mut().runtime = Some(rt),
+            Err(e) => {
+                tracing::warn!("notifier: couldn't start tokio runtime: {e}");
+                return;
+            }
+        }
+    }
+    let scheduler = Arc::clone(&vm.as_ref().notifier);
+    let handle = vm
+        .as_ref()
+        .rust()
+        .runtime
+        .as_ref()
+        .expect("runtime constructed above")
+        .handle()
+        .clone();
+    scheduler.reschedule_all(&handle, &path);
 }
 
 fn string_list_from_iter<'a>(iter: impl Iterator<Item = &'a str>) -> QStringList {
@@ -3558,9 +3673,18 @@ fn start_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf) {
             }
             match watcher.events.recv_timeout(Duration::from_millis(500)) {
                 Ok(_event) => {
-                    if let Err(e) = qt_thread.queue(|pinned| {
-                        pinned.reload_active_filter();
-                    }) {
+                    if let Err(e) =
+                        qt_thread.queue(|mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                            pinned.as_mut().reload_active_filter();
+                            // External writers (Syncthing, the Android
+                            // app via the same DB file) may have added,
+                            // removed, or shifted alarms. Re-read +
+                            // reconcile so the desktop scheduler tracks
+                            // those changes without waiting for the next
+                            // restart.
+                            reschedule_alarms(pinned.as_mut());
+                        })
+                    {
                         tracing::warn!("couldn't queue reload on Qt thread: {e}");
                         return;
                     }
