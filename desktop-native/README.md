@@ -28,6 +28,12 @@ docker run --rm -it -v "$PWD":/workspace -w /workspace/desktop-native tasks-dev 
     bash -c 'cargo test --workspace && QT_QPA_PLATFORM=offscreen cargo run -p tasks-ui'
 ```
 
+For local sync testing (Etebase + CalDAV servers on loopback,
+hard-coded credentials), see
+**[`docker/README.test-servers.md`](docker/README.test-servers.md)**.
+The desktop client auto-signs-up `alice / alicepw` against the
+loopback Etebase service the first time it syncs.
+
 ## Crate layout
 
 ```
