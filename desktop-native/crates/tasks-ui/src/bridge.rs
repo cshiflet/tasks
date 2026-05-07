@@ -415,7 +415,11 @@ pub mod qobject {
         /// through the status bar — both the in-flight
         /// "Opening browser…" notice and the success / failure
         /// outcome.
+        // `auto_cxx_name` would emit `beginOauthSignIn` (treating
+        // "oauth" as a single word). Force the conventional
+        // `beginOAuthSignIn` so QML reads naturally.
         #[qinvokable]
+        #[cxx_name = "beginOAuthSignIn"]
         fn begin_oauth_sign_in(self: Pin<&mut TaskListViewModel>, kind: i32, label: QString);
 
         /// Drive a one-shot pull-then-push cycle against the account
