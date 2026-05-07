@@ -1,45 +1,61 @@
-# Etebase test-server image, built from upstream source.
-#
-# `etesync/server` doesn't publish a Docker Hub image — the Docker
-# Hub repo of that name is squatted / 404 — so we clone the
-# project at build time and run it under Django's dev server. The
-# resulting container is for local iteration only; do not expose
-# it to the public internet.
+FROM python:3.12.4-alpine
+LABEL maintainer="Victor R. Santos <victor-rds@users.noreply.github.com>"
 
-FROM python:3.11-slim
+ARG DEFAULT_UID=373
+ARG DEFAULT_GID=373
+ARG ETE_VERSION=master
+ARG ETE_REPO="https://github.com/etesync/server.git"
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+ENV BASE_DIR /etebase
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        git \
-        curl \
-        build-essential \
-        libssl-dev \
-        libffi-dev && \
-    rm -rf /var/lib/apt/lists/*
+ENV DATA_DIR /data
+ENV MEDIA_ROOT ${DATA_DIR}/media
+ENV ETEBASE_EASY_CONFIG_PATH ${DATA_DIR}/etebase-server.ini
+ENV SECRET_FILE ${DATA_DIR}/secret.txt
 
-WORKDIR /app
+ENV STATIC_ROOT /srv/etebase/static
 
-# Pin upstream to a known-good ref. `master` has historically
-# broken the WSGI app path (we hit
-# `ModuleNotFoundError: No module named 'etebase_server.wsgi'`
-# on May 2026 master). v0.13.0 is the most recent tag verified
-# end-to-end with `manage.py runserver`. Override with
-# `--build-arg ETEBASE_REF=...` if you want a specific tag.
-ARG ETEBASE_REF=v0.13.0
-RUN git clone --depth 1 --branch ${ETEBASE_REF} \
-        https://github.com/etesync/server.git . && \
-    pip install --no-cache-dir -r requirements.txt && \
-    # daphne fallback in case a future tag drops `wsgi.py` and
-    # the entrypoint needs to switch to the ASGI app.
-    pip install --no-cache-dir daphne
+ENV SERVER="http"
+ENV PORT 3735
 
-EXPOSE 3735
+WORKDIR ${BASE_DIR}
 
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# OS packages and deps installation
+# hadolint ignore=DL3018
+RUN set -eux; \
+    # Prepare packages required by the base image
+    apk upgrade --no-cache; \
+    apk add --no-cache openssl mailcap libpq libffi libldap libsasl bash; \
+    apk add --no-cache --virtual .build-deps coreutils gcc make wget linux-headers \
+        cyrus-sasl-dev libc-dev libffi-dev openssl-dev postgresql-dev openldap-dev git; \
+    # Download Etebase and install dependencies
+    git clone --depth=1 --branch=${ETE_VERSION} "${ETE_REPO}" "${BASE_DIR}"; \
+    /usr/local/bin/python -m pip install --no-cache-dir --progress-bar off --upgrade pip; \
+    pip install --no-cache-dir --progress-bar off -r "${BASE_DIR}/requirements.txt" "psycopg2-binary" "python-ldap"; \
+    # Remove packages no longer required by the base image
+    apk del .build-deps; \
+    # Clear Downloads and set permissions
+    rm -r "${BASE_DIR}/.git"; \
+    chown -R "${DEFAULT_UID}":"${DEFAULT_GID}" "${BASE_DIR}"
+
+# Etebase directories and user setup 
+RUN set -eux; \
+    addgroup --system --gid "${DEFAULT_GID}" etebase; \
+    adduser --system --no-create-home --disabled-password \
+    --gecos '' --home ${BASE_DIR} --ingroup etebase --uid "${DEFAULT_UID}" etebase; \
+    mkdir -p "${MEDIA_ROOT}" "${STATIC_ROOT}"; \
+    chown -R "${DEFAULT_UID}":"${DEFAULT_GID}" "${DATA_DIR}" "${STATIC_ROOT}"; \
+    chmod -R 750 "${DATA_DIR}"; \
+    export DJANGO_STATIC_ROOT="${STATIC_ROOT}"; \
+    "${BASE_DIR}"/manage.py collectstatic --no-input; \
+    rm "${BASE_DIR}/secret.txt"
+
+COPY --chown=${DEFAULT_UID}:${DEFAULT_GID} context /
+
+USER etebase:etebase
+
+EXPOSE ${PORT}
+
+VOLUME /data
 
 ENTRYPOINT ["/entrypoint.sh"]

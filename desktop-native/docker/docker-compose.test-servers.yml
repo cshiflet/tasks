@@ -29,7 +29,12 @@
 
 services:
   etebase:
-    image: victorrds/etesync:alpine
+    # Built locally from `etebase/` (vendored copy of
+    # github.com/victor-rds/docker-etebase). See etebase/UPSTREAM.md
+    # for the pinned source commit + bump procedure.
+    build:
+      context: ./etebase
+    image: tasks-test-etebase:local
     container_name: etebase
     environment:
       DEBUG: true
