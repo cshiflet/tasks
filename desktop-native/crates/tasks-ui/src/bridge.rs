@@ -2075,10 +2075,15 @@ impl qobject::TaskListViewModel {
         if self.syncs_in_flight.contains(&uuid) {
             return;
         }
-        self.as_mut()
-            .rust_mut()
-            .syncs_in_flight
-            .insert(uuid.clone());
+        // The `syncs_in_flight` insert deliberately happens later
+        // — *just before* spawning the worker thread, after every
+        // early-return prerequisite has been validated. Inserting
+        // here would leak the uuid on db_path-missing,
+        // runtime-build failure, missing OAuth tokens (the common
+        // "Re-sign-in required" case), missing client_id/secret,
+        // or unknown account kind, leaving subsequent
+        // `sync_account` calls to silently no-op via the
+        // contains-check above.
         let stored = self.accounts[idx].clone();
         let Some(db_path) = self.db_path.clone() else {
             self.as_mut()
@@ -2225,6 +2230,16 @@ impl qobject::TaskListViewModel {
         // `Connection` is !Sync. Drive the future from a dedicated
         // OS thread via `block_on` instead — that polls in place,
         // so the !Sync borrow never crosses thread boundaries.
+        // Mark the account as in-flight *now* — every prerequisite
+        // has been validated above and we're about to spawn the
+        // worker. The completion handler below removes the uuid
+        // before any further state updates so a panic in the
+        // closure still releases the slot.
+        self.as_mut()
+            .rust_mut()
+            .syncs_in_flight
+            .insert(uuid.clone());
+
         // Once the future resolves, queue a callback back onto the
         // QML thread so the Q_PROPERTY updates run with exclusive
         // pinned-mut access.
