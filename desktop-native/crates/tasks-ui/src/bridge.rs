@@ -1238,35 +1238,46 @@ impl qobject::TaskListViewModel {
     /// list of accepted values.
     pub fn update_credential_storage_choice(mut self: Pin<&mut Self>, choice: QString) {
         let new_choice = choice.to_string();
-        if new_choice == self.credential_storage_choice.to_string() {
-            return;
-        }
         let (new_tier, new_token_store, new_secret_store) =
             crate::token_persist::StorageTier::probe(&new_choice);
         let new_tier_name = new_tier.as_str().to_string();
 
-        // Snapshot the bits the migration loop needs without
-        // holding the &Self borrow across the writes below.
-        let accounts: Vec<(String, i32)> = self
-            .as_ref()
-            .rust()
-            .accounts
-            .iter()
-            .map(|a| (a.uuid.clone(), a.kind))
-            .collect();
+        // Skip migration when the destination Arcs *are* the
+        // current Arcs — that happens when the user re-submits
+        // the same choice and the probe returned a fresh-but-
+        // equivalent instance (e.g. "auto" again). Iterating
+        // get→put→delete with the same store on both ends would
+        // delete the data we just re-wrote into the same slot.
+        // Compare the Arc-pointers before doing any I/O.
         let from_tokens = Arc::clone(&self.as_ref().rust().token_store);
         let from_secrets = Arc::clone(&self.as_ref().rust().secret_store);
-        let (tokens_moved, secrets_moved) = migrate_credentials(
-            &accounts,
-            from_tokens.as_ref(),
-            from_secrets.as_ref(),
-            new_token_store.as_ref(),
-            new_secret_store.as_ref(),
-        );
-        tracing::info!(
-            "credential migration: {tokens_moved} tokens, {secrets_moved} secrets \
-             moved into {new_tier_name}"
-        );
+        let same_token_store = Arc::ptr_eq(&from_tokens, &new_token_store);
+        let same_secret_store = Arc::ptr_eq(&from_secrets, &new_secret_store);
+
+        if !(same_token_store && same_secret_store) {
+            // Snapshot the bits the migration loop needs without
+            // holding the &Self borrow across the writes below.
+            let accounts: Vec<(String, i32)> = self
+                .as_ref()
+                .rust()
+                .accounts
+                .iter()
+                .map(|a| (a.uuid.clone(), a.kind))
+                .collect();
+            let (tokens_moved, secrets_moved) = migrate_credentials(
+                &accounts,
+                from_tokens.as_ref(),
+                from_secrets.as_ref(),
+                new_token_store.as_ref(),
+                new_secret_store.as_ref(),
+            );
+            tracing::info!(
+                "credential migration: {tokens_moved} tokens, {secrets_moved} \
+                 secrets moved into {new_tier_name}"
+            );
+        } else {
+            tracing::debug!("credential migration: skipping — destination matches current store");
+        }
 
         {
             let mut inner = self.as_mut().rust_mut();
@@ -1394,7 +1405,15 @@ impl qobject::TaskListViewModel {
             };
             let res = open_rw_conn(&path).and_then(|conn| {
                 conn.execute(
-                    "INSERT OR REPLACE INTO caldav_accounts \
+                    // Plain INSERT — `OR REPLACE` is a footgun
+                    // here because `caldav_accounts` PK is
+                    // `cda_id`, not `cda_uuid`, so it never
+                    // actually de-dupes. Both call sites mint a
+                    // fresh `Uuid::new_v4()` above; if a future
+                    // path reuses one, a unique constraint
+                    // failure surfaces the bug rather than the
+                    // SQL silently inserting a duplicate.
+                    "INSERT INTO caldav_accounts \
                      (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
                       cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
                      VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, -1, 0)",
@@ -1966,7 +1985,15 @@ impl qobject::TaskListViewModel {
                                     // store handles secrets.
                                     let res = open_rw_conn(&db_path).and_then(|conn| {
                                         conn.execute(
-                                            "INSERT OR REPLACE INTO caldav_accounts \
+                                            // Plain INSERT — `OR REPLACE` is a footgun
+                    // here because `caldav_accounts` PK is
+                    // `cda_id`, not `cda_uuid`, so it never
+                    // actually de-dupes. Both call sites mint a
+                    // fresh `Uuid::new_v4()` above; if a future
+                    // path reuses one, a unique constraint
+                    // failure surfaces the bug rather than the
+                    // SQL silently inserting a duplicate.
+                    "INSERT INTO caldav_accounts \
                                              (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
                                               cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
                                              VALUES (?1, ?2, '', '', '', NULL, ?3, 0, -1, 0)",
