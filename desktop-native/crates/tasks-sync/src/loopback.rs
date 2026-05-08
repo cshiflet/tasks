@@ -434,6 +434,46 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Cancel flag wakes the receiver mid-wait. The bridge's
+    /// view-model Drop sets this so closing the window during an
+    /// in-flight OAuth flow aborts the wait promptly instead of
+    /// hanging until the 120 s timeout. Verifies (a) the wait
+    /// returns an Err immediately, and (b) the elapsed time is
+    /// well under the timeout (so we know the cancel really
+    /// woke it, not the timeout).
+    #[test]
+    fn wait_for_redirect_returns_promptly_on_cancel() {
+        let receiver = LoopbackReceiver::bind().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_thread = Arc::clone(&cancel);
+        let _waker = std::thread::spawn(move || {
+            // Give the receiver a moment to start polling.
+            std::thread::sleep(Duration::from_millis(50));
+            cancel_for_thread.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let err = receiver
+            .wait_for_redirect("state", Duration::from_secs(60), Some(cancel))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        // Cancelled-on-poll loops at the 25 ms accept cadence;
+        // 1 s is generous headroom and well under the 60 s
+        // timeout we'd otherwise wait.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancel didn't wake the receiver in time (took {elapsed:?})"
+        );
+        match err {
+            OAuthError::MalformedRedirect(msg) => {
+                assert!(
+                    msg.contains("cancelled"),
+                    "expected cancel-shaped error, got {msg:?}"
+                );
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
     /// H-3 path allowlist: anything other than `/cb` returns 400
     /// and the receiver keeps accepting. If the deadline fires
     /// without a good request we bubble `MalformedRedirect`.
