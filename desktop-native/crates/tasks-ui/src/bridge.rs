@@ -1660,21 +1660,9 @@ impl qobject::TaskListViewModel {
             ));
             return;
         }
-        if self.runtime.is_none() {
-            match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .thread_name("tasks-sync")
-                .build()
-            {
-                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
-                Err(e) => {
-                    self.as_mut()
-                        .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
-                    return;
-                }
-            }
-        }
+        let Some(rt_handle) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
         self.as_mut()
             .set_last_test_result(QString::from("Testing connection…"));
         let allow_signup = is_local_etebase_url(&server_s);
@@ -1686,13 +1674,7 @@ impl qobject::TaskListViewModel {
             }
             _ => unreachable!("kind validated above"),
         };
-        let result = self
-            .as_mut()
-            .rust_mut()
-            .runtime
-            .as_ref()
-            .expect("runtime constructed above")
-            .block_on(async move { provider.connect().await });
+        let result = rt_handle.block_on(async move { provider.connect().await });
         match result {
             Ok(()) => self
                 .as_mut()
@@ -1828,34 +1810,14 @@ impl qobject::TaskListViewModel {
             _ => unreachable!(),
         };
 
-        if self.runtime.is_none() {
-            match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .thread_name("tasks-sync")
-                .build()
-            {
-                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
-                Err(e) => {
-                    self.as_mut()
-                        .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
-                    return;
-                }
-            }
-        }
+        let Some(runtime) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
 
         self.as_mut()
             .set_status(QString::from("Opening browser to sign in\u{2026}"));
 
         let qt_thread = self.as_ref().qt_thread();
-        let runtime = self
-            .as_mut()
-            .rust_mut()
-            .runtime
-            .as_ref()
-            .expect("runtime constructed above")
-            .handle()
-            .clone();
         let token_store = Arc::clone(&self.as_ref().token_store);
         let db_path = self.db_path.clone().expect("db_path checked above");
         let label_for_thread = label_s.clone();
@@ -2122,21 +2084,9 @@ impl qobject::TaskListViewModel {
         // Build (or reuse) the tokio runtime. Construction can fail
         // if the OS refuses thread spawn — surface that on the
         // status bar rather than panicking.
-        if self.runtime.is_none() {
-            match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .thread_name("tasks-sync")
-                .build()
-            {
-                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
-                Err(e) => {
-                    self.as_mut()
-                        .set_status(QString::from(&format!("Couldn't start sync runtime: {e}")));
-                    return;
-                }
-            }
-        }
+        let Some(runtime_for_spawn) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
 
         // Build the right Provider before we leave the QML thread
         // — the credential plumbing reads from `self.accounts` and
@@ -2260,14 +2210,7 @@ impl qobject::TaskListViewModel {
         // / label strings, and the boxed Send-typed Provider are
         // all Send + 'static.
         let qt_thread = self.as_ref().qt_thread();
-        let runtime = self
-            .as_mut()
-            .rust_mut()
-            .runtime
-            .as_ref()
-            .expect("runtime constructed above")
-            .handle()
-            .clone();
+        let runtime = runtime_for_spawn;
         let uuid_owned = uuid.clone();
         let label_owned = label.clone();
 
@@ -2437,21 +2380,9 @@ impl qobject::TaskListViewModel {
             return;
         };
 
-        if self.runtime.is_none() {
-            match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .thread_name("tasks-sync")
-                .build()
-            {
-                Ok(rt) => self.as_mut().rust_mut().runtime = Some(rt),
-                Err(e) => {
-                    self.as_mut()
-                        .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
-                    return;
-                }
-            }
-        }
+        let Some(rt_handle) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
 
         let allow_signup = is_local_etebase_url(&stored.server);
         let creds = AccountCredentials::new_password(
@@ -2478,17 +2409,11 @@ impl qobject::TaskListViewModel {
             name_s, stored.label
         )));
 
-        let create_result = self
-            .as_mut()
-            .rust_mut()
-            .runtime
-            .as_ref()
-            .expect("runtime constructed above")
-            .block_on(async move {
-                provider.connect().await?;
-                let color_arg = if color == 0 { None } else { Some(color) };
-                provider.create_calendar(&name_s, color_arg).await
-            });
+        let create_result = rt_handle.block_on(async move {
+            provider.connect().await?;
+            let color_arg = if color == 0 { None } else { Some(color) };
+            provider.create_calendar(&name_s, color_arg).await
+        });
 
         match create_result {
             Ok(_cal) => {
@@ -4275,6 +4200,45 @@ fn vacuum_orphan_tasks(conn: &mut rusqlite::Connection) -> rusqlite::Result<usiz
     Ok(removed)
 }
 
+/// Lazy-build the bridge's shared multi-thread tokio runtime
+/// and return a cloned Handle. Five sites used to repeat the
+/// `if self.runtime.is_none() { Builder::new_multi_thread()... }`
+/// dance verbatim; this helper consolidates them.
+///
+/// Returns `Some(handle)` on ready, `None` on a build failure
+/// (status set on the bridge so the caller just early-returns).
+/// The Runtime itself stays held on `TaskListViewModelRust`
+/// for the view model's lifetime — workers spawn against the
+/// returned Handle clone.
+fn ensure_runtime_handle(
+    mut vm: Pin<&mut qobject::TaskListViewModel>,
+) -> Option<tokio::runtime::Handle> {
+    if vm.as_ref().rust().runtime.is_none() {
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("tasks-sync")
+            .build()
+        {
+            Ok(rt) => vm.as_mut().rust_mut().runtime = Some(rt),
+            Err(e) => {
+                vm.as_mut()
+                    .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
+                return None;
+            }
+        }
+    }
+    Some(
+        vm.as_ref()
+            .rust()
+            .runtime
+            .as_ref()
+            .expect("runtime constructed above")
+            .handle()
+            .clone(),
+    )
+}
+
 fn open_rw_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
     let flags =
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -4473,6 +4437,10 @@ fn reschedule_alarms(mut vm: Pin<&mut qobject::TaskListViewModel>) {
         Some(p) => p,
         None => return,
     };
+    // Notifier runs at debounced background cadence; failure is
+    // logged silently rather than via `set_status`, so this site
+    // doesn't go through `ensure_runtime_handle` (which lights up
+    // the status bar). Otherwise identical builder shape.
     if vm.as_ref().rust().runtime.is_none() {
         match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
