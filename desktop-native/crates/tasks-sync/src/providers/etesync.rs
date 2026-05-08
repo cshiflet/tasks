@@ -328,15 +328,28 @@ impl Provider for EteSyncProvider {
             let col_mgr = account
                 .collection_manager()
                 .map_err(|e| map_err("collection_manager", e))?;
-            let col = col_mgr
-                .fetch(&cal_uid, None)
-                .map_err(|e| map_err("collection.fetch", e))?;
+            // Both the collection and the item may have been
+            // deleted on the server while our local row was
+            // queued for deletion (another client beat us to
+            // it, or the user removed the whole calendar). In
+            // those cases the etebase API surfaces
+            // `Error::NotFound`; treat it as success so the
+            // engine clears `cd_etag` and stops retrying.
+            // Matches the 404 tolerance the CalDAV / Google /
+            // Microsoft providers already had.
+            let col = match col_mgr.fetch(&cal_uid, None) {
+                Ok(c) => c,
+                Err(etebase::error::Error::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(map_err("collection.fetch", e)),
+            };
             let item_mgr = col_mgr
                 .item_manager(&col)
                 .map_err(|e| map_err("item_manager", e))?;
-            let mut item = item_mgr
-                .fetch(&item_uid, None)
-                .map_err(|e| map_err("item.fetch", e))?;
+            let mut item = match item_mgr.fetch(&item_uid, None) {
+                Ok(i) => i,
+                Err(etebase::error::Error::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(map_err("item.fetch", e)),
+            };
             item.delete().map_err(|e| map_err("item.delete", e))?;
             item_mgr
                 .batch(std::iter::once(&item), None)
