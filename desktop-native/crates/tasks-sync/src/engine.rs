@@ -175,56 +175,26 @@ impl<'a> SyncEngine<'a> {
         let conn = open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
         let dirty = load_dirty_tasks(&conn, self.account_filter.as_deref())
             .map_err(|e| SyncError::Local(format!("load dirty: {e}")))?;
-        drop(conn); // Release the write handle before the async round trips.
-
-        let mut pushed = 0usize;
-        let mut conflicts = 0usize;
-        for (task, modified_at_load) in &dirty {
-            match self.provider.push_task(task).await {
-                Ok(new_etag) => {
-                    let conn = open_rw(self.db_path)
-                        .map_err(|e| SyncError::Local(format!("reopen db: {e}")))?;
-                    // Stamp `cd_last_sync` with the modified value
-                    // we read at push-start, not `tasks_core::now_ms()`. If the
-                    // user edited the row mid-push, `tasks.modified`
-                    // is now newer than the snapshot — leaving
-                    // `tasks.modified > cd_last_sync` and re-flagging
-                    // the row as dirty so the next cycle re-pushes
-                    // their edit. Stamping `tasks_core::now_ms()` would silently
-                    // "ack" the concurrent edit and lose it.
-                    record_push_success(
-                        &conn,
-                        &task.remote_id,
-                        new_etag.as_deref(),
-                        *modified_at_load,
-                    )
-                    .map_err(|e| SyncError::Local(format!("stamp etag: {e}")))?;
-                    pushed += 1;
-                }
-                Err(SyncError::Conflict { remote_id, .. }) => {
-                    tracing::warn!("push conflict on {remote_id}; keeping local");
-                    conflicts += 1;
-                }
-                Err(other) => return Err(other),
-            }
-        }
-
-        // Second pass: propagate locally-soft-deleted rows. A row
-        // qualifies when `tasks.deleted > 0` AND it carries a
-        // server-acknowledged `cd_etag` (otherwise it never made
-        // it upstream — nothing to do remotely; the row is just
-        // a local-only stub) AND `cd_deleted = 0` (haven't yet
-        // told the server). On success: stamp `cd_deleted = now`
-        // and clear `cd_etag` so we don't retry. On error: log
-        // at warn and leave the row alone — next cycle retries.
-        // Unlike push_task, individual delete failures don't
-        // abort the rest; transient 5xx / 404 / Network /
-        // Protocol errors all resolve themselves on the next
-        // attempt.
-        let conn = open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
+        // First pass: propagate locally-soft-deleted rows.
+        //
+        // Order: deletes BEFORE pushes. Soft-deletes are atomic
+        // remote-side (no etag dance, no body) and benefit from
+        // running while the rest of the world is still in flight;
+        // pushing first would mean a single transient `Auth` /
+        // `Network` error on a dirty row aborts the whole cycle
+        // and the deletes pile up. A row qualifies when the
+        // local `tasks.deleted` column is non-zero AND it carries
+        // a server-acknowledged `cd_etag` (otherwise it never
+        // made it upstream — nothing to do remotely; the row is
+        // just a local-only stub) AND `cd_deleted` is zero.
+        // On success: stamp `cd_deleted = now` and clear
+        // `cd_etag` so we don't retry. On error: log at warn and
+        // leave the row alone — next cycle retries. Per-row
+        // tolerance applies to both this pass and the dirty
+        // pass below.
         let to_delete = load_locally_deleted_tasks(&conn, self.account_filter.as_deref())
             .map_err(|e| SyncError::Local(format!("load deleted: {e}")))?;
-        drop(conn);
+        drop(conn); // Release the write handle before the async round trips.
         let mut deleted = 0usize;
         for (task_id, calendar_remote_id, remote_id) in &to_delete {
             match self
@@ -245,17 +215,75 @@ impl<'a> SyncEngine<'a> {
                     deleted += 1;
                 }
                 Err(e) => {
-                    // Includes 404 (already gone server-side) —
-                    // we leave the row in place and let the next
-                    // cycle re-attempt; if it really is gone the
-                    // provider will eventually 404 deterministically
-                    // and we'll need a future "treat 404 as
-                    // success" hook. Conservative for now: don't
-                    // lose track of pending deletes on a transient
-                    // failure.
+                    // Per-provider semantics differ: caldav.rs /
+                    // google.rs / microsoft.rs map 404 to Ok(()),
+                    // but etesync.rs (today) wraps every error as
+                    // SyncError::Network including the genuine
+                    // "remote item gone" case. The conservative
+                    // fall-through here means a row genuinely
+                    // gone on EteSync retries forever; the per-
+                    // provider 404-tolerance fix lives separately.
                     tracing::warn!("delete failed for {remote_id} ({calendar_remote_id}): {e}");
                 }
             }
+        }
+
+        // Second pass: dirty-row pushes. Per-row tolerance
+        // matches the delete pass — a transient `Auth` /
+        // `Network` / `Protocol` / `Local` error on one row no
+        // longer aborts the whole cycle, just logs at warn and
+        // moves on. The earlier "abort on first error" behaviour
+        // (Round-2 review's A3) meant a single expired credential
+        // would block every other dirty row from pushing AND
+        // would have blocked the soft-delete pass too — solved
+        // here by reordering deletes-before-pushes plus this
+        // continue-on-error change.
+        let mut pushed = 0usize;
+        let mut conflicts = 0usize;
+        let mut push_failures = 0usize;
+        for (task, modified_at_load) in &dirty {
+            match self.provider.push_task(task).await {
+                Ok(new_etag) => {
+                    let conn = open_rw(self.db_path)
+                        .map_err(|e| SyncError::Local(format!("reopen db: {e}")))?;
+                    // Stamp `cd_last_sync` with the modified value
+                    // we read at push-start, not now_ms(). If the
+                    // user edited the row mid-push, `tasks.modified`
+                    // is now newer than the snapshot — leaving
+                    // `tasks.modified > cd_last_sync` and re-flagging
+                    // the row as dirty so the next cycle re-pushes
+                    // their edit. Stamping now_ms() would silently
+                    // "ack" the concurrent edit and lose it.
+                    if let Err(e) = record_push_success(
+                        &conn,
+                        &task.remote_id,
+                        new_etag.as_deref(),
+                        *modified_at_load,
+                    ) {
+                        tracing::warn!(
+                            "stamp etag failed for {}: {e}; will retry next cycle",
+                            task.remote_id
+                        );
+                        push_failures += 1;
+                        continue;
+                    }
+                    pushed += 1;
+                }
+                Err(SyncError::Conflict { remote_id, .. }) => {
+                    tracing::warn!("push conflict on {remote_id}; keeping local");
+                    conflicts += 1;
+                }
+                Err(other) => {
+                    tracing::warn!(
+                        "push failed for {}: {other}; will retry next cycle",
+                        task.remote_id
+                    );
+                    push_failures += 1;
+                }
+            }
+        }
+        if push_failures > 0 {
+            tracing::warn!("push_dirty: {push_failures} push(es) failed and will retry");
         }
 
         Ok(SyncOutcome {
@@ -1113,6 +1141,11 @@ mod tests {
         /// recording the call. Lets the soft-delete tests exercise
         /// the "leave the row alone for retry" branch.
         delete_error: Option<String>,
+        /// When set, `push_task` returns `SyncError::Auth(_)`
+        /// instead of recording the call. Round-2 review's A3
+        /// — pin that a transient push failure no longer aborts
+        /// the rest of `push_dirty`.
+        push_error: Option<String>,
     }
 
     #[async_trait]
@@ -1133,6 +1166,9 @@ mod tests {
             Ok(Vec::new())
         }
         async fn push_task(&mut self, t: &RemoteTask) -> SyncResult<Option<String>> {
+            if let Some(msg) = &self.push_error {
+                return Err(SyncError::Auth(msg.clone()));
+            }
             self.pushes.lock().unwrap().push(t.clone());
             if self.conflict_on.as_deref() == Some(t.remote_id.as_str()) {
                 Err(SyncError::Conflict {
@@ -1839,5 +1875,33 @@ mod tests {
         let outcome = engine.push_dirty().await.unwrap();
         assert_eq!(outcome.tasks_deleted, 0);
         assert!(deletes.lock().unwrap().is_empty());
+    }
+
+    /// Round-2 review's A3: a transient `Auth` (or any non-
+    /// Conflict) error from `push_task` used to abort
+    /// `push_dirty` mid-loop, skipping the soft-delete pass and
+    /// any unprocessed dirty rows. Pin the new behaviour: the
+    /// delete pass runs first AND completes regardless of any
+    /// dirty-row push failure. The cycle returns Ok(SyncOutcome).
+    #[tokio::test]
+    async fn push_dirty_propagates_deletes_even_when_push_fails() {
+        let (_tmp, db_path) = fresh_db();
+        // One soft-deleted row + one dirty row (seeded by
+        // `seed_dirty_task`).
+        let _del_uid = seed_locally_deleted_task(&db_path);
+        let _dirty_uid = seed_dirty_task(&db_path);
+        let mock = MockWithPushResult {
+            push_error: Some("token expired".into()),
+            ..Default::default()
+        };
+        let deletes = mock.deletes.clone();
+
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        // Critically: push_dirty returns Ok despite the push
+        // failure, and the delete still got through.
+        let outcome = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome.tasks_deleted, 1);
+        assert_eq!(outcome.tasks_pushed, 0);
+        assert_eq!(deletes.lock().unwrap().len(), 1);
     }
 }
