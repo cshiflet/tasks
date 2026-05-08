@@ -2253,14 +2253,24 @@ impl qobject::TaskListViewModel {
                 let _ = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
                     match result {
                         Ok(outcome) => {
-                            set_account_state(
-                                pinned.as_mut(),
-                                &uuid_owned,
-                                &format!(
+                            // Status reads "Synced (N↓ / M↑)" for the
+                            // common case; only mention deletes
+                            // when there were any so the everyday
+                            // sync stays visually quiet.
+                            let summary = if outcome.tasks_deleted > 0 {
+                                format!(
+                                    "Synced ({}↓ / {}↑ / {}🗑)",
+                                    outcome.tasks_pulled,
+                                    outcome.tasks_pushed,
+                                    outcome.tasks_deleted
+                                )
+                            } else {
+                                format!(
                                     "Synced ({}↓ / {}↑)",
                                     outcome.tasks_pulled, outcome.tasks_pushed
-                                ),
-                            );
+                                )
+                            };
+                            set_account_state(pinned.as_mut(), &uuid_owned, &summary);
                             pinned
                                 .as_mut()
                                 .set_status(QString::from(&format!("{label_owned}: Done")));

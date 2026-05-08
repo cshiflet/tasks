@@ -200,6 +200,11 @@ pub struct SyncOutcome {
     pub calendars_pulled: usize,
     pub tasks_pulled: usize,
     pub tasks_pushed: usize,
+    /// Locally-soft-deleted rows the engine successfully pushed
+    /// to the server via `provider.delete_task`. Distinct from
+    /// `tasks_pulled` server-side tombstones (those count as
+    /// "pulled / no-op" rather than "deleted upstream").
+    pub tasks_deleted: usize,
     pub conflicts: usize,
 }
 

@@ -130,6 +130,7 @@ impl<'a> SyncEngine<'a> {
             calendars_pulled: calendars.len(),
             tasks_pulled,
             tasks_pushed: 0,
+            tasks_deleted: 0,
             conflicts: 0,
         })
     }
@@ -184,10 +185,61 @@ impl<'a> SyncEngine<'a> {
                 Err(other) => return Err(other),
             }
         }
+
+        // Second pass: propagate locally-soft-deleted rows. A row
+        // qualifies when `tasks.deleted > 0` AND it carries a
+        // server-acknowledged `cd_etag` (otherwise it never made
+        // it upstream — nothing to do remotely; the row is just
+        // a local-only stub) AND `cd_deleted = 0` (haven't yet
+        // told the server). On success: stamp `cd_deleted = now`
+        // and clear `cd_etag` so we don't retry. On error: log
+        // at warn and leave the row alone — next cycle retries.
+        // Unlike push_task, individual delete failures don't
+        // abort the rest; transient 5xx / 404 / Network /
+        // Protocol errors all resolve themselves on the next
+        // attempt.
+        let conn = open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
+        let to_delete = load_locally_deleted_tasks(&conn, self.account_filter.as_deref())
+            .map_err(|e| SyncError::Local(format!("load deleted: {e}")))?;
+        drop(conn);
+        let mut deleted = 0usize;
+        for (task_id, calendar_remote_id, remote_id) in &to_delete {
+            match self
+                .provider
+                .delete_task(calendar_remote_id, remote_id)
+                .await
+            {
+                Ok(()) => {
+                    let conn = open_rw(self.db_path)
+                        .map_err(|e| SyncError::Local(format!("reopen db: {e}")))?;
+                    if let Err(e) = record_delete_success(&conn, *task_id, now_ms()) {
+                        tracing::warn!(
+                            "delete: stamp cd_deleted failed for {remote_id}: {e}; \
+                             will retry next cycle"
+                        );
+                        continue;
+                    }
+                    deleted += 1;
+                }
+                Err(e) => {
+                    // Includes 404 (already gone server-side) —
+                    // we leave the row in place and let the next
+                    // cycle re-attempt; if it really is gone the
+                    // provider will eventually 404 deterministically
+                    // and we'll need a future "treat 404 as
+                    // success" hook. Conservative for now: don't
+                    // lose track of pending deletes on a transient
+                    // failure.
+                    tracing::warn!("delete failed for {remote_id} ({calendar_remote_id}): {e}");
+                }
+            }
+        }
+
         Ok(SyncOutcome {
             calendars_pulled: 0,
             tasks_pulled: 0,
             tasks_pushed: pushed,
+            tasks_deleted: deleted,
             conflicts,
         })
     }
@@ -201,6 +253,7 @@ impl<'a> SyncEngine<'a> {
             calendars_pulled: pulled.calendars_pulled,
             tasks_pulled: pulled.tasks_pulled,
             tasks_pushed: pushed.tasks_pushed,
+            tasks_deleted: pushed.tasks_deleted,
             conflicts: pushed.conflicts,
         })
     }
@@ -306,6 +359,81 @@ fn load_dirty_tasks(
 /// for passing the `tasks.modified` value it read at load time —
 /// not `now_ms()` — so a concurrent local edit during the push
 /// round-trip leaves the row legitimately dirty for next cycle.
+/// Load every task the user soft-deleted locally that the
+/// server hasn't been told about yet: rows where the local
+/// `tasks.deleted` column is non-zero, the row carries a
+/// server-acknowledged `cd_etag` (otherwise it never made it
+/// upstream and there's nothing to delete remotely), and
+/// `cd_deleted` is still zero (we haven't already propagated
+/// the delete).
+///
+/// Returns `(tasks._id, calendar_remote_id, remote_id)` per row.
+/// The bridge passes `account_filter` so a CalDAV push doesn't
+/// touch Google / Microsoft / Etebase rows.
+fn load_locally_deleted_tasks(
+    conn: &Connection,
+    account_filter: Option<&str>,
+) -> rusqlite::Result<Vec<(i64, String, String)>> {
+    let base = "SELECT t._id, ct.cd_calendar, ct.cd_remote_id \
+                FROM tasks t \
+                JOIN caldav_tasks ct ON ct.cd_task = t._id";
+    let (sql, account_uuid) = match account_filter {
+        Some(uuid) => (
+            format!(
+                "{base} \
+                 JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+                 WHERE t.deleted > 0 \
+                   AND ct.cd_etag IS NOT NULL \
+                   AND ct.cd_deleted = 0 \
+                   AND cl.cdl_account = ?1"
+            ),
+            Some(uuid.to_string()),
+        ),
+        None => (
+            format!(
+                "{base} \
+                 WHERE t.deleted > 0 \
+                   AND ct.cd_etag IS NOT NULL \
+                   AND ct.cd_deleted = 0"
+            ),
+            None,
+        ),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, String, String)> {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    };
+    let mut out = Vec::new();
+    if let Some(ref uuid) = account_uuid {
+        for row in stmt.query_map(params![uuid], map_row)? {
+            out.push(row?);
+        }
+    } else {
+        for row in stmt.query_map([], map_row)? {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// After a successful `provider.delete_task`, mark the row as
+/// fully tombstoned locally so the next push_dirty cycle skips
+/// it. `cd_etag = NULL` breaks any future pull-side assumption
+/// that the server still has the row; `cd_deleted = now` is the
+/// idempotency marker.
+fn record_delete_success(conn: &Connection, task_id: i64, now_ms: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE caldav_tasks SET cd_deleted = ?1, cd_etag = NULL \
+         WHERE cd_task = ?2",
+        params![now_ms, task_id],
+    )?;
+    Ok(())
+}
+
 fn record_push_success(
     conn: &Connection,
     remote_id: &str,
@@ -962,7 +1090,12 @@ mod tests {
     #[derive(Default, Clone)]
     struct MockWithPushResult {
         pushes: Arc<Mutex<Vec<RemoteTask>>>,
+        deletes: Arc<Mutex<Vec<(String, String)>>>,
         conflict_on: Option<String>,
+        /// When set, `delete_task` returns this error instead of
+        /// recording the call. Lets the soft-delete tests exercise
+        /// the "leave the row alone for retry" branch.
+        delete_error: Option<String>,
     }
 
     #[async_trait]
@@ -994,7 +1127,14 @@ mod tests {
                 Ok(Some("etag-new".to_string()))
             }
         }
-        async fn delete_task(&mut self, _c: &str, _id: &str) -> SyncResult<()> {
+        async fn delete_task(&mut self, cal: &str, id: &str) -> SyncResult<()> {
+            if let Some(msg) = &self.delete_error {
+                return Err(SyncError::Network(msg.clone()));
+            }
+            self.deletes
+                .lock()
+                .unwrap()
+                .push((cal.to_string(), id.to_string()));
             Ok(())
         }
         async fn sync_once(&mut self) -> SyncResult<SyncOutcome> {
@@ -1540,5 +1680,147 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_title, "B (edited locally)");
+    }
+
+    /// Seed a task that's been soft-deleted locally and *was*
+    /// previously pushed (so it carries a `cd_etag`). The
+    /// soft-delete-propagation path in push_dirty should pick
+    /// this up.
+    fn seed_locally_deleted_task(db_path: &std::path::Path) -> String {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        // deleted = 100 (any non-zero); mirrors what
+        // toggle_task_completion / delete_selected_task write.
+        conn.execute(
+            "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
+             modified, completed, deleted, estimatedSeconds, elapsedSeconds, \
+             timerStart, notificationFlags, lastNotified, repeat_from, \
+             collapsed, parent, read_only, remoteId) \
+             VALUES ('Goner', 3, 0, 0, 1, 200, 0, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'gone-1')",
+            [],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_etag, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'cal-1', 'gone-1', 'old-etag', 100, 0, 0, 0)",
+            [task_id],
+        )
+        .unwrap();
+        "gone-1".to_string()
+    }
+
+    /// A1: a soft-deleted local row that previously synced should
+    /// be pushed up as a `provider.delete_task` call, then have
+    /// its `cd_deleted` stamped + `cd_etag` cleared so the next
+    /// cycle skips it.
+    #[tokio::test]
+    async fn push_dirty_propagates_local_soft_deletes() {
+        let (_tmp, db_path) = fresh_db();
+        let uid = seed_locally_deleted_task(&db_path);
+        let mock = MockWithPushResult::default();
+        let deletes = mock.deletes.clone();
+
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome.tasks_deleted, 1);
+        assert_eq!(outcome.tasks_pushed, 0); // no live dirty rows seeded.
+
+        // Provider saw exactly the one delete with the right keys.
+        // Snapshot under the lock + drop the guard before any
+        // .await below — clippy's await_holding_lock would
+        // otherwise flag the next push_dirty across a live
+        // MutexGuard.
+        {
+            let seen = deletes.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0], ("cal-1".to_string(), "gone-1".to_string()));
+        }
+
+        // Row stamped: cd_deleted > 0, cd_etag NULL.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (cd_deleted, cd_etag): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT cd_deleted, cd_etag FROM caldav_tasks WHERE cd_remote_id = ?1",
+                [&uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(cd_deleted > 0);
+        assert!(cd_etag.is_none());
+
+        // Second push_dirty is a no-op for this row.
+        let outcome2 = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome2.tasks_deleted, 0);
+    }
+
+    /// A1: when `delete_task` errors (transient network, 5xx),
+    /// the row stays as-is and the next cycle retries. The error
+    /// must NOT abort the rest of push_dirty — other rows in the
+    /// same batch should still process normally.
+    #[tokio::test]
+    async fn push_dirty_retries_failed_deletes_next_cycle() {
+        let (_tmp, db_path) = fresh_db();
+        let uid = seed_locally_deleted_task(&db_path);
+        let mock = MockWithPushResult {
+            delete_error: Some("transient 502 from server".into()),
+            ..Default::default()
+        };
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.push_dirty().await.unwrap();
+        // Engine reports zero deletes — the failure is logged,
+        // not surfaced as an Err that aborts push_dirty.
+        assert_eq!(outcome.tasks_deleted, 0);
+
+        // Row state unchanged: still soft-deleted locally,
+        // cd_deleted = 0, cd_etag still 'old-etag'.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (cd_deleted, cd_etag): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT cd_deleted, cd_etag FROM caldav_tasks WHERE cd_remote_id = ?1",
+                [&uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cd_deleted, 0);
+        assert_eq!(cd_etag.as_deref(), Some("old-etag"));
+    }
+
+    /// A1 boundary: a soft-deleted row that was *never* pushed
+    /// (cd_etag NULL) should NOT be reported to the server —
+    /// there's nothing remote to delete. The local row just
+    /// stays soft-deleted.
+    #[tokio::test]
+    async fn push_dirty_skips_local_only_soft_deletes() {
+        let (_tmp, db_path) = fresh_db();
+        // Seed without cd_etag.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (title, importance, dueDate, hideUntil, created, \
+             modified, completed, deleted, estimatedSeconds, elapsedSeconds, \
+             timerStart, notificationFlags, lastNotified, repeat_from, \
+             collapsed, parent, read_only, remoteId) \
+             VALUES ('Local stub', 3, 0, 0, 1, 200, 0, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'stub-1')",
+            [],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO caldav_tasks \
+             (cd_task, cd_calendar, cd_remote_id, cd_etag, cd_last_sync, cd_deleted, \
+              gt_moved, gt_remote_order) \
+             VALUES (?1, 'cal-1', 'stub-1', NULL, 0, 0, 0, 0)",
+            [task_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mock = MockWithPushResult::default();
+        let deletes = mock.deletes.clone();
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome.tasks_deleted, 0);
+        assert!(deletes.lock().unwrap().is_empty());
     }
 }
