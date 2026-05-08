@@ -22,6 +22,7 @@ sudo apt-get install -y --no-install-recommends \
     cmake \
     curl \
     git \
+    libdbus-1-dev \
     libqt6svg6-dev \
     libsqlite3-dev \
     libssl-dev \
