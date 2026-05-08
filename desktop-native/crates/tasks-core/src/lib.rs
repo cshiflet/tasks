@@ -21,7 +21,7 @@ pub use query::{
 };
 
 pub use datetime::{
-    days_to_ymd, describe_alarm, format_due_label, format_duration_hhmm, parse_due_input,
+    days_to_ymd, describe_alarm, format_due_label, format_duration_hhmm, now_ms, parse_due_input,
     parse_duration_input, ymd_to_days,
 };
 pub use db::{default_db_path, tune_writeback_connection, Database};

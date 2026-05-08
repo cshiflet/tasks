@@ -127,7 +127,7 @@ impl<'a> SyncEngine<'a> {
             // server didn't list this time: tombstone locally.
             // Matches what the Android client does when the
             // remote deletes a task.
-            let now = now_ms();
+            let now = tasks_core::now_ms();
             let removed = tombstone_missing_tasks(&tx, &cal.remote_id, &seen_remote_ids, now)
                 .map_err(|e| SyncError::Local(format!("tombstone: {e}")))?;
             tasks_deleted += removed;
@@ -185,12 +185,12 @@ impl<'a> SyncEngine<'a> {
                     let conn = open_rw(self.db_path)
                         .map_err(|e| SyncError::Local(format!("reopen db: {e}")))?;
                     // Stamp `cd_last_sync` with the modified value
-                    // we read at push-start, not `now_ms()`. If the
+                    // we read at push-start, not `tasks_core::now_ms()`. If the
                     // user edited the row mid-push, `tasks.modified`
                     // is now newer than the snapshot — leaving
                     // `tasks.modified > cd_last_sync` and re-flagging
                     // the row as dirty so the next cycle re-pushes
-                    // their edit. Stamping `now_ms()` would silently
+                    // their edit. Stamping `tasks_core::now_ms()` would silently
                     // "ack" the concurrent edit and lose it.
                     record_push_success(
                         &conn,
@@ -235,7 +235,7 @@ impl<'a> SyncEngine<'a> {
                 Ok(()) => {
                     let conn = open_rw(self.db_path)
                         .map_err(|e| SyncError::Local(format!("reopen db: {e}")))?;
-                    if let Err(e) = record_delete_success(&conn, *task_id, now_ms()) {
+                    if let Err(e) = record_delete_success(&conn, *task_id, tasks_core::now_ms()) {
                         tracing::warn!(
                             "delete: stamp cd_deleted failed for {remote_id}: {e}; \
                              will retry next cycle"
@@ -280,14 +280,6 @@ impl<'a> SyncEngine<'a> {
             conflicts: pushed.conflicts,
         })
     }
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Load every task that needs pushing: a caldav_tasks row whose
@@ -380,7 +372,7 @@ fn load_dirty_tasks(
 /// snapshotted `modified_at_load` value so the next push_dirty
 /// call doesn't re-send the same row. The caller is responsible
 /// for passing the `tasks.modified` value it read at load time —
-/// not `now_ms()` — so a concurrent local edit during the push
+/// not `tasks_core::now_ms()` — so a concurrent local edit during the push
 /// round-trip leaves the row legitimately dirty for next cycle.
 /// Load every task the user soft-deleted locally that the
 /// server hasn't been told about yet: rows where the local
@@ -579,7 +571,7 @@ fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Resu
             |r| r.get(0),
         )
         .optional()?;
-    let now = now_ms();
+    let now = tasks_core::now_ms();
     let chosen_modified = match t.last_modified_ms {
         Some(stamp) => stamp.min(now), // clamp future-dated remote stamps
         None => t.completed_ms.max(t.due_ms).max(1),
@@ -1321,7 +1313,7 @@ mod tests {
         let (_tmp, db_path) = fresh_db();
         // Year 2999 stamp — way past any plausible local clock.
         let future_stamp = 32_503_680_000_000_i64;
-        let before = now_ms();
+        let before = tasks_core::now_ms();
         let mut t = task("u-future", "cal-1", None);
         t.last_modified_ms = Some(future_stamp);
         let mut tasks = HashMap::new();
@@ -1333,7 +1325,7 @@ mod tests {
         };
         let mut engine = SyncEngine::new(&db_path, Box::new(mock));
         engine.pull_all().await.unwrap();
-        let after = now_ms();
+        let after = tasks_core::now_ms();
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let modified: i64 = conn
@@ -1517,10 +1509,10 @@ mod tests {
 
     /// Fix 4: `record_push_success` must stamp `cd_last_sync` with
     /// the `tasks.modified` value snapshotted at push-start, not
-    /// `now_ms()`. If the user edits the row mid-push, the snapshot
+    /// `tasks_core::now_ms()`. If the user edits the row mid-push, the snapshot
     /// is older than the post-edit modified, so the row stays
     /// dirty and gets re-pushed on the next cycle. Stamping
-    /// `now_ms()` would silently ack the concurrent edit and lose
+    /// `tasks_core::now_ms()` would silently ack the concurrent edit and lose
     /// it.
     #[tokio::test]
     async fn push_dirty_uses_modified_snapshot_not_now_for_cd_last_sync() {
@@ -1528,7 +1520,7 @@ mod tests {
         let uid = seed_dirty_task(&db_path);
         // The seed_dirty_task helper writes tasks.modified=100.
         // After a successful push, cd_last_sync should be 100, not
-        // the current wall-clock now_ms() (which is 6+ orders of
+        // the current wall-clock tasks_core::now_ms() (which is 6+ orders of
         // magnitude larger).
         let mock = MockWithPushResult::default();
         let mut engine = SyncEngine::new(&db_path, Box::new(mock));
@@ -1545,7 +1537,7 @@ mod tests {
         assert_eq!(
             last_sync, 100,
             "cd_last_sync should match the modified value read at \
-             load time, not now_ms()"
+             load time, not tasks_core::now_ms()"
         );
     }
 

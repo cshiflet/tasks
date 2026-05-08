@@ -20,6 +20,24 @@
 //! * **Empty ↔ 0**. The tasks table uses `0` to mean "no date";
 //!   `format_due_label(0)` returns an empty string and
 //!   `parse_due_input("")` returns `Ok(0)`.
+//!
+//! Also exposes [`now_ms`] — milliseconds since the Unix epoch
+//! as i64 — the canonical source for the timestamp every other
+//! place in the workspace previously open-coded in five separate
+//! `fn now_ms()` helpers.
+
+/// Milliseconds since the Unix epoch as i64. Saturates at 0 on
+/// the rare clock-before-epoch case so callers don't have to
+/// handle a Result. Behaviour is identical to the inline copies
+/// that used to live in `tasks_sync::engine`, the per-provider
+/// modules, `tasks_ui::bridge`, and `tasks_ui::notifier`.
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Format a millisecond-epoch date as a compact UTC string.
 /// Returns an empty string when `due_ms <= 0` (no date set).

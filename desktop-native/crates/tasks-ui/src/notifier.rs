@@ -78,7 +78,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use tasks_core::models::AlarmType;
@@ -185,7 +185,7 @@ impl AlarmScheduler {
     /// test's "pending_count drained itself" assertion honest
     /// without forcing the caller to re-run `reschedule_all`.
     pub fn reschedule_all(self: &Arc<Self>, runtime: &Handle, db_path: &Path) {
-        let now_ms = now_ms();
+        let now_ms = tasks_core::now_ms();
         let rows = match read_alarms_with_anchors(db_path) {
             Ok(r) => r,
             Err(e) => {
@@ -406,7 +406,7 @@ fn spawn_alarm_task(
             let notifier = Arc::clone(&scheduler.notifier);
             let mut current = schedule;
             loop {
-                let wait_ms = (current.fire_at_ms - now_ms()).max(0) as u64;
+                let wait_ms = (current.fire_at_ms - tasks_core::now_ms()).max(0) as u64;
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 // Look up the task's title + notes on a fresh
                 // read-only handle. This is intentionally a fresh
@@ -510,13 +510,6 @@ fn read_task_for_alarm(
         )
         .ok();
     Ok(row)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -673,7 +666,7 @@ mod tests {
         // future.
         drop(tasks_core::db::Database::open_or_create_read_only(&db_path).unwrap());
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let now = now_ms();
+        let now = tasks_core::now_ms();
         let fire_at = now + 100;
         conn.execute(
             "INSERT INTO tasks (_id, title, notes, importance, dueDate, hideUntil, \
@@ -740,7 +733,7 @@ mod tests {
         let db_path = tmp.path().join("tasks.db");
         drop(tasks_core::db::Database::open_or_create_read_only(&db_path).unwrap());
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let now = now_ms();
+        let now = tasks_core::now_ms();
         conn.execute(
             "INSERT INTO tasks (_id, title, notes, importance, dueDate, hideUntil, \
              created, modified, completed, deleted, estimatedSeconds, elapsedSeconds, \

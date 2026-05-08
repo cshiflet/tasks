@@ -608,7 +608,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
@@ -2530,7 +2530,7 @@ impl qobject::TaskListViewModel {
         };
         let active = self.active_filter_id.to_string();
         let caldav_uuid = active.strip_prefix("caldav:");
-        match tasks_core::create_task(&path, title_trim, now_ms(), caldav_uuid) {
+        match tasks_core::create_task(&path, title_trim, tasks_core::now_ms(), caldav_uuid) {
             Ok(new_id) => {
                 self.as_mut().reload_active_filter();
                 self.as_mut().select_task(new_id);
@@ -2558,7 +2558,7 @@ impl qobject::TaskListViewModel {
                 .set_status(QString::from("No database open; can't mark task."));
             return;
         };
-        match tasks_core::set_task_completion(&path, id, completed, now_ms()) {
+        match tasks_core::set_task_completion(&path, id, completed, tasks_core::now_ms()) {
             Ok(true) => {
                 self.as_mut().reload_active_filter();
                 // reload_active_filter rewrites the status line with a
@@ -2606,7 +2606,7 @@ impl qobject::TaskListViewModel {
                 .set_status(QString::from("No database open; can't delete."));
             return;
         };
-        match tasks_core::set_task_deleted(&path, id, now_ms()) {
+        match tasks_core::set_task_deleted(&path, id, tasks_core::now_ms()) {
             Ok(true) => {
                 clear_detail_pane(self.as_mut());
                 self.as_mut().reload_active_filter();
@@ -2657,7 +2657,7 @@ impl qobject::TaskListViewModel {
                 .set_status(QString::from("No database open; can't undo."));
             return;
         };
-        match tasks_core::set_task_undeleted(&path, id, now_ms()) {
+        match tasks_core::set_task_undeleted(&path, id, tasks_core::now_ms()) {
             Ok(true) => {
                 self.as_mut().set_last_deleted_id(0);
                 self.as_mut().rust_mut().last_deleted_title.clear();
@@ -2928,7 +2928,7 @@ impl qobject::TaskListViewModel {
             recurrence: &recurrence_str,
             repeat_from,
         };
-        match tasks_core::update_task_fields(&path, id, &edit, now_ms()) {
+        match tasks_core::update_task_fields(&path, id, &edit, tasks_core::now_ms()) {
             Ok(true) => {
                 self.as_mut().reload_active_filter();
                 // Refresh the detail pane from the cache that
@@ -2964,7 +2964,7 @@ impl qobject::TaskListViewModel {
             return;
         }
 
-        let now_ms = now_ms();
+        let now_ms = tasks_core::now_ms();
         let offset = current_local_offset_secs();
         let active_id = self.active_filter_id.to_string();
         let search = self.search_query.clone();
@@ -4632,13 +4632,6 @@ fn start_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf) {
             }
         }
     });
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Current process-local UTC offset in seconds, east-positive. Used to

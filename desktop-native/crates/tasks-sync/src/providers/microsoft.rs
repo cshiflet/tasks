@@ -93,7 +93,9 @@ impl MicrosoftToDoProvider {
         let s = guard
             .as_mut()
             .ok_or_else(|| SyncError::Auth("Microsoft To Do: connect() first".into()))?;
-        if s.tokens.needs_refresh(now_ms(), REFRESH_GRACE_MS) {
+        if s.tokens
+            .needs_refresh(tasks_core::now_ms(), REFRESH_GRACE_MS)
+        {
             let refresh = s.tokens.refresh_token.clone().ok_or_else(|| {
                 SyncError::Auth("access token expired and no refresh_token stored".into())
             })?;
@@ -467,7 +469,7 @@ fn parse_token_response(body: &str) -> SyncResult<OAuthTokens> {
         .map_err(|e| SyncError::Protocol(format!("token response JSON: {e}")))?;
     let expires_at_ms = raw
         .expires_in
-        .map(|secs| now_ms() + secs * 1000)
+        .map(|secs| tasks_core::now_ms() + secs * 1000)
         .unwrap_or(0);
     Ok(OAuthTokens {
         // Wrap parsed tokens the moment they leave serde.
@@ -497,14 +499,6 @@ fn check_graph_origin(url: &str) -> SyncResult<()> {
             "off-origin redirect to {host}"
         )))
     }
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 fn classify_http_error(status: StatusCode, body: String, op: &str) -> SyncError {
@@ -548,7 +542,7 @@ mod tests {
             t.refresh_token.as_ref().map(|s| s.expose_secret()),
             Some("RT-1")
         );
-        let target = now_ms() + 3_599_000;
+        let target = tasks_core::now_ms() + 3_599_000;
         assert!((t.expires_at_ms - target).abs() < 5_000);
     }
 

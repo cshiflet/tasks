@@ -304,7 +304,7 @@ impl Provider for CalDavProvider {
         s.trusted_origin.check(&obj_url)?;
 
         let body = {
-            let vtodo = remote_task_to_vtodo(task, now_ms(), None);
+            let vtodo = remote_task_to_vtodo(task, tasks_core::now_ms(), None);
             serialize_vcalendar(&vtodo)
         };
 
@@ -579,14 +579,6 @@ fn parse_hex_color(s: &str) -> Option<i32> {
         bytes
     };
     Some(with_alpha as i32)
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

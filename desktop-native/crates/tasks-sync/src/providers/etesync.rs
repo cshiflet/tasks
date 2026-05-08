@@ -262,11 +262,11 @@ impl Provider for EteSyncProvider {
             // Build the VCALENDAR bytes on the async thread so we
             // don't need to Send the full `&RemoteTask` into the
             // blocking closure.
-            let now_ms = now_ms();
+            let now_ms = tasks_core::now_ms();
             let vtodo = remote_task_to_vtodo(task, now_ms, None);
             serialize_vcalendar(&vtodo).into_bytes()
         };
-        let now_ms = now_ms();
+        let now_ms = tasks_core::now_ms();
 
         tokio::task::spawn_blocking(move || -> SyncResult<Option<String>> {
             let guard = lock_session(&state)?;
@@ -435,14 +435,6 @@ fn parse_hex_color(s: &str) -> Option<i32> {
         bytes
     };
     Some(with_alpha as i32)
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
