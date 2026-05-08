@@ -397,8 +397,13 @@ mod tests {
             let _ = s.read(&mut buf);
         });
 
+        // 5 s deadline (not 2): macOS-latest GH runner is slow
+        // enough that the receive-poll-parse cycle can drift past
+        // 2 s under load. The test still finishes in well under a
+        // second on real hardware; the headroom only matters on
+        // virtualised CI.
         let params = receiver
-            .wait_for_redirect("xyz", Duration::from_secs(2), None)
+            .wait_for_redirect("xyz", Duration::from_secs(5), None)
             .unwrap();
         assert_eq!(params.code, "abc");
         assert_eq!(params.state, "xyz");
@@ -427,8 +432,11 @@ mod tests {
             let mut buf = [0u8; 512];
             let _ = s.read(&mut buf);
         });
+        // 5 s deadline — same race shape as
+        // `wait_for_redirect_parses_callback`; see that test for
+        // why 2 s was tight on the macOS-latest runner.
         let err = receiver
-            .wait_for_redirect("expected", Duration::from_secs(2), None)
+            .wait_for_redirect("expected", Duration::from_secs(5), None)
             .unwrap_err();
         assert!(matches!(err, OAuthError::StateMismatch { .. }));
         handle.join().unwrap();
