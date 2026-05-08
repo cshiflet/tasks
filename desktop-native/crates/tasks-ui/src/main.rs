@@ -20,6 +20,7 @@ use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QUrl};
 mod bridge;
 mod notifier;
 mod preferences;
+mod token_persist;
 
 #[cfg(target_os = "windows")]
 mod win_dark_titlebar;

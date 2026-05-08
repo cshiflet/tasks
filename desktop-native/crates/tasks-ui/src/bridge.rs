@@ -254,6 +254,17 @@ pub mod qobject {
         // copy it into a browser of their choice. Cleared as soon
         // as the loopback receiver consumes the redirect — or
         // times out, whichever comes first.
+        // Stable string identifier of the active credential
+        // storage tier — `"keychain"` (Tier 1, OS-native),
+        // `"encrypted_file"` (Tier 2, AES-256-GCM under
+        // <config_dir>/tasks-desktop/tokens.dat with a key derived
+        // from the machine identifier), or `"in_memory"` (Tier 3
+        // fallback when the other two probes fail; tokens vanish
+        // on restart). The QML pre-flight dialog reads this
+        // before any OAuth or password-account flow so the user
+        // can choose to abort if the tier doesn't match what they
+        // want. Stable for the process lifetime.
+        #[qproperty(QString, credential_storage_tier)]
         #[qproperty(QString, oauth_manual_url)]
         // Account label paired with `oauth_manual_url` so the
         // Dialog can render "Sign in to <label>" without QML having
@@ -744,6 +755,18 @@ pub struct TaskListViewModelRust {
     /// each launch. Disk-backed (libsecret / Keychain / Credential
     /// Manager) is the follow-up tracked in PLAN_UPDATES §11.
     token_store: Arc<dyn tasks_sync::TokenStore>,
+    /// Same-tier secret store for non-OAuth account passwords
+    /// (CalDAV / EteSync). Tier is determined by
+    /// `crate::token_persist::StorageTier::probe`; this Arc and
+    /// `token_store` above always come from the same probe call.
+    secret_store: Arc<dyn crate::token_persist::SecretStore>,
+    /// Stable string identifier of the active storage tier
+    /// (`"keychain"` / `"encrypted_file"` / `"in_memory"`),
+    /// surfaced to QML via the `credentialStorageTier` Q_PROPERTY
+    /// for the pre-flight warning dialog. QString rather than
+    /// `String` so cxx-qt can mirror the field directly without
+    /// an extra getter.
+    credential_storage_tier: QString,
     /// Per-CalDAV-list pref overrides keyed by `cdl_uuid`. Held
     /// in memory + serialised through `preferences.json` in
     /// `persist_prefs`. The active filter merges these over the
@@ -774,6 +797,14 @@ impl Default for TaskListViewModelRust {
         // missing / malformed file falls back to the struct's
         // own defaults.
         let saved = crate::preferences::Preferences::load();
+        // Probe credential storage tier *once* on view-model
+        // construction. The chosen Arcs back both OAuth tokens
+        // and CalDAV / EteSync passwords; the tier name flows to
+        // QML so the pre-flight warning dialog can describe what
+        // the user is actually getting.
+        let (probed_tier, probed_token_store, probed_secret_store) =
+            crate::token_persist::StorageTier::probe();
+        let probed_tier_name = probed_tier.as_str().to_string();
         TaskListViewModelRust {
             count: 0,
             titles: QStringList::default(),
@@ -872,7 +903,9 @@ impl Default for TaskListViewModelRust {
             auto_sync_stop: None,
             oauth_stop: None,
             runtime: None,
-            token_store: Arc::new(tasks_sync::InMemoryTokenStore::new()),
+            token_store: probed_token_store,
+            secret_store: probed_secret_store,
+            credential_storage_tier: QString::from(&probed_tier_name),
             list_overrides: saved.list_overrides.clone(),
             last_sidebar_refresh: None,
             pending_sidebar_refresh: false,
@@ -1199,6 +1232,26 @@ impl qobject::TaskListViewModel {
             _ => unreachable!("kind validated above"),
         };
         if let Some(path) = self.db_path.clone() {
+            // Stash the password in the persistent secret store
+            // (keychain / encrypted file / in-memory depending on
+            // tier) and write an empty cda_password column. If the
+            // secret-store write fails, fall back to the column so
+            // sync still works in the degraded case — better than
+            // silently dropping the credential.
+            let stored_in_store = self
+                .as_ref()
+                .rust()
+                .secret_store
+                .put_secret(&uuid, &password_s)
+                .is_ok();
+            let column_value = if stored_in_store {
+                String::new()
+            } else {
+                tracing::warn!(
+                    "secret store write failed for {uuid}; falling back to cda_password"
+                );
+                password_s.clone()
+            };
             let res = open_rw_conn(&path).and_then(|conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO caldav_accounts \
@@ -1210,7 +1263,7 @@ impl qobject::TaskListViewModel {
                         label_s,
                         server_s,
                         username_s,
-                        password_s,
+                        column_value,
                         cda_account_type,
                     ],
                 )
@@ -1276,6 +1329,20 @@ impl qobject::TaskListViewModel {
         let removed = self.as_mut().rust_mut().accounts.remove(idx);
         if idx < self.account_states.len() {
             self.as_mut().rust_mut().account_states.remove(idx);
+        }
+        // Best-effort drop of the persisted password (and any
+        // OAuth tokens) for this account; ignore errors so a
+        // stale keychain entry can't block UI removal.
+        let _ = self
+            .as_ref()
+            .rust()
+            .secret_store
+            .delete_secret(&removed.uuid);
+        for pk in [
+            tasks_sync::ProviderKind::GoogleTasks,
+            tasks_sync::ProviderKind::MicrosoftToDo,
+        ] {
+            let _ = self.as_ref().rust().token_store.delete(pk, &removed.uuid);
         }
         if let Some(path) = self.db_path.clone() {
             if let Ok(mut conn) = open_rw_conn(&path) {
@@ -3064,7 +3131,10 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
             // EteSync (5) are reachable from here today; OAuth
             // providers stay invisible until their sign-in flow
             // lands.
-            let loaded = load_password_accounts(&db);
+            let loaded = {
+                let secret_store = Arc::clone(&vm.as_ref().rust().secret_store);
+                load_password_accounts(&db, secret_store.as_ref())
+            };
             {
                 let mut inner = vm.as_mut().rust_mut();
                 inner.account_states = vec![String::from("Idle"); loaded.len()];
@@ -3322,13 +3392,21 @@ fn current_caldav_meta_for(db: &Database, task_id: i64) -> (String, i32) {
 
 /// Load every sync-capable `caldav_accounts` row into the bridge's
 /// in-memory `accounts` list so the Accounts pane reflects whatever
-/// the DB carries — both rows the user added in a prior session and
-/// rows brought in by the JSON-import path. OAuth providers
-/// (kinds 6 / 7) appear here too; their tokens are session-local
-/// (`InMemoryTokenStore`), so on a fresh launch the row materialises
-/// without tokens and `sync_account` will surface
-/// "Re-sign-in required" until the user re-runs the OAuth flow.
-fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
+/// the DB carries. Passwords are fetched from `secret_store` first
+/// (the post-keychain-batch canonical storage); we fall back to the
+/// `cda_password` column when the store has nothing — so accounts
+/// authored on Android (which still writes the column) keep working,
+/// and a degraded in-memory store at Tier 3 doesn't lose the column
+/// value across a single launch.
+///
+/// OAuth providers (kinds 6 / 7) carry no password; their tokens
+/// are tracked separately in `token_store`. A fresh launch with
+/// no persisted tokens still surfaces "Re-sign-in required" via
+/// `sync_account` until the user re-runs the OAuth flow.
+fn load_password_accounts(
+    db: &Database,
+    secret_store: &dyn crate::token_persist::SecretStore,
+) -> Vec<StoredAccount> {
     let mut out = Vec::new();
     let Ok(mut stmt) = db.connection().prepare(
         "SELECT cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_account_type \
@@ -3350,7 +3428,7 @@ fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
     });
     if let Ok(rows) = rows {
         for row in rows.flatten() {
-            let (uuid, name, url, username, password, kind_in_db) = row;
+            let (uuid, name, url, username, column_password, kind_in_db) = row;
             let Some(uuid) = uuid else { continue };
             // Map cda_account_type back onto the bridge's KIND_*
             // integers (which match `tasks_sync::ProviderKind` for
@@ -3362,13 +3440,17 @@ fn load_password_accounts(db: &Database) -> Vec<StoredAccount> {
                 7 => KIND_GOOGLE_TASKS,
                 _ => continue,
             };
+            let password = match secret_store.get_secret(&uuid) {
+                Some(s) if !s.is_empty() => s,
+                _ => column_password.unwrap_or_default(),
+            };
             out.push(StoredAccount {
                 uuid,
                 kind,
                 label: name.unwrap_or_default(),
                 server: url.unwrap_or_default(),
                 username: username.unwrap_or_default(),
-                password: SecretString::from(password.unwrap_or_default()),
+                password: SecretString::from(password),
             });
         }
     }

@@ -61,6 +61,25 @@ reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"
 # call-site, and notification failures are logged + swallowed so a
 # flaky daemon can't take the app down.
 notify-rust = "4"
+# OS keychain wrapper for the OAuth token store (Tier 1).
+# Backends: secret-service (libsecret) on Linux, NSKeychain on
+# macOS, Credential Manager on Windows. The crate exposes a
+# uniform Entry::set_password / get_password API and surfaces
+# unavailability (no D-Bus session, etc.) as an Err we fall
+# through to the Tier-2 encrypted-file store on.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "sync-secret-service"] }
+# AES-256-GCM for the Tier-2 encrypted-file token store. The key
+# is HKDF-derived from a per-machine identifier + an app salt; we
+# never persist the key, only re-derive it on each launch.
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+# Stable per-machine identifier feeding the HKDF in the Tier-2
+# store. `/etc/machine-id` on Linux, IORegistry UUID on macOS,
+# MachineGuid on Windows; the crate handles the per-OS lookup.
+machine-uid = "0.5"
+# Cryptographically-random nonces for the Tier-2 GCM frames.
+getrandom = "0.2"
 
 # The Win32 dark-title-bar shim is implemented with bare
 # `extern "system"` declarations in `src/win_dark_titlebar.rs` —
