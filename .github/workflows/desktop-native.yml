@@ -170,7 +170,14 @@ jobs:
           fi
 
   check-windows:
-    runs-on: windows-latest
+    # Pinned to windows-2022 (MSVC 2019). `windows-latest` is
+    # mid-migration to windows-2025 / VS 2026, and our cached
+    # Qt 6.6.3 binary is built against win64_msvc2019_64 — the
+    # 2026-05-08 runner-image roll surfaced as Install-Qt-Action
+    # failing 24 s into the job, immediately after a cache hit
+    # for the msvc2019 build. Revisit when install-qt-action
+    # ships a Qt 6 build for the new toolchain.
+    runs-on: windows-2022
     defaults:
       run:
         working-directory: desktop-native
