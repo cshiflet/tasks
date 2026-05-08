@@ -121,14 +121,38 @@ desktop-native/
 
 ## Dev loop details
 
+### Linker speedup (Linux only)
+
+The workspace ships a `desktop-native/.cargo/config.toml` that
+swaps the linker on Linux x86_64 to **clang + mold**. Default
+GNU `ld` dominates the wall-clock on touch-and-rebuild cycles
+for the ~8K-LOC bridge crate; mold links the same binary in
+~100 ms vs several seconds. Real-world: a touched-`main.rs`
+relink drops from ~30 s to ~4 s.
+
+`apt install clang mold` is in the bare-Ubuntu setup script
+and the Dockerfile.dev — no extra step needed if you followed
+those. macOS / Windows builds aren't affected (the config is
+gated to `[target.x86_64-unknown-linux-gnu]`).
+
+If you'd rather not use mold (debugging linker output, etc.),
+delete the `.cargo/config.toml` for your local checkout — Cargo
+falls back to the default linker. Don't commit the deletion.
+
 ### Fast inner loop
 
 ```sh
 # pick ONE of these depending on what you touched
+cargo check                      # type-check only; 3-10× faster than build
 cargo test -p tasks-core         # no Qt needed; ~1 s rebuild
 cargo test --workspace           # also recompiles cxx-qt; slower
 cargo run  -p tasks-ui -- --cli fixtures.db   # smoke the data layer
 ```
+
+`cargo check` skips codegen + linking; use it when you're just
+chasing a type / borrow-check error. `cargo build` (or
+`cargo run`) is needed before `cargo run --bin tasks-desktop`
+since check doesn't produce a binary.
 
 ### CI parity (runs the same thing `.github/workflows/desktop-native.yml` does)
 
