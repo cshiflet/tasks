@@ -291,19 +291,24 @@ fn caldav_parent_query(calendar_uuid: &str) -> String {
 /// colons into the UID) without admitting quote/space/semicolon
 /// chars that have no business in a canonical UUID.
 fn is_plausible_caldav_uuid(s: &str) -> bool {
-    // The CalDAV provider in `tasks-sync` stores the full calendar
-    // URL as `cdl_uuid` (it doubles as the FK from
-    // `caldav_tasks.cd_calendar` and as the URL the next REPORT /
-    // PUT call resolves against). That URL can be ~120 chars on
-    // iCloud / Fastmail, so the cap goes to 256, and `/` is added
-    // to the allow-list. The single-quote escape immediately below
-    // is the actual SQL-injection guard; this character check is
-    // belt-and-braces against future write paths that drop URLs of
-    // a less-trusted shape.
+    // `cdl_uuid` carries three flavours of identifier today:
+    //   * RFC 4122 UUID (Radicale, Nextcloud, Fastmail, iCloud) —
+    //     letters / digits / hyphen.
+    //   * Full calendar URL (CalDAV providers that store URLs as
+    //     the canonical id) — adds `/`, `:`, `.`, `@`.
+    //   * Provider-opaque base64-ish id (Microsoft Graph
+    //     todoTaskList, Google Tasks list) — adds `+` and `=`
+    //     for Microsoft's standard-base64 padding plus general
+    //     URL-safe-base64 characters Google emits.
+    // The single-quote escape immediately below is the actual
+    // SQL-injection guard; this character check is belt-and-
+    // braces against future write paths that drop ids of a
+    // less-trusted shape.
     !s.is_empty()
         && s.len() <= 256
         && s.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'@' | b'/')
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'-' | b'_' | b'.' | b':' | b'@' | b'/' | b'+' | b'=')
         })
 }
 
@@ -321,6 +326,21 @@ mod caldav_uuid_tests {
         assert!(is_plausible_caldav_uuid("AB12CD34EF56"));
         // Fastmail-style dotted id.
         assert!(is_plausible_caldav_uuid("cal.user-name.home"));
+        // CalDAV calendar URL (Radicale / Nextcloud / Fastmail).
+        assert!(is_plausible_caldav_uuid(
+            "https://example.com:5232/user/test/calendar-id/"
+        ));
+        // Microsoft Graph todoTaskList id — base64-padded with =,
+        // contains _ and -. Real-world shape that previously
+        // tripped the shape check and yielded the empty-result
+        // sidebar bug.
+        assert!(is_plausible_caldav_uuid(
+            "AQMkADAwATM3ZmYAZS04OTQyLTNhMzAtMDACLTAwCgAuAAADQ_aOqL6oUaNMJ04hkvHkYEAB-uqH9KUO9cy8YwfrXxDnxsAAAIBDgAAAA=="
+        ));
+        // Google Tasks tasklist id — URL-safe base64.
+        assert!(is_plausible_caldav_uuid("MDA0NTk0NjEzNzQyOTUxMzg2OTM6MDow"));
+        // Standard base64 with + (Microsoft also uses this).
+        assert!(is_plausible_caldav_uuid("a+b/c=="));
     }
 
     #[test]
