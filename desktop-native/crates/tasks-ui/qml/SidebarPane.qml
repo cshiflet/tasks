@@ -450,6 +450,31 @@ Pane {
                                 && root.vm.accountSyncStates
                                 && (root.vm.accountSyncStates[_accountIndex] || "")
                                        .startsWith("Re-sign-in")
+                            // Live string view of the per-account
+                            // state. The handler below fires on
+                            // every transition; a transition into
+                            // a "Synced …" string flips
+                            // `_justSucceeded` true for 3 s so a
+                            // green checkmark briefly overlays the
+                            // sync icon.
+                            readonly property string _currentState:
+                                _accountIndex >= 0
+                                && root.vm
+                                && root.vm.accountSyncStates
+                                ? (root.vm.accountSyncStates[_accountIndex] || "")
+                                : ""
+                            property bool _justSucceeded: false
+                            onCurrentStateChanged: {
+                                if (_currentState.startsWith("Synced")) {
+                                    _justSucceeded = true;
+                                    successTimer.restart();
+                                }
+                            }
+                            Timer {
+                                id: successTimer
+                                interval: 3000
+                                onTriggered: rowSyncButton._justSucceeded = false
+                            }
                             ToolTip.text: _needsReauth
                                 ? qsTr("Re-sign-in required for %1").arg(row.myLabel)
                                 : qsTr("Sync %1").arg(row.myLabel)
@@ -533,6 +558,36 @@ Pane {
                                     // Repaint when the visibility flips
                                     // so the X disappears cleanly after
                                     // a successful re-sign-in.
+                                    onVisibleChanged: requestPaint()
+                                }
+                                // Success overlay — green ✓ painted on
+                                // top of the refresh glyph for 3 s
+                                // after each successful sync. Mutually
+                                // exclusive with the failure X (the
+                                // re-auth state can't transition into
+                                // "Synced" without a successful re-sign-
+                                // in clearing it first).
+                                Canvas {
+                                    anchors.fill: parent
+                                    visible: rowSyncButton._justSucceeded
+                                            && !rowSyncButton._needsReauth
+                                    onPaint: {
+                                        const ctx = getContext("2d");
+                                        ctx.reset();
+                                        ctx.lineWidth = 2.2;
+                                        ctx.lineCap = "round";
+                                        ctx.lineJoin = "round";
+                                        ctx.strokeStyle = "#2e7d32"; // success-green
+                                        // Two-segment ✓: short up-stroke
+                                        // from lower-left through the
+                                        // mid-bottom corner, long up-
+                                        // stroke to the upper-right.
+                                        ctx.beginPath();
+                                        ctx.moveTo(width * 0.22, height * 0.55);
+                                        ctx.lineTo(width * 0.43, height * 0.78);
+                                        ctx.lineTo(width * 0.80, height * 0.30);
+                                        ctx.stroke();
+                                    }
                                     onVisibleChanged: requestPaint()
                                 }
                             }
