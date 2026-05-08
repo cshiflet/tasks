@@ -52,7 +52,7 @@ ColumnLayout {
         opacity: 0.6
         font.pointSize: Qt.application.font.pointSize - 1
         text: qsTr("Defaults applied to every list view. Right-click a list " +
-                   "in the sidebar to override these for that list (coming soon).")
+                   "in the sidebar → List settings… to override these for that list.")
     }
 
     GridLayout {

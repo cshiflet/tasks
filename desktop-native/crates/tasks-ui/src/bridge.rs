@@ -299,6 +299,48 @@ pub mod qobject {
             completed_at_bottom: bool,
         );
 
+        /// Apply per-list query-pref overrides for the CalDAV list
+        /// keyed on `cdl_uuid`. Negative values for the int-typed
+        /// fields (`sort_mode`) and the special tri-state values
+        /// for the bool-typed fields (-1 = inherit) signal "no
+        /// override; fall back to the global default". Persisted
+        /// to `preferences.json` and merged over the global
+        /// QueryPreferences in `reload_active_filter`.
+        ///
+        /// `sort_mode_set` / `sort_ascending_set` / etc. are the
+        /// matching booleans that flip a field between "set" and
+        /// "inherit"; QML passes false to clear a single field
+        /// without resetting the whole row.
+        #[qinvokable]
+        fn update_list_override(
+            self: Pin<&mut TaskListViewModel>,
+            uuid: QString,
+            sort_mode: i32,
+            sort_mode_set: bool,
+            sort_ascending: bool,
+            sort_ascending_set: bool,
+            show_completed: bool,
+            show_completed_set: bool,
+            show_hidden: bool,
+            show_hidden_set: bool,
+            completed_at_bottom: bool,
+            completed_at_bottom_set: bool,
+        );
+
+        /// Drop every per-list override for `uuid`. The list goes
+        /// back to inheriting the global defaults verbatim. Idempotent.
+        #[qinvokable]
+        fn clear_list_override(self: Pin<&mut TaskListViewModel>, uuid: QString);
+
+        /// Look up a list's override values for the QML edit
+        /// dialog to prefill. Returns 5 strings packed into a
+        /// QStringList: `[sort_mode, sort_ascending, show_completed,
+        /// show_hidden, completed_at_bottom]`. Each entry is either
+        /// `""` (inherit) or the stringified value (e.g. `"1"` /
+        /// `"true"`). Called once per dialog open.
+        #[qinvokable]
+        fn list_override_for(self: Pin<&mut TaskListViewModel>, uuid: QString) -> QStringList;
+
         /// Update + persist the appearance theme (0=System, 1=Light, 2=Dark).
         /// QML calls this from Settings → General → Appearance.
         #[qinvokable]
@@ -702,6 +744,13 @@ pub struct TaskListViewModelRust {
     /// each launch. Disk-backed (libsecret / Keychain / Credential
     /// Manager) is the follow-up tracked in PLAN_UPDATES §11.
     token_store: Arc<dyn tasks_sync::TokenStore>,
+    /// Per-CalDAV-list pref overrides keyed by `cdl_uuid`. Held
+    /// in memory + serialised through `preferences.json` in
+    /// `persist_prefs`. The active filter merges these over the
+    /// global defaults in `reload_active_filter` so individual
+    /// lists can carry their own sort / show-completed / etc.
+    /// without churning the SQLite schema.
+    list_overrides: std::collections::HashMap<String, crate::preferences::ListOverride>,
     /// Throttle bookkeeping for `refresh_sidebar`. A burst of
     /// in-process mutation triggers (account-add, list-rename, sync
     /// completion, …) used to fan out as one full rebuild per call;
@@ -824,6 +873,7 @@ impl Default for TaskListViewModelRust {
             oauth_stop: None,
             runtime: None,
             token_store: Arc::new(tasks_sync::InMemoryTokenStore::new()),
+            list_overrides: saved.list_overrides.clone(),
             last_sidebar_refresh: None,
             pending_sidebar_refresh: false,
             notifier: Arc::new(crate::notifier::AlarmScheduler::new()),
@@ -962,6 +1012,93 @@ impl qobject::TaskListViewModel {
             .set_pref_completed_at_bottom(completed_at_bottom);
         persist_prefs(self.as_ref().get_ref());
         self.as_mut().reload_active_filter();
+    }
+
+    /// Set / unset per-list query-pref overrides for the CalDAV
+    /// list keyed on `uuid`. Each pref has a paired `_set`
+    /// boolean: `true` writes the value, `false` clears the
+    /// override on that field (back to the global default). When
+    /// every field ends up cleared the map entry is removed.
+    pub fn update_list_override(
+        mut self: Pin<&mut Self>,
+        uuid: QString,
+        sort_mode: i32,
+        sort_mode_set: bool,
+        sort_ascending: bool,
+        sort_ascending_set: bool,
+        show_completed: bool,
+        show_completed_set: bool,
+        show_hidden: bool,
+        show_hidden_set: bool,
+        completed_at_bottom: bool,
+        completed_at_bottom_set: bool,
+    ) {
+        let key = uuid.to_string();
+        if key.is_empty() {
+            return;
+        }
+        let mut o = self
+            .as_ref()
+            .rust()
+            .list_overrides
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        o.sort_mode = sort_mode_set.then_some(sort_mode);
+        o.sort_ascending = sort_ascending_set.then_some(sort_ascending);
+        o.show_completed = show_completed_set.then_some(show_completed);
+        o.show_hidden = show_hidden_set.then_some(show_hidden);
+        o.completed_at_bottom = completed_at_bottom_set.then_some(completed_at_bottom);
+        {
+            let mut inner = self.as_mut().rust_mut();
+            if o.is_empty() {
+                inner.list_overrides.remove(&key);
+            } else {
+                inner.list_overrides.insert(key, o);
+            }
+        }
+        persist_prefs(self.as_ref().get_ref());
+        self.as_mut().reload_active_filter();
+    }
+
+    /// Drop every override for `uuid`. Idempotent.
+    pub fn clear_list_override(mut self: Pin<&mut Self>, uuid: QString) {
+        let key = uuid.to_string();
+        if key.is_empty() {
+            return;
+        }
+        let removed = self.as_mut().rust_mut().list_overrides.remove(&key);
+        if removed.is_some() {
+            persist_prefs(self.as_ref().get_ref());
+            self.as_mut().reload_active_filter();
+        }
+    }
+
+    /// Return the override values for `uuid` as a parallel
+    /// QStringList: each entry is `""` (inherit) or the stringified
+    /// value the dialog should prefill.
+    pub fn list_override_for(self: Pin<&mut Self>, uuid: QString) -> QStringList {
+        let key = uuid.to_string();
+        let o = self.as_ref().rust().list_overrides.get(&key).cloned();
+        let mut list: QList<QString> = QList::default();
+        let push = |list: &mut QList<QString>, v: Option<String>| {
+            list.append(QString::from(&v.unwrap_or_default()));
+        };
+        match o {
+            Some(o) => {
+                push(&mut list, o.sort_mode.map(|v| v.to_string()));
+                push(&mut list, o.sort_ascending.map(|v| v.to_string()));
+                push(&mut list, o.show_completed.map(|v| v.to_string()));
+                push(&mut list, o.show_hidden.map(|v| v.to_string()));
+                push(&mut list, o.completed_at_bottom.map(|v| v.to_string()));
+            }
+            None => {
+                for _ in 0..5 {
+                    list.append(QString::default());
+                }
+            }
+        }
+        QStringList::from(&list)
     }
 
     /// Apply + persist the appearance theme override.
@@ -2462,7 +2599,14 @@ impl qobject::TaskListViewModel {
         let offset = current_local_offset_secs();
         let active_id = self.active_filter_id.to_string();
         let search = self.search_query.clone();
-        let prefs = self.preferences.clone();
+        // Merge per-list overrides over the global defaults when
+        // the active filter is a CalDAV list. Other filters
+        // (Today / All / saved) just use the global defaults.
+        let prefs = if let Some(uuid) = active_id.strip_prefix("caldav:") {
+            merge_list_override(self.preferences.clone(), self.list_overrides.get(uuid))
+        } else {
+            self.preferences.clone()
+        };
         // Borrow `db` immutably for the duration of the query, then drop
         // the borrow before any `rust_mut()` call below. `db` lives on
         // `self` (no extra open), so repeated filter navigations reuse
@@ -3752,8 +3896,29 @@ fn persist_prefs(vm: &qobject::TaskListViewModel) {
         window_y: vm.window_y,
         window_maximized: vm.window_maximized,
         notifications_enabled: vm.notifications_enabled,
+        list_overrides: vm.list_overrides.clone(),
     };
     prefs.save();
+}
+
+/// Merge a list's [`ListOverride`] over the global query
+/// preferences. Returns `base` unchanged when no override is
+/// present.
+fn merge_list_override(
+    base: tasks_core::QueryPreferences,
+    o: Option<&crate::preferences::ListOverride>,
+) -> tasks_core::QueryPreferences {
+    let Some(o) = o else { return base };
+    tasks_core::QueryPreferences {
+        sort_mode: o.sort_mode.unwrap_or(base.sort_mode),
+        sort_ascending: o.sort_ascending.unwrap_or(base.sort_ascending),
+        show_completed: o.show_completed.unwrap_or(base.show_completed),
+        show_hidden: o.show_hidden.unwrap_or(base.show_hidden),
+        completed_tasks_at_bottom: o
+            .completed_at_bottom
+            .unwrap_or(base.completed_tasks_at_bottom),
+        ..base
+    }
 }
 
 /// Ensure the bridge's tokio Runtime is up, then ask the alarm

@@ -12,9 +12,47 @@
 //! failure logs at warn but never panics. The on-disk format is
 //! intentionally easy to inspect by hand.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// Per-CalDAV-list overrides for the global default query
+/// preferences. Each field is `Option<...>`; `None` means
+/// "inherit the global default at the same name". A list with
+/// no entry in [`Preferences::list_overrides`] inherits every
+/// field. Reset-to-defaults is removing the entry.
+///
+/// Stored in our own `preferences.json` rather than a SQLite
+/// column so we don't have to bump the pinned Room schema or
+/// fight Android's idea of per-list prefs (Android's same
+/// feature lives in a different table that lands after our
+/// pinned v92).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_mode: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_ascending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_bottom: Option<bool>,
+}
+
+impl ListOverride {
+    /// True when every field is `None` — the override is a no-op
+    /// and `Preferences::save` should drop the map entry.
+    pub fn is_empty(&self) -> bool {
+        self.sort_mode.is_none()
+            && self.sort_ascending.is_none()
+            && self.show_completed.is_none()
+            && self.show_hidden.is_none()
+            && self.completed_at_bottom.is_none()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
@@ -51,6 +89,11 @@ pub struct Preferences {
     /// surfaces it as "Show OS notifications for task reminders".
     #[serde(default = "default_true")]
     pub notifications_enabled: bool,
+    /// Per-CalDAV-list query-pref overrides, keyed on the list's
+    /// `cdl_uuid`. Missing key → inherit every field from the
+    /// global defaults above. See [`ListOverride`].
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub list_overrides: HashMap<String, ListOverride>,
 }
 
 fn default_true() -> bool {
@@ -80,6 +123,7 @@ impl Default for Preferences {
             window_y: 0,
             window_maximized: false,
             notifications_enabled: true,
+            list_overrides: HashMap::new(),
         }
     }
 }

@@ -593,8 +593,139 @@ Pane {
                                         : "");
                             }
                         }
+                        MenuItem {
+                            text: qsTr("List settings…")
+                            onTriggered: {
+                                listSettingsDialog.openFor(
+                                    row.myLabel,
+                                    row.myId.startsWith("caldav:")
+                                        ? row.myId.slice("caldav:".length)
+                                        : "");
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    // Per-list query-pref override editor. Reuses the same
+    // controls as Settings → List defaults but writes to the
+    // per-list override map keyed by `cdl_uuid`. Each row has a
+    // checkbox that toggles whether that field overrides the
+    // global default; unchecked = inherit. Open via right-click
+    // on a CalDAV list → List settings…
+    Dialog {
+        id: listSettingsDialog
+        title: qsTr("List settings — %1").arg(_listLabel)
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Ok | Dialog.Cancel | Dialog.Reset
+        property string _listUuid: ""
+        property string _listLabel: ""
+
+        // Sort modes mirror SortHelper integers; index in the
+        // ComboBox maps via the `_sortMapping` array. Same shape
+        // as ListSettingsPane.qml.
+        readonly property var _sortMapping: [0, 1, 2, 3, 4, 5, 8]
+
+        function _sortIndexFor(mode) {
+            for (let i = 0; i < _sortMapping.length; i++) {
+                if (_sortMapping[i] === mode) { return i; }
+            }
+            return 0;
+        }
+
+        function openFor(label, uuid) {
+            if (!uuid) { return; }
+            _listLabel = label;
+            _listUuid = uuid;
+            const arr = root.vm ? root.vm.listOverrideFor(uuid) : ["", "", "", "", ""];
+            // Each entry is "" (inherit) or stringified value.
+            const sm = arr[0]; const sa = arr[1]; const sc = arr[2];
+            const sh = arr[3]; const cb = arr[4];
+            sortOverride.checked = sm.length > 0;
+            sortBox.currentIndex = sm.length > 0 ? _sortIndexFor(parseInt(sm)) : _sortIndexFor(root.vm ? (root.vm.prefSortMode | 0) : 0);
+            ascOverride.checked = sa.length > 0;
+            ascBox.currentIndex = sa.length > 0 ? (sa === "true" ? 0 : 1) : (root.vm && root.vm.prefSortAscending ? 0 : 1);
+            completedOverride.checked = sc.length > 0;
+            completedBox.checked = sc.length > 0 ? (sc === "true") : (root.vm ? root.vm.prefShowCompleted : false);
+            hiddenOverride.checked = sh.length > 0;
+            hiddenBox.checked = sh.length > 0 ? (sh === "true") : (root.vm ? root.vm.prefShowHidden : false);
+            bottomOverride.checked = cb.length > 0;
+            bottomBox.checked = cb.length > 0 ? (cb === "true") : (root.vm ? root.vm.prefCompletedAtBottom : false);
+            open();
+        }
+
+        onAccepted: {
+            if (!root.vm || !_listUuid) { return; }
+            const sortMode = _sortMapping[sortBox.currentIndex] ?? 0;
+            root.vm.updateListOverride(
+                _listUuid,
+                sortMode,                  sortOverride.checked,
+                ascBox.currentIndex === 0, ascOverride.checked,
+                completedBox.checked,      completedOverride.checked,
+                hiddenBox.checked,         hiddenOverride.checked,
+                bottomBox.checked,         bottomOverride.checked);
+        }
+        onReset: {
+            if (!root.vm || !_listUuid) { return; }
+            root.vm.clearListOverride(_listUuid);
+            close();
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                text: qsTr("Tick a row to override the global default for this list. Unticked rows inherit Settings → List defaults.")
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                font.pointSize: Qt.application.font.pointSize - 1
+            }
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 3
+                columnSpacing: 8
+                rowSpacing: 6
+
+                CheckBox { id: sortOverride; text: qsTr("Sort by") }
+                CompactComboBox {
+                    id: sortBox
+                    Layout.fillWidth: true
+                    enabled: sortOverride.checked
+                    model: [
+                        qsTr("Due date"),
+                        qsTr("Start date"),
+                        qsTr("Importance"),
+                        qsTr("Alphabetical"),
+                        qsTr("Modified"),
+                        qsTr("Created"),
+                        qsTr("Manual"),
+                    ]
+                }
+                Item { Layout.fillWidth: true }
+
+                CheckBox { id: ascOverride; text: qsTr("Direction") }
+                CompactComboBox {
+                    id: ascBox
+                    Layout.fillWidth: true
+                    enabled: ascOverride.checked
+                    model: [ qsTr("Ascending"), qsTr("Descending") ]
+                }
+                Item { Layout.fillWidth: true }
+
+                CheckBox { id: completedOverride; text: qsTr("Show completed") }
+                CheckBox { id: completedBox; enabled: completedOverride.checked }
+                Item { Layout.fillWidth: true }
+
+                CheckBox { id: hiddenOverride; text: qsTr("Show hidden") }
+                CheckBox { id: hiddenBox; enabled: hiddenOverride.checked }
+                Item { Layout.fillWidth: true }
+
+                CheckBox { id: bottomOverride; text: qsTr("Completed at bottom") }
+                CheckBox { id: bottomBox; enabled: bottomOverride.checked }
+                Item { Layout.fillWidth: true }
             }
         }
     }
