@@ -147,8 +147,15 @@ impl<'a> SyncEngine<'a> {
             parent_links,
             tasks_deleted,
         );
-        let _ = tasks_deleted; // (exposed through tracing; SyncOutcome
-                               // doesn't carry a deletions counter yet)
+        // `tasks_deleted` here counts server-side tombstones the
+        // engine applied locally (rows the server told us are
+        // gone). `SyncOutcome::tasks_deleted` represents the
+        // opposite direction — locally soft-deleted rows we
+        // successfully pushed up via `delete_task` — and is
+        // populated by `push_dirty`. Keep them separate so the
+        // status line's "K🗑" badge means "the user's deletes
+        // reached the server" rather than "the server has new
+        // tombstones for us."
         Ok(SyncOutcome {
             calendars_pulled: calendars.len(),
             tasks_pulled,

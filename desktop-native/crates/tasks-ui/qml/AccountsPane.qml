@@ -150,7 +150,9 @@ ScrollView {
                     }
                     // Per-account sync state badge — populated from
                     // `account_sync_states[index]` ("Idle",
-                    // "Syncing…", "Synced (N↓ / M↑)", "Failed: …").
+                    // "Syncing…", "Synced (N↓ / M↑)" or
+                    // "Synced (N↓ / M↑ / K🗑)" when the cycle
+                    // pushed soft-deletes upstream, "Failed: …").
                     // Hidden while idle so the row stays clean.
                     Label {
                         visible: pane.vm

@@ -231,7 +231,10 @@ pub fn tune_writeback_connection(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// so IO errors on the parent dir don't get silently swallowed.
+/// Reject any `path` that points at a symlink so a malicious
+/// link can't redirect our open into another file (L-5). IO
+/// errors on the parent dir surface as `CoreError::Io` rather
+/// than getting silently swallowed.
 ///
 /// `symlink_metadata` does NOT follow symlinks — that's the whole
 /// point; it reports on the link itself.

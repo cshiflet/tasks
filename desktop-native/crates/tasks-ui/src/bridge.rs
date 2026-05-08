@@ -455,15 +455,13 @@ pub mod qobject {
         );
 
         /// Persist a password-auth sync account (CalDAV or EteSync)
-        /// to the in-memory accounts list and re-emit the Q_PROPERTY
+        /// to the user's account list and re-emit the Q_PROPERTY
         /// arrays the Accounts pane binds to. `kind` must be 0
         /// (CalDAV) or 3 (EteSync); other values are rejected on the
         /// status line. Empty required fields are also rejected.
-        ///
-        /// Session-local only for now — neither the account list nor
-        /// the password survives a restart. OS-native keychain
-        /// storage (libsecret / Keychain / Credential Manager) is
-        /// the follow-up tracked in PLAN_UPDATES §11.
+        /// The password is sealed into the active credential store
+        /// (keyring → encrypted file → in-memory, in that priority
+        /// order) so it survives a restart on the chosen tier.
         #[qinvokable]
         fn add_password_account(
             self: Pin<&mut TaskListViewModel>,
@@ -639,21 +637,17 @@ const KIND_MICROSOFT_TODO: i32 = 2;
 const KIND_ETESYNC: i32 = 3;
 
 /// Non-Qt account record. `password` is held on the Rust side only
-/// so it never crosses the FFI boundary into QML. Cleared when the
-/// view model is dropped; OS-native keychain storage lands with the
-/// follow-up tracked in PLAN_UPDATES §11.
-///
-/// `password` is captured but not yet consumed — the SyncEngine
-/// wiring is the next commit. Silencing dead_code until then so the
-/// type signature stays stable across the two commits.
+/// so it never crosses the FFI boundary into QML. The persistent
+/// copy lives in the active credential store (keyring →
+/// encrypted file → in-memory); the in-memory `SecretString` here
+/// is the working copy the SyncEngine consumes during a sync.
 ///
 /// `password` is wrapped in [`SecretString`] (M-1) so it zeroes on
 /// drop and can't be accidentally Debug-printed alongside the rest
-/// of the struct. Its single consumer — the future SyncEngine
-/// handoff — exposes the inner value only at the FFI boundary via
+/// of the struct. Its single consumer — the SyncEngine handoff —
+/// exposes the inner value only at the FFI boundary via
 /// `.expose_secret()`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct StoredAccount {
     /// `caldav_accounts.cda_uuid` of the row this StoredAccount
     /// represents. Generated when the account is added via the
@@ -810,10 +804,11 @@ pub struct TaskListViewModelRust {
     /// lifetime of the view model.
     runtime: Option<tokio::runtime::Runtime>,
     /// OAuth tokens for Google / Microsoft accounts, keyed on
-    /// `(ProviderKind, cda_uuid)`. In-memory only today — tokens
-    /// don't survive a restart, so the user has to re-sign-in on
-    /// each launch. Disk-backed (libsecret / Keychain / Credential
-    /// Manager) is the follow-up tracked in PLAN_UPDATES §11.
+    /// `(ProviderKind, cda_uuid)`. The concrete implementation is
+    /// chosen by `StorageTier::probe`: keyring (libsecret /
+    /// Keychain / Credential Manager) when available, falling
+    /// back to an AES-256-GCM-encrypted file under the user's
+    /// data dir, then to in-memory as a last resort.
     token_store: Arc<dyn tasks_sync::TokenStore>,
     /// Same-tier secret store for non-OAuth account passwords
     /// (CalDAV / EteSync). Tier is determined by
