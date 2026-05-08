@@ -172,11 +172,13 @@ impl<'a> SyncEngine<'a> {
     ///
     /// On success, the returned etag is stamped back onto
     /// `cd_etag` + `cd_last_sync`. A
-    /// [`SyncError::Conflict`] from the provider is caught,
-    /// recorded against the task, and the loop continues with the
-    /// remaining rows — one conflict shouldn't block unrelated
-    /// pushes. Callers get a total count of conflicts via
-    /// [`SyncOutcome::conflicts`].
+    /// [`SyncError::Conflict`] from the provider is logged at
+    /// warn, counted into [`SyncOutcome::conflicts`], and the
+    /// row is left dirty for the next cycle — one conflict
+    /// shouldn't block unrelated pushes, and the user resolves
+    /// it by editing locally or accepting the server version on
+    /// the next pull. Conflicts on the delete pass roll up into
+    /// the same counter.
     pub async fn push_dirty(&mut self) -> SyncResult<SyncOutcome> {
         self.ensure_connected().await?;
         let conn = open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
@@ -203,6 +205,7 @@ impl<'a> SyncEngine<'a> {
             .map_err(|e| SyncError::Local(format!("load deleted: {e}")))?;
         drop(conn); // Release the write handle before the async round trips.
         let mut deleted = 0usize;
+        let mut delete_conflicts = 0usize;
         for (task_id, calendar_remote_id, remote_id, etag) in &to_delete {
             match self
                 .provider
@@ -221,15 +224,31 @@ impl<'a> SyncEngine<'a> {
                     }
                     deleted += 1;
                 }
+                Err(SyncError::Conflict {
+                    remote_id: rid,
+                    server_message,
+                    ..
+                }) => {
+                    // CalDAV's If-Match returned 412: a third
+                    // party edited the row server-side after our
+                    // local soft-delete was queued. Don't bulldoze
+                    // — leave `cd_etag` and `cd_deleted` alone so
+                    // the next pull refreshes the etag and the
+                    // user can re-issue the delete (or accept
+                    // the server version) consciously. Counted
+                    // into `outcome.conflicts` so the status line
+                    // reflects the unresolved state.
+                    tracing::info!(
+                        "delete conflict on {rid}: third-party edit; \
+                         leaving local row for next cycle. server: {server_message}"
+                    );
+                    delete_conflicts += 1;
+                }
                 Err(e) => {
-                    // Per-provider semantics differ: caldav.rs /
-                    // google.rs / microsoft.rs map 404 to Ok(()),
-                    // but etesync.rs (today) wraps every error as
-                    // SyncError::Network including the genuine
-                    // "remote item gone" case. The conservative
-                    // fall-through here means a row genuinely
-                    // gone on EteSync retries forever; the per-
-                    // provider 404-tolerance fix lives separately.
+                    // All providers now map 404 / NotFound to
+                    // Ok(()); anything reaching this arm is a
+                    // genuine transient (Auth / Network /
+                    // Protocol) that the next cycle retries.
                     tracing::warn!("delete failed for {remote_id} ({calendar_remote_id}): {e}");
                 }
             }
@@ -298,7 +317,12 @@ impl<'a> SyncEngine<'a> {
             tasks_pulled: 0,
             tasks_pushed: pushed,
             tasks_deleted: deleted,
-            conflicts,
+            // Both push-side and delete-side conflicts roll up
+            // into a single counter; the status-line semantics
+            // ("there are N rows the user needs to look at") are
+            // the same. The log line on each branch carries the
+            // per-row context if the user wants more.
+            conflicts: conflicts + delete_conflicts,
         })
     }
 
@@ -1157,11 +1181,21 @@ mod tests {
     struct MockWithPushResult {
         pushes: Arc<Mutex<Vec<RemoteTask>>>,
         deletes: Arc<Mutex<Vec<(String, String)>>>,
+        /// Parallel to `deletes`, records the `etag: Option<&str>`
+        /// the engine passed to each delete_task call. Round-3
+        /// review's D-R3-2 wants the engine's `cd_etag` -> CalDAV
+        /// `If-Match` plumbing covered without an HTTP harness.
+        delete_etags: Arc<Mutex<Vec<Option<String>>>>,
         conflict_on: Option<String>,
         /// When set, `delete_task` returns this error instead of
         /// recording the call. Lets the soft-delete tests exercise
         /// the "leave the row alone for retry" branch.
         delete_error: Option<String>,
+        /// When set, `delete_task` returns `SyncError::Conflict`
+        /// targeting this remote_id — the 412 case the engine
+        /// must NOT collapse into a transient warning. Round-3
+        /// review's B-R3-5 fix.
+        delete_conflict_on: Option<String>,
         /// When set, `push_task` returns `SyncError::Auth(_)`
         /// instead of recording the call. Round-2 review's A3
         /// — pin that a transient push failure no longer aborts
@@ -1201,12 +1235,21 @@ mod tests {
                 Ok(Some("etag-new".to_string()))
             }
         }
-        async fn delete_task(
-            &mut self,
-            cal: &str,
-            id: &str,
-            _etag: Option<&str>,
-        ) -> SyncResult<()> {
+        async fn delete_task(&mut self, cal: &str, id: &str, etag: Option<&str>) -> SyncResult<()> {
+            // Record the etag the engine threaded down BEFORE
+            // any conditional return so the test can assert on
+            // it in both Ok and Err branches.
+            self.delete_etags
+                .lock()
+                .unwrap()
+                .push(etag.map(str::to_string));
+            if self.delete_conflict_on.as_deref() == Some(id) {
+                return Err(SyncError::Conflict {
+                    remote_id: id.to_string(),
+                    local: etag.map(str::to_string),
+                    server_message: "third party edited".into(),
+                });
+            }
             if let Some(msg) = &self.delete_error {
                 return Err(SyncError::Network(msg.clone()));
             }
@@ -1934,5 +1977,68 @@ mod tests {
         assert_eq!(outcome.tasks_deleted, 1);
         assert_eq!(outcome.tasks_pushed, 0);
         assert_eq!(deletes.lock().unwrap().len(), 1);
+    }
+
+    /// Round-3 review's D-R3-2: pin that the engine threads
+    /// `caldav_tasks.cd_etag` into `provider.delete_task` as the
+    /// etag arg. Without this, the CalDAV `If-Match` plumbing
+    /// (A6) is unreachable.
+    #[tokio::test]
+    async fn push_dirty_threads_cd_etag_into_delete_task() {
+        let (_tmp, db_path) = fresh_db();
+        // seed_locally_deleted_task hard-codes cd_etag = 'old-etag'.
+        let _uid = seed_locally_deleted_task(&db_path);
+        let mock = MockWithPushResult::default();
+        let etags = mock.delete_etags.clone();
+
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome.tasks_deleted, 1);
+        let seen = etags.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].as_deref(), Some("old-etag"));
+    }
+
+    /// Round-3 review's B-R3-5 / D-R3-1: a 412 from
+    /// `provider.delete_task` (CalDAV's If-Match precondition
+    /// fired because a third party edited the row server-side)
+    /// must NOT silently overwrite the remote edit on the next
+    /// cycle. The engine counts it into `outcome.conflicts`,
+    /// leaves `cd_etag` and `cd_deleted` alone (so the next
+    /// pull refreshes the etag and the user gets a chance to
+    /// re-issue the delete consciously), and the cycle still
+    /// returns Ok.
+    #[tokio::test]
+    async fn push_dirty_surfaces_delete_conflict_without_clearing_state() {
+        let (_tmp, db_path) = fresh_db();
+        let uid = seed_locally_deleted_task(&db_path);
+        let mock = MockWithPushResult {
+            delete_conflict_on: Some(uid.clone()),
+            ..Default::default()
+        };
+        let deletes = mock.deletes.clone();
+
+        let mut engine = SyncEngine::new(&db_path, Box::new(mock));
+        let outcome = engine.push_dirty().await.unwrap();
+        assert_eq!(outcome.tasks_deleted, 0);
+        assert_eq!(outcome.conflicts, 1);
+        // The conflict short-circuits before the success-record
+        // path, so `deletes` (which records only successful
+        // calls in this mock) stays empty.
+        assert!(deletes.lock().unwrap().is_empty());
+
+        // Row state is preserved for the next cycle: cd_deleted
+        // still 0, cd_etag still 'old-etag'. The next pull will
+        // refresh cd_etag and the user can re-issue the delete.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (cd_deleted, cd_etag): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT cd_deleted, cd_etag FROM caldav_tasks WHERE cd_remote_id = ?1",
+                [&uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cd_deleted, 0);
+        assert_eq!(cd_etag.as_deref(), Some("old-etag"));
     }
 }

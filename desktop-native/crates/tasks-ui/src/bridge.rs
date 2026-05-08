@@ -214,9 +214,10 @@ pub mod qobject {
         // → Accounts pane. `account_kinds` is the integer tag
         //   0 = CalDAV, 1 = Google Tasks, 2 = Microsoft To Do, 3 = EteSync
         // matching `tasks_sync::ProviderKind`. Server + username are
-        // blank for OAuth providers (they come from the eventual
-        // token store); passwords are held in-memory only on the Rust
-        // side and never exposed as a Q_PROPERTY.
+        // blank for OAuth providers (they come from the active
+        // token store); passwords flow through the secret store
+        // (keyring / encrypted file / in-memory depending on tier)
+        // and are never exposed as a Q_PROPERTY.
         #[qproperty(QStringList, account_labels)]
         #[qproperty(QList_i32, account_kinds)]
         #[qproperty(QStringList, account_servers)]
@@ -1251,8 +1252,21 @@ impl qobject::TaskListViewModel {
         // same OS-level store (keychain entry / encrypted file
         // path / in-memory map keyed by service name).
         let current_tier_str = self.credential_storage_tier.to_string();
+        let current_choice_str = self.credential_storage_choice.to_string();
         let from_tokens = Arc::clone(&self.as_ref().rust().token_store);
         let from_secrets = Arc::clone(&self.as_ref().rust().secret_store);
+
+        // Pure no-op: same resolved tier AND same user-visible
+        // choice string. Avoids re-writing preferences.json on
+        // every settings-pane click that resolves to the same
+        // value. Distinct from the tier-name compare below
+        // because two different choices ("auto" + "keychain")
+        // can resolve to the same tier; in that case we still
+        // want to persist the user-visible choice update so
+        // next launch's probe takes the same path.
+        if current_tier_str == new_tier_name && current_choice_str == new_choice {
+            return;
+        }
 
         if current_tier_str != new_tier_name {
             // Snapshot the bits the migration loop needs without
@@ -1373,10 +1387,14 @@ impl qobject::TaskListViewModel {
         let uuid = uuid::Uuid::new_v4().to_string();
 
         // Persist into `caldav_accounts` so the bridge's sync path
-        // (and future restarts) can find this row by uuid. This is
-        // a session-local DB write; the password lands in plaintext
-        // for now, mirroring how the JSON import stores it. OS-
-        // keychain integration is tracked in PLAN_UPDATES §11.
+        // (and future restarts) can find this row by uuid. The
+        // password itself is sealed into the active credential
+        // store (keyring → encrypted file → in-memory, in that
+        // probe order); the column gets a blank string. If the
+        // store write fails we fall back to writing the password
+        // into the column (logged at warn) so sync isn't dropped
+        // outright — this is the same legacy fallback path that
+        // `migrate_legacy_passwords` reverses on next launch.
         let cda_account_type = match kind {
             KIND_CALDAV => 0,  // tasks_core::AccountType::CALDAV
             KIND_ETESYNC => 5, // tasks_core::AccountType::ETEBASE
@@ -1453,8 +1471,7 @@ impl qobject::TaskListViewModel {
             inner.account_states.push(String::from("Idle"));
         }
         publish_accounts(self.as_mut());
-        self.as_mut()
-            .set_status(QString::from("Account saved (session-local)."));
+        self.as_mut().set_status(QString::from("Account saved."));
         // First sync immediately so the sidebar populates without
         // a manual click. sync_account is non-blocking (spawns a
         // worker thread) so the QML add-form returns instantly.
@@ -4934,6 +4951,65 @@ mod tests {
             secret_store.get_secret("uuid-1").as_deref(),
             Some("already-here")
         );
+    }
+
+    /// Round-3 review's D-R3-3 / A-R3-2: when `put_secret`
+    /// fails outright, the function MUST NOT blank the
+    /// `cda_password` column. The "store the credential, then
+    /// drop the plaintext" pair has to be all-or-nothing,
+    /// otherwise a read-only secret-store would silently lose
+    /// the user's password on first migration. (The genuine
+    /// "put-OK-then-UPDATE-fails" rollback is exercised by
+    /// code-review against the function body — simulating it
+    /// from outside requires racing two SQLite connections,
+    /// which is too fragile for unit tests; the SecretStore
+    /// trait has no async hook a fake can use to fail
+    /// mid-call.)
+    #[test]
+    fn migrate_legacy_passwords_keeps_column_when_put_secret_fails() {
+        struct AlwaysFailingSecretStore;
+        impl SecretStore for AlwaysFailingSecretStore {
+            fn put_secret(
+                &self,
+                _account_uuid: &str,
+                _secret: &str,
+            ) -> Result<(), tasks_sync::TokenStoreError> {
+                Err(tasks_sync::TokenStoreError::Backend(
+                    "simulated keychain unavailable".into(),
+                ))
+            }
+            fn get_secret(&self, _account_uuid: &str) -> Option<String> {
+                None
+            }
+            fn delete_secret(
+                &self,
+                _account_uuid: &str,
+            ) -> Result<(), tasks_sync::TokenStoreError> {
+                Ok(())
+            }
+        }
+
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "still-here")]);
+        let secret_store = AlwaysFailingSecretStore;
+        let accounts = vec![stored("uuid-1", "still-here")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 0);
+
+        // Column NOT blanked — the legacy fallback in
+        // `load_password_accounts` keeps the row usable for
+        // sync. Without this guarantee, a transient keychain
+        // outage on first launch would silently strand the
+        // user's password.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let column: String = conn
+            .query_row(
+                "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, "still-here");
     }
 
     /// When both the column AND the store hold a value, the
