@@ -761,6 +761,14 @@ pub struct TaskListViewModelRust {
     /// without round-tripping through QStringList (cxx-qt 0.7
     /// doesn't expose an index setter on QStringList).
     account_states: Vec<String>,
+    /// Set of `cda_uuid`s with a sync currently running. The
+    /// previous re-entrancy guard keyed on the literal string
+    /// `"Syncing…"` in `account_states`; a future i18n pass
+    /// wrapping that with `qsTr` would silently let concurrent
+    /// syncs stack and fight for the SQLite write lock.
+    /// Membership in this HashSet is the canonical signal —
+    /// state strings are display-only.
+    syncs_in_flight: std::collections::HashSet<String>,
     // H-6: last-deleted-task pinning for the undo flow. The id
     // crosses FFI as a Q_PROPERTY (so QML can show / hide the
     // Undo button); the title stays Rust-side because nothing in
@@ -943,6 +951,7 @@ impl Default for TaskListViewModelRust {
             account_sync_states: QStringList::default(),
             accounts: Vec::new(),
             account_states: Vec::new(),
+            syncs_in_flight: std::collections::HashSet::new(),
             last_deleted_id: 0,
             last_deleted_title: String::new(),
             status: QString::default(),
@@ -2059,20 +2068,23 @@ impl qobject::TaskListViewModel {
             return;
         };
         // Same-account re-entrancy guard: if a sync against this
-        // account is already in flight, drop the new request silently.
-        // Auto-trigger paths (task create / edit / delete +
-        // periodic timer) can fire several times in a row; without
-        // this guard they'd stack as concurrent syncs that fight
-        // for the same SQLite write lock.
-        if self
-            .account_states
-            .get(idx)
-            .map(String::as_str)
-            .unwrap_or("")
-            == "Syncing…"
-        {
+        // account is already in flight, drop the new request
+        // silently. Auto-trigger paths (task create / edit /
+        // delete + periodic timer) can fire several times in a
+        // row; without this guard they'd stack as concurrent
+        // syncs that fight for the same SQLite write lock.
+        // Keyed on `syncs_in_flight` (HashSet&lt;cda_uuid&gt;) rather
+        // than the display-only `account_states` string — the
+        // latter is going to flow through `qsTr` for i18n at
+        // some point and the literal "Syncing…" comparison
+        // would silently break.
+        if self.syncs_in_flight.contains(&uuid) {
             return;
         }
+        self.as_mut()
+            .rust_mut()
+            .syncs_in_flight
+            .insert(uuid.clone());
         let stored = self.accounts[idx].clone();
         let Some(db_path) = self.db_path.clone() else {
             self.as_mut()
@@ -2251,6 +2263,17 @@ impl qobject::TaskListViewModel {
                     engine.sync_now().await
                 });
                 let _ = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    // Drop the in-flight marker before we
+                    // dispatch any further state updates — the
+                    // re-entrancy guard at the top of
+                    // sync_account checks this set, and a panic
+                    // / early-return below should still leave
+                    // the slot reusable.
+                    pinned
+                        .as_mut()
+                        .rust_mut()
+                        .syncs_in_flight
+                        .remove(&uuid_owned);
                     match result {
                         Ok(outcome) => {
                             // Status reads "Synced (N↓ / M↑)" for the

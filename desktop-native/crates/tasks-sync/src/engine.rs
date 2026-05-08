@@ -41,6 +41,13 @@ pub struct SyncEngine<'a> {
     /// errors. `None` means "every dirty row" — kept for the
     /// engine's own integration tests.
     account_filter: Option<String>,
+    /// True after the first successful `provider.connect()` of
+    /// this engine's lifetime. Subsequent calls to `pull_all` /
+    /// `push_dirty` skip the connect, so `sync_now` doesn't pay
+    /// for two `connect()`s per cycle (CalDAV PROPFIND ×2,
+    /// EteSync re-login, etc.). Reset is intentionally absent:
+    /// re-connecting requires a fresh engine.
+    connected: bool,
 }
 
 impl<'a> SyncEngine<'a> {
@@ -49,6 +56,7 @@ impl<'a> SyncEngine<'a> {
             db_path,
             provider,
             account_filter: None,
+            connected: false,
         }
     }
 
@@ -63,13 +71,28 @@ impl<'a> SyncEngine<'a> {
             db_path,
             provider,
             account_filter: Some(account_uuid.into()),
+            connected: false,
         }
+    }
+
+    /// Idempotent provider connect. Lazy: first call dispatches
+    /// `provider.connect()` and flips `self.connected` on success;
+    /// subsequent calls are a no-op. Used by both `pull_all` and
+    /// `push_dirty` so a `sync_now` (which calls both) only pays
+    /// for one round-trip.
+    async fn ensure_connected(&mut self) -> SyncResult<()> {
+        if self.connected {
+            return Ok(());
+        }
+        self.provider.connect().await?;
+        self.connected = true;
+        Ok(())
     }
 
     /// Connect + pull every calendar's tasks. Returns the count of
     /// rows pulled. Does not push.
     pub async fn pull_all(&mut self) -> SyncResult<SyncOutcome> {
-        self.provider.connect().await?;
+        self.ensure_connected().await?;
         let calendars = self.provider.list_calendars().await?;
 
         let mut conn =
@@ -148,7 +171,7 @@ impl<'a> SyncEngine<'a> {
     /// pushes. Callers get a total count of conflicts via
     /// [`SyncOutcome::conflicts`].
     pub async fn push_dirty(&mut self) -> SyncResult<SyncOutcome> {
-        self.provider.connect().await?;
+        self.ensure_connected().await?;
         let conn = open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
         let dirty = load_dirty_tasks(&conn, self.account_filter.as_deref())
             .map_err(|e| SyncError::Local(format!("load dirty: {e}")))?;
