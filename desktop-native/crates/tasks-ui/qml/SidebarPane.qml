@@ -404,7 +404,11 @@ Pane {
                             Layout.preferredWidth: 28
                             Layout.preferredHeight: 28
                             ToolTip.visible: hovered
-                            ToolTip.text: qsTr("Sync %1").arg(row.myLabel)
+                            // Tooltip text is bound to the per-account
+                            // state below (`_needsReauth`); a single
+                            // assignment swaps between "Sync …" and
+                            // "Re-sign-in required for …" as the state
+                            // changes.
                             // Stop propagation so the click doesn't
                             // also collapse/expand the section.
                             onClicked: {
@@ -435,53 +439,101 @@ Pane {
                                 && root.vm
                                 && root.vm.accountSyncStates
                                 && root.vm.accountSyncStates[_accountIndex] === "Syncing…"
-                            contentItem: Canvas {
-                                id: rowSyncIcon
+                            // True when the bridge has flagged this
+                            // account as needing re-sign-in (OAuth
+                            // tokens missing or refresh-token failed).
+                            // Drives the X overlay below + lights up
+                            // the per-account "Re-sign in…" menu item.
+                            readonly property bool _needsReauth:
+                                _accountIndex >= 0
+                                && root.vm
+                                && root.vm.accountSyncStates
+                                && (root.vm.accountSyncStates[_accountIndex] || "")
+                                       .startsWith("Re-sign-in")
+                            ToolTip.text: _needsReauth
+                                ? qsTr("Re-sign-in required for %1").arg(row.myLabel)
+                                : qsTr("Sync %1").arg(row.myLabel)
+                            contentItem: Item {
                                 implicitWidth: 18
                                 implicitHeight: 18
-                                RotationAnimation on rotation {
-                                    running: rowSyncButton._syncing
-                                    from: 0; to: 360
-                                    duration: 900
-                                    loops: Animation.Infinite
+                                Canvas {
+                                    id: rowSyncIcon
+                                    anchors.fill: parent
+                                    // Dim the refresh glyph when the
+                                    // X overlay is present so the
+                                    // failure state reads as the
+                                    // dominant signal.
+                                    opacity: rowSyncButton._needsReauth ? 0.45 : 1.0
+                                    RotationAnimation on rotation {
+                                        running: rowSyncButton._syncing
+                                        from: 0; to: 360
+                                        duration: 900
+                                        loops: Animation.Infinite
+                                    }
+                                    onPaint: {
+                                        // Same two-arc refresh glyph the
+                                        // command-bar button uses, scaled
+                                        // down for the sidebar row height.
+                                        const ctx = getContext("2d");
+                                        ctx.reset();
+                                        ctx.lineWidth = 1.4;
+                                        ctx.lineCap = "round";
+                                        ctx.lineJoin = "round";
+                                        ctx.strokeStyle = rowSyncButton.Material.foreground;
+                                        ctx.fillStyle = rowSyncButton.Material.foreground;
+                                        const cx = width / 2;
+                                        const cy = height / 2;
+                                        const r = Math.min(width, height) / 2 - 2;
+                                        ctx.beginPath();
+                                        ctx.arc(cx, cy, r, -Math.PI * 0.4, Math.PI * 0.4);
+                                        ctx.stroke();
+                                        ctx.beginPath();
+                                        ctx.arc(cx, cy, r, Math.PI * 0.6, Math.PI * 1.4);
+                                        ctx.stroke();
+                                        const head = 2.5;
+                                        const xR = cx + r * Math.cos(Math.PI * 0.4);
+                                        const yR = cy + r * Math.sin(Math.PI * 0.4);
+                                        ctx.beginPath();
+                                        ctx.moveTo(xR, yR);
+                                        ctx.lineTo(xR - head, yR - head * 0.6);
+                                        ctx.lineTo(xR + head * 0.4, yR - head);
+                                        ctx.closePath();
+                                        ctx.fill();
+                                        const xL = cx + r * Math.cos(Math.PI * 1.4);
+                                        const yL = cy + r * Math.sin(Math.PI * 1.4);
+                                        ctx.beginPath();
+                                        ctx.moveTo(xL, yL);
+                                        ctx.lineTo(xL + head, yL + head * 0.6);
+                                        ctx.lineTo(xL - head * 0.4, yL + head);
+                                        ctx.closePath();
+                                        ctx.fill();
+                                    }
                                 }
-                                onPaint: {
-                                    // Same two-arc refresh glyph the
-                                    // command-bar button uses, scaled
-                                    // down for the sidebar row height.
-                                    const ctx = getContext("2d");
-                                    ctx.reset();
-                                    ctx.lineWidth = 1.4;
-                                    ctx.lineCap = "round";
-                                    ctx.lineJoin = "round";
-                                    ctx.strokeStyle = rowSyncButton.Material.foreground;
-                                    ctx.fillStyle = rowSyncButton.Material.foreground;
-                                    const cx = width / 2;
-                                    const cy = height / 2;
-                                    const r = Math.min(width, height) / 2 - 2;
-                                    ctx.beginPath();
-                                    ctx.arc(cx, cy, r, -Math.PI * 0.4, Math.PI * 0.4);
-                                    ctx.stroke();
-                                    ctx.beginPath();
-                                    ctx.arc(cx, cy, r, Math.PI * 0.6, Math.PI * 1.4);
-                                    ctx.stroke();
-                                    const head = 2.5;
-                                    const xR = cx + r * Math.cos(Math.PI * 0.4);
-                                    const yR = cy + r * Math.sin(Math.PI * 0.4);
-                                    ctx.beginPath();
-                                    ctx.moveTo(xR, yR);
-                                    ctx.lineTo(xR - head, yR - head * 0.6);
-                                    ctx.lineTo(xR + head * 0.4, yR - head);
-                                    ctx.closePath();
-                                    ctx.fill();
-                                    const xL = cx + r * Math.cos(Math.PI * 1.4);
-                                    const yL = cy + r * Math.sin(Math.PI * 1.4);
-                                    ctx.beginPath();
-                                    ctx.moveTo(xL, yL);
-                                    ctx.lineTo(xL + head, yL + head * 0.6);
-                                    ctx.lineTo(xL - head * 0.4, yL + head);
-                                    ctx.closePath();
-                                    ctx.fill();
+                                // Failure overlay — small red X painted
+                                // on top of the (dimmed) refresh glyph
+                                // when the bridge has flagged this
+                                // account as needing re-sign-in.
+                                Canvas {
+                                    anchors.fill: parent
+                                    visible: rowSyncButton._needsReauth
+                                    onPaint: {
+                                        const ctx = getContext("2d");
+                                        ctx.reset();
+                                        ctx.lineWidth = 2.0;
+                                        ctx.lineCap = "round";
+                                        ctx.strokeStyle = "#c62828";
+                                        const m = 4;
+                                        ctx.beginPath();
+                                        ctx.moveTo(m, m);
+                                        ctx.lineTo(width - m, height - m);
+                                        ctx.moveTo(width - m, m);
+                                        ctx.lineTo(m, height - m);
+                                        ctx.stroke();
+                                    }
+                                    // Repaint when the visibility flips
+                                    // so the X disappears cleanly after
+                                    // a successful re-sign-in.
+                                    onVisibleChanged: requestPaint()
                                 }
                             }
                         }
@@ -505,6 +557,21 @@ Pane {
                             onTriggered: {
                                 if (!root.vm) { return; }
                                 root.vm.syncAccount(root._accountUuidOf(row.myGroup));
+                            }
+                        }
+                        // OAuth-only: re-run the sign-in flow against
+                        // the existing cda_uuid so tokens are replaced
+                        // in-place rather than the user having to
+                        // delete + re-add. Only meaningful when the
+                        // sync icon is showing the re-auth X overlay.
+                        MenuItem {
+                            text: qsTr("Re-sign in…")
+                            visible: rowSyncButton._needsReauth
+                            height: visible ? implicitHeight : 0
+                            onTriggered: {
+                                if (!root.vm) { return; }
+                                root.vm.reSignInOAuth(
+                                    root._accountUuidOf(row.myGroup));
                             }
                         }
                         // "Remove account" deliberately lives only in

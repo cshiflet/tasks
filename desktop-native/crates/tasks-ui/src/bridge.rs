@@ -526,6 +526,20 @@ pub mod qobject {
         #[cxx_name = "beginOAuthSignIn"]
         fn begin_oauth_sign_in(self: Pin<&mut TaskListViewModel>, kind: i32, label: QString);
 
+        /// Re-run the OAuth flow against an existing account row,
+        /// keyed by its `cda_uuid`. The new tokens replace whatever
+        /// the token store had under (kind, uuid); no new
+        /// caldav_accounts row is inserted. Used by the failed-auth
+        /// "Re-sign in…" affordance — when the persistent token
+        /// store loses tokens (in-memory tier on restart, refresh
+        /// token expiry, user revoke from the provider's dashboard)
+        /// the sidebar surfaces an X overlay; right-click → Re-sign
+        /// in… calls this so the user doesn't have to delete +
+        /// re-add the account.
+        #[qinvokable]
+        #[cxx_name = "reSignInOAuth"]
+        fn re_sign_in_oauth(self: Pin<&mut TaskListViewModel>, uuid: QString);
+
         /// Drive a one-shot pull-then-push cycle against the account
         /// identified by `cda_uuid`. Returns immediately — the
         /// actual cycle runs on a background worker thread, and a
@@ -1625,6 +1639,37 @@ impl qobject::TaskListViewModel {
         }
     }
 
+    /// Re-run the OAuth flow against an existing `caldav_accounts`
+    /// row. Looks up the row by `uuid` to recover the kind + label,
+    /// then drives the same flow as `begin_oauth_sign_in` except
+    /// that on success we replace tokens for the existing
+    /// (kind, uuid) key rather than inserting a fresh row + pushing
+    /// a new StoredAccount. No-op when `uuid` doesn't match any
+    /// known OAuth account.
+    pub fn re_sign_in_oauth(mut self: Pin<&mut Self>, uuid: QString) {
+        let key = uuid.to_string();
+        // Bind the borrow into a local so it lasts long enough
+        // for the find / clone below. `self.as_ref().rust()`
+        // alone returns a temporary that's dropped at the end
+        // of the statement (E0716).
+        let r = self.as_ref();
+        let acct = match r.rust().accounts.iter().find(|a| a.uuid == key) {
+            Some(a) => (a.kind, a.label.clone()),
+            None => {
+                tracing::warn!("re_sign_in_oauth: no account with uuid {key}");
+                return;
+            }
+        };
+        let (kind, label) = acct;
+        if kind != KIND_GOOGLE_TASKS && kind != KIND_MICROSOFT_TODO {
+            self.as_mut().set_status(QString::from(
+                "Re-sign-in only supports Google Tasks / Microsoft To Do.",
+            ));
+            return;
+        }
+        self.start_oauth(kind, QString::from(&label), Some(key));
+    }
+
     /// Drive the browser-based OAuth sign-in for a Google / Microsoft
     /// account. Posts an "Opening browser…" status, kicks off a
     /// dedicated worker thread (mirrors `sync_account`'s threading
@@ -1634,7 +1679,21 @@ impl qobject::TaskListViewModel {
     /// to insert the `caldav_accounts` row + stash the tokens. On
     /// failure the row is not inserted and the error surfaces on
     /// the status bar.
-    pub fn begin_oauth_sign_in(mut self: Pin<&mut Self>, kind: i32, label: QString) {
+    pub fn begin_oauth_sign_in(self: Pin<&mut Self>, kind: i32, label: QString) {
+        self.start_oauth(kind, label, None);
+    }
+
+    /// Shared body for both `begin_oauth_sign_in` (new account)
+    /// and `re_sign_in_oauth` (existing). When `existing_uuid` is
+    /// `Some`, the success closure skips the caldav_accounts
+    /// insert + accounts list push and just replaces the tokens
+    /// for the existing (kind, uuid) key.
+    fn start_oauth(
+        mut self: Pin<&mut Self>,
+        kind: i32,
+        label: QString,
+        existing_uuid: Option<String>,
+    ) {
         if kind != KIND_GOOGLE_TASKS && kind != KIND_MICROSOFT_TODO {
             self.as_mut().set_status(QString::from(
                 "OAuth sign-in only supports Google Tasks / Microsoft To Do.",
@@ -1834,48 +1893,63 @@ impl qobject::TaskListViewModel {
                     pinned.as_mut().set_oauth_manual_label(QString::default());
                     match result {
                         Ok(tokens) => {
-                            let uuid = uuid::Uuid::new_v4().to_string();
-                            let cda_account_type = match kind {
-                                KIND_GOOGLE_TASKS => 7, // tasks_core::AccountType::GOOGLE_TASKS
-                                KIND_MICROSOFT_TODO => 6, // tasks_core::AccountType::MICROSOFT
-                                _ => unreachable!(),
-                            };
-                            // Persist a row with empty server / username /
-                            // password — OAuth providers don't use any of
-                            // those columns; the token store handles
-                            // secrets.
-                            let res = open_rw_conn(&db_path).and_then(|conn| {
-                                conn.execute(
-                                    "INSERT OR REPLACE INTO caldav_accounts \
-                                     (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
-                                      cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
-                                     VALUES (?1, ?2, '', '', '', NULL, ?3, 0, -1, 0)",
-                                    rusqlite::params![uuid, label_for_thread, cda_account_type],
-                                )
-                                .map(|_| ())
-                            });
-                            if let Err(e) = res {
-                                pinned.as_mut().set_status(QString::from(&format!(
-                                    "Sign-in failed: DB write: {e}"
-                                )));
-                                return;
-                            }
                             let provider_kind = match kind {
                                 KIND_GOOGLE_TASKS => ProviderKind::GoogleTasks,
                                 KIND_MICROSOFT_TODO => ProviderKind::MicrosoftToDo,
                                 _ => unreachable!(),
                             };
+                            // Two flows: (a) brand-new account —
+                            // generate uuid, insert caldav_accounts
+                            // row, push StoredAccount onto the in-
+                            // memory list. (b) re-sign-in for an
+                            // existing account — uuid + row + entry
+                            // already there, just refresh tokens
+                            // for the same (kind, uuid) key.
+                            let uuid = match existing_uuid.clone() {
+                                Some(u) => u,
+                                None => {
+                                    let new_uuid = uuid::Uuid::new_v4().to_string();
+                                    let cda_account_type = match kind {
+                                        KIND_GOOGLE_TASKS => 7,
+                                        KIND_MICROSOFT_TODO => 6,
+                                        _ => unreachable!(),
+                                    };
+                                    // Persist with empty server /
+                                    // username / password — OAuth
+                                    // providers don't use any of
+                                    // those columns; the token
+                                    // store handles secrets.
+                                    let res = open_rw_conn(&db_path).and_then(|conn| {
+                                        conn.execute(
+                                            "INSERT OR REPLACE INTO caldav_accounts \
+                                             (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+                                              cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+                                             VALUES (?1, ?2, '', '', '', NULL, ?3, 0, -1, 0)",
+                                            rusqlite::params![new_uuid, label_for_thread, cda_account_type],
+                                        )
+                                        .map(|_| ())
+                                    });
+                                    if let Err(e) = res {
+                                        pinned.as_mut().set_status(QString::from(&format!(
+                                            "Sign-in failed: DB write: {e}"
+                                        )));
+                                        return;
+                                    }
+                                    new_uuid
+                                }
+                            };
                             // Token store is keyed by (provider_kind, cda_uuid)
                             // so the per-account `sync_account` lookup is
                             // unambiguous even if the user signs into the
-                            // same provider twice.
+                            // same provider twice. `put` replaces under
+                            // the same key — exactly what re-sign-in needs.
                             if let Err(e) = token_store.put(provider_kind, &uuid, &tokens) {
                                 pinned.as_mut().set_status(QString::from(&format!(
                                     "Sign-in failed: token store: {e}"
                                 )));
                                 return;
                             }
-                            {
+                            if existing_uuid.is_none() {
                                 let mut inner = pinned.as_mut().rust_mut();
                                 inner.accounts.push(StoredAccount {
                                     uuid: uuid.clone(),
@@ -1886,12 +1960,22 @@ impl qobject::TaskListViewModel {
                                     password: SecretString::from(String::new()),
                                 });
                                 inner.account_states.push(String::from("Idle"));
+                            } else {
+                                // Re-sign-in: clear the
+                                // "Re-sign-in required" state so the
+                                // sidebar drops the X overlay. The
+                                // sync_account call below will set
+                                // it back to "Syncing…" right away.
+                                set_account_state(pinned.as_mut(), &uuid, "Idle");
                             }
                             publish_accounts(pinned.as_mut());
                             tracing::info!("oauth: account row + token store updated for {label_for_thread}");
-                            pinned.as_mut().set_status(QString::from(&format!(
-                                "Signed in to {label_for_thread} (session-local tokens)."
-                            )));
+                            let msg = if existing_uuid.is_some() {
+                                format!("Re-signed in to {label_for_thread}.")
+                            } else {
+                                format!("Signed in to {label_for_thread}.")
+                            };
+                            pinned.as_mut().set_status(QString::from(&msg));
                             // Pull immediately so the sidebar populates without
                             // requiring the user to click Sync. sync_account
                             // spawns its own worker thread, so this returns
@@ -2017,7 +2101,12 @@ impl qobject::TaskListViewModel {
                 if token_store.get(provider_kind, &uuid).is_none() {
                     self.as_mut()
                         .set_status(QString::from(&format!("Re-sign-in required for {label}")));
-                    set_account_state(self.as_mut(), &uuid, "Idle");
+                    // "Re-sign-in required" is a stable per-account
+                    // state QML watches to paint the X overlay on
+                    // the sync icon and surface the right-click
+                    // "Re-sign in…" affordance. Don't drop back to
+                    // "Idle" here — that would hide the failure.
+                    set_account_state(self.as_mut(), &uuid, "Re-sign-in required");
                     return;
                 }
                 let client_id = if stored.kind == KIND_GOOGLE_TASKS {
