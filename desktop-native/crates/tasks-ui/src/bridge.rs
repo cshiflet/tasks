@@ -2238,7 +2238,7 @@ impl qobject::TaskListViewModel {
         // Once the future resolves, queue a callback back onto the
         // QML thread so the Q_PROPERTY updates run with exclusive
         // pinned-mut access.
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name(format!("sync:{label}"))
             .spawn(move || {
                 let uuid_for_engine = uuid_owned.clone();
@@ -2304,8 +2304,20 @@ impl qobject::TaskListViewModel {
                         }
                     }
                 });
-            })
-            .expect("spawn sync worker thread");
+            });
+        if let Err(spawn_err) = spawn_result {
+            // Resource exhaustion (ulimit, EAGAIN, etc.) — the
+            // worker never started, so the completion-handler
+            // path that normally clears `syncs_in_flight` and
+            // resets the per-account "Syncing…" badge will
+            // never run. Roll both back here so a follow-up
+            // user click can retry.
+            tracing::error!("sync_account: thread spawn failed: {spawn_err}");
+            self.as_mut().rust_mut().syncs_in_flight.remove(&uuid);
+            set_account_state(self.as_mut(), &uuid, &format!("Failed: {spawn_err}"));
+            self.as_mut()
+                .set_status(QString::from(&format!("Sync failed: {spawn_err}")));
+        }
     }
 
     /// Fan out a `sync_account` dispatch to every non-OAuth, non-
@@ -4363,6 +4375,11 @@ fn migrate_legacy_passwords(
             .get_secret(&acct.uuid)
             .filter(|s| !s.is_empty())
             .is_some();
+        // Track whether *we* put the secret on this iteration —
+        // if the column-blank UPDATE then fails we have to roll
+        // it back out so the next pass doesn't see "store wins"
+        // and silently leak the plaintext column forever.
+        let mut put_just_now = false;
         if !already_in_store {
             // Use the in-memory password where it matches what
             // load_password_accounts read back; otherwise prefer
@@ -4379,15 +4396,42 @@ fn migrate_legacy_passwords(
                 );
                 continue;
             }
+            put_just_now = true;
         }
         if let Err(e) = conn.execute(
             "UPDATE caldav_accounts SET cda_password = '' WHERE cda_uuid = ?1",
             [&acct.uuid],
         ) {
-            tracing::warn!(
-                "migrate_legacy_passwords: blanking column failed for {}: {e}",
-                acct.uuid
-            );
+            // Roll back our `put_secret` so we don't leave the
+            // plaintext in BOTH the column AND the secret store.
+            // If we don't, the next pass takes the
+            // `already_in_store` branch (skipping the put) and
+            // tries the UPDATE again — if the underlying cause
+            // is persistent (e.g. read-only filesystem) the
+            // plaintext lives on disk indefinitely.
+            // Failure to roll back is itself logged at error.
+            if put_just_now {
+                if let Err(rollback_err) = secret_store.delete_secret(&acct.uuid) {
+                    tracing::error!(
+                        "migrate_legacy_passwords: column UPDATE failed for {} ({e}); \
+                         rollback delete_secret ALSO failed ({rollback_err}); \
+                         credential is now in BOTH column and store",
+                        acct.uuid
+                    );
+                } else {
+                    tracing::error!(
+                        "migrate_legacy_passwords: column UPDATE failed for {} ({e}); \
+                         rolled back the put_secret; row stays on legacy fallback",
+                        acct.uuid
+                    );
+                }
+            } else {
+                tracing::error!(
+                    "migrate_legacy_passwords: blanking column failed for {} ({e}); \
+                     plaintext remains in caldav_accounts.cda_password",
+                    acct.uuid
+                );
+            }
             continue;
         }
         moved += 1;

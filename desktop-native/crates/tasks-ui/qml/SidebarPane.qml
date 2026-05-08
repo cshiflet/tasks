@@ -468,6 +468,16 @@ Pane {
                                 if (_currentState.startsWith("Synced")) {
                                     _justSucceeded = true;
                                     successTimer.restart();
+                                } else {
+                                    // Leaving the "Synced …" state
+                                    // (typically into "Syncing…"
+                                    // because of a back-to-back
+                                    // sync) — stop the timer and
+                                    // drop the flag immediately so
+                                    // the green ✓ doesn't overlay
+                                    // the spinning refresh glyph.
+                                    successTimer.stop();
+                                    _justSucceeded = false;
                                 }
                             }
                             Timer {

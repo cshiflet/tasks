@@ -194,9 +194,6 @@ fn create_empty_db(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reject a path whose final component is a symlink. Non-existent
-/// paths are OK (the caller may be about to create the file);
-/// anything else that fails `symlink_metadata` is also surfaced
 /// Apply the desktop client's writer-side concurrency tuning.
 /// Used by every RW handle: the long-lived bridge connection,
 /// the per-write transient handles in `tasks_core::write`, and
