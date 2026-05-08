@@ -4801,4 +4801,128 @@ mod tests {
         );
         assert_eq!(secrets2, 0);
     }
+
+    /// Stand up a minimal SQLite file with just the columns
+    /// `migrate_legacy_passwords` reads + writes. The test
+    /// doesn't need the full Tasks.org schema — only
+    /// `caldav_accounts(cda_uuid, cda_password)`.
+    fn fresh_legacy_db(rows: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE caldav_accounts ( \
+                cda_uuid TEXT PRIMARY KEY, \
+                cda_password TEXT NOT NULL DEFAULT '' \
+             )",
+            [],
+        )
+        .unwrap();
+        for (uuid, pwd) in rows {
+            conn.execute(
+                "INSERT INTO caldav_accounts (cda_uuid, cda_password) VALUES (?1, ?2)",
+                [uuid, pwd],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        (tmp, path)
+    }
+
+    fn stored(uuid: &str, password: &str) -> StoredAccount {
+        StoredAccount {
+            uuid: uuid.to_string(),
+            kind: KIND_CALDAV,
+            label: format!("acct {uuid}"),
+            server: "https://dav.example.com/".to_string(),
+            username: "alice".to_string(),
+            password: SecretString::from(password.to_string()),
+        }
+    }
+
+    /// D3 happy path: a row carrying a legacy plaintext
+    /// `cda_password` is moved into the secret store and the
+    /// SQLite column is blanked. The function returns 1 (one
+    /// row migrated).
+    #[test]
+    fn migrate_legacy_passwords_moves_plaintext_into_secret_store() {
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "hunter2")]);
+        let secret_store = InMemorySecretStore::new();
+        let accounts = vec![stored("uuid-1", "hunter2")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 1);
+
+        // Column blanked.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let column: String = conn
+            .query_row(
+                "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, "");
+        // Secret store populated.
+        assert_eq!(
+            secret_store.get_secret("uuid-1").as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    /// Idempotency: running the migration a second time on a
+    /// row whose column is already empty (because the first
+    /// pass cleaned it up) is a no-op. Pin this so the
+    /// open-at-path call site can run the migration on every
+    /// launch without churning the secret store.
+    #[test]
+    fn migrate_legacy_passwords_is_idempotent_on_empty_column() {
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "")]);
+        let secret_store = InMemorySecretStore::new();
+        // Pre-seed the secret as if a prior migration moved it.
+        secret_store.put_secret("uuid-1", "already-here").unwrap();
+        let accounts = vec![stored("uuid-1", "already-here")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 0);
+        // Existing secret untouched.
+        assert_eq!(
+            secret_store.get_secret("uuid-1").as_deref(),
+            Some("already-here")
+        );
+    }
+
+    /// When both the column AND the store hold a value, the
+    /// store is canonical (it's the durable copy). The column
+    /// gets blanked without overwriting the store, so a row
+    /// where the store and column drifted out of sync resolves
+    /// in favour of the store.
+    #[test]
+    fn migrate_legacy_passwords_prefers_existing_secret_store_value() {
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "stale-from-column")]);
+        let secret_store = InMemorySecretStore::new();
+        secret_store
+            .put_secret("uuid-1", "fresh-from-store")
+            .unwrap();
+        let accounts = vec![stored("uuid-1", "fresh-from-store")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 1);
+
+        // Column blanked.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let column: String = conn
+            .query_row(
+                "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, "");
+        // Store wasn't overwritten with the stale column value.
+        assert_eq!(
+            secret_store.get_secret("uuid-1").as_deref(),
+            Some("fresh-from-store")
+        );
+    }
 }
