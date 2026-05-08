@@ -114,13 +114,13 @@ ApplicationWindow {
         modal: true
         anchors.centerIn: Overlay.overlay
         standardButtons: Dialog.Ok
+        // Set the Dialog's width directly rather than driving it
+        // through the contentItem. Layout.fillWidth on the inner
+        // Labels would otherwise feed implicitContentWidth back
+        // into the Dialog's width binding and Qt Quick reports a
+        // binding loop. Fixing the Dialog width breaks the cycle.
+        width: 540
         contentItem: ColumnLayout {
-            // Pinning width here (instead of Layout.maximumWidth on
-            // each Label) sidesteps the Dialog's implicitWidth
-            // binding loop — the contentItem's geometry is the
-            // dialog's only width input, so a fixed value is
-            // unambiguous.
-            width: 540
             spacing: 8
             Label {
                 Layout.fillWidth: true

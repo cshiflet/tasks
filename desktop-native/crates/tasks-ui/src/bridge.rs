@@ -3252,6 +3252,23 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
                 let secret_store = Arc::clone(&vm.as_ref().rust().secret_store);
                 load_password_accounts(&db, secret_store.as_ref())
             };
+            // Once the user has acknowledged the credential-storage
+            // disclosure, walk the accounts list and lift any
+            // leftover plaintext `cda_password` value into the
+            // secret store, blanking the column on success. Idempotent
+            // — already-migrated rows have an empty column and skip.
+            // Gated on the ack flag so the disclosure dialog stays
+            // the consent point for the migration.
+            if vm.as_ref().credential_storage_acknowledged {
+                let secret_store = Arc::clone(&vm.as_ref().rust().secret_store);
+                let migrated = migrate_legacy_passwords(&path, &loaded, secret_store.as_ref());
+                if migrated > 0 {
+                    tracing::info!(
+                        "migrated {migrated} legacy plaintext password(s) into {} store",
+                        vm.as_ref().credential_storage_tier
+                    );
+                }
+            }
             {
                 let mut inner = vm.as_mut().rust_mut();
                 inner.account_states = vec![String::from("Idle"); loaded.len()];
@@ -4127,6 +4144,86 @@ fn migrate_credentials(
         }
     }
     (tokens_moved, secrets_moved)
+}
+
+/// Walk every entry in `accounts` and migrate any leftover
+/// plaintext `cda_password` value into the secret store,
+/// blanking the SQLite column on success. Returns the number of
+/// rows actually moved. Idempotent — rows whose column is
+/// already empty are skipped silently.
+///
+/// Called from `open_at_path` after the disclosure has been
+/// acknowledged, so the user has already seen what storage tier
+/// the value is being moved into. Failures (read-only DB,
+/// secret-store write error, etc.) leave the column intact so
+/// the legacy-fallback path in `load_password_accounts` keeps
+/// the account usable; we log at warn rather than abort.
+fn migrate_legacy_passwords(
+    db_path: &std::path::Path,
+    accounts: &[StoredAccount],
+    secret_store: &dyn crate::token_persist::SecretStore,
+) -> usize {
+    use secrecy::ExposeSecret;
+    let mut moved = 0;
+    let conn = match open_rw_conn(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("migrate_legacy_passwords: open RW conn failed: {e}");
+            return 0;
+        }
+    };
+    for acct in accounts {
+        // Re-read the column directly rather than trust the in-
+        // memory StoredAccount.password — the load path may have
+        // already merged the secret store's value, masking
+        // whether the column itself still has a plaintext copy.
+        let column_value: Result<Option<String>, _> = conn.query_row(
+            "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = ?1",
+            [&acct.uuid],
+            |r| r.get::<_, Option<String>>(0),
+        );
+        let column_password = match column_value {
+            Ok(Some(s)) if !s.is_empty() => s,
+            _ => continue,
+        };
+        // Don't overwrite a secret-store value that's already in
+        // place from a previous migration; if both exist, the
+        // store is canonical and the column is the duplicate
+        // we're trying to clean up.
+        let already_in_store = secret_store
+            .get_secret(&acct.uuid)
+            .filter(|s| !s.is_empty())
+            .is_some();
+        if !already_in_store {
+            // Use the in-memory password where it matches what
+            // load_password_accounts read back; otherwise prefer
+            // the column value we just confirmed is non-empty.
+            let candidate = if acct.password.expose_secret() == column_password.as_str() {
+                acct.password.expose_secret().to_string()
+            } else {
+                column_password.clone()
+            };
+            if let Err(e) = secret_store.put_secret(&acct.uuid, &candidate) {
+                tracing::warn!(
+                    "migrate_legacy_passwords: secret put failed for {}: {e}",
+                    acct.uuid
+                );
+                continue;
+            }
+        }
+        if let Err(e) = conn.execute(
+            "UPDATE caldav_accounts SET cda_password = '' WHERE cda_uuid = ?1",
+            [&acct.uuid],
+        ) {
+            tracing::warn!(
+                "migrate_legacy_passwords: blanking column failed for {}: {e}",
+                acct.uuid
+            );
+            continue;
+        }
+        moved += 1;
+    }
+    moved
 }
 
 fn persist_prefs(vm: &qobject::TaskListViewModel) {
