@@ -1527,10 +1527,36 @@ impl qobject::TaskListViewModel {
                 .set_status(QString::from("Open a database before editing an account."));
             return;
         };
-        // Persist via a transient RW connection. Empty password
-        // preserves the existing one — caller blank-defaults the
-        // field so a user fixing a typo doesn't have to retype the
-        // password.
+        // Always update label/url/username; touch the password
+        // path only when the caller supplied a new value (the
+        // dialog blank-defaults the field so a typo fix doesn't
+        // require retyping the password).
+        //
+        // Password write goes through the secret store as the
+        // canonical source — exactly what add_password_account
+        // does. Writing only the SQLite `cda_password` column
+        // here would regress on the next launch: load_password_accounts
+        // prefers a non-empty secret-store value over the column,
+        // so the *old* secret would shadow the freshly-edited
+        // column. Blank the column on success so the legacy-fallback
+        // path doesn't keep the stale plaintext around either.
+        let mut password_written_to_store = false;
+        if !password_s.is_empty() {
+            match self
+                .as_ref()
+                .rust()
+                .secret_store
+                .put_secret(&uuid, &password_s)
+            {
+                Ok(()) => password_written_to_store = true,
+                Err(e) => {
+                    tracing::warn!(
+                        "update_password_account: secret store write failed for \
+                         {uuid}: {e}; falling back to plaintext column"
+                    );
+                }
+            }
+        }
         let res = open_rw_conn(&path).and_then(|conn| {
             if password_s.is_empty() {
                 conn.execute(
@@ -1541,11 +1567,21 @@ impl qobject::TaskListViewModel {
                 )
                 .map(|_| ())
             } else {
+                // Column value: blank when the secret store
+                // accepted the write (canonical source is the
+                // store; load path reads it first), or the
+                // plaintext as a fallback for the rare write
+                // failure above.
+                let column_value = if password_written_to_store {
+                    String::new()
+                } else {
+                    password_s.clone()
+                };
                 conn.execute(
                     "UPDATE caldav_accounts \
                      SET cda_name = ?1, cda_url = ?2, cda_username = ?3, cda_password = ?4 \
                      WHERE cda_uuid = ?5",
-                    rusqlite::params![label_s, server_s, username_s, password_s, uuid],
+                    rusqlite::params![label_s, server_s, username_s, column_value, uuid],
                 )
                 .map(|_| ())
             }
