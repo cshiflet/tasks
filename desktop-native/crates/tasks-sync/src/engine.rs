@@ -196,10 +196,10 @@ impl<'a> SyncEngine<'a> {
             .map_err(|e| SyncError::Local(format!("load deleted: {e}")))?;
         drop(conn); // Release the write handle before the async round trips.
         let mut deleted = 0usize;
-        for (task_id, calendar_remote_id, remote_id) in &to_delete {
+        for (task_id, calendar_remote_id, remote_id, etag) in &to_delete {
             match self
                 .provider
-                .delete_task(calendar_remote_id, remote_id)
+                .delete_task(calendar_remote_id, remote_id, etag.as_deref())
                 .await
             {
                 Ok(()) => {
@@ -410,14 +410,22 @@ fn load_dirty_tasks(
 /// `cd_deleted` is still zero (we haven't already propagated
 /// the delete).
 ///
-/// Returns `(tasks._id, calendar_remote_id, remote_id)` per row.
+/// One row's worth of "locally soft-deleted, server-side
+/// delete still pending" state. `cd_etag` is `None` for rows
+/// where the server hasn't yet acknowledged a body (those
+/// wouldn't pass the `cd_etag IS NOT NULL` filter today, but
+/// the column is still nullable on the schema so we surface
+/// it as `Option`); CalDAV uses it as the `If-Match` value so
+/// a concurrent server-side edit surfaces as Conflict.
+type PendingDelete = (i64, String, String, Option<String>);
+
 /// The bridge passes `account_filter` so a CalDAV push doesn't
 /// touch Google / Microsoft / Etebase rows.
 fn load_locally_deleted_tasks(
     conn: &Connection,
     account_filter: Option<&str>,
-) -> rusqlite::Result<Vec<(i64, String, String)>> {
-    let base = "SELECT t._id, ct.cd_calendar, ct.cd_remote_id \
+) -> rusqlite::Result<Vec<PendingDelete>> {
+    let base = "SELECT t._id, ct.cd_calendar, ct.cd_remote_id, ct.cd_etag \
                 FROM tasks t \
                 JOIN caldav_tasks ct ON ct.cd_task = t._id";
     let (sql, account_uuid) = match account_filter {
@@ -443,11 +451,12 @@ fn load_locally_deleted_tasks(
         ),
     };
     let mut stmt = conn.prepare(&sql)?;
-    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, String, String)> {
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<PendingDelete> {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     };
     let mut out = Vec::new();
@@ -908,7 +917,12 @@ mod tests {
             self.pushes.lock().unwrap().push(t.clone());
             Ok(Some("etag-pushed".to_string()))
         }
-        async fn delete_task(&mut self, cal: &str, id: &str) -> SyncResult<()> {
+        async fn delete_task(
+            &mut self,
+            cal: &str,
+            id: &str,
+            _etag: Option<&str>,
+        ) -> SyncResult<()> {
             self.deletes
                 .lock()
                 .unwrap()
@@ -1180,7 +1194,12 @@ mod tests {
                 Ok(Some("etag-new".to_string()))
             }
         }
-        async fn delete_task(&mut self, cal: &str, id: &str) -> SyncResult<()> {
+        async fn delete_task(
+            &mut self,
+            cal: &str,
+            id: &str,
+            _etag: Option<&str>,
+        ) -> SyncResult<()> {
             if let Some(msg) = &self.delete_error {
                 return Err(SyncError::Network(msg.clone()));
             }
@@ -1620,7 +1639,12 @@ mod tests {
                 .unwrap();
                 Ok(Some("etag-new".into()))
             }
-            async fn delete_task(&mut self, _c: &str, _id: &str) -> SyncResult<()> {
+            async fn delete_task(
+                &mut self,
+                _c: &str,
+                _id: &str,
+                _etag: Option<&str>,
+            ) -> SyncResult<()> {
                 Ok(())
             }
             async fn sync_once(&mut self) -> SyncResult<SyncOutcome> {

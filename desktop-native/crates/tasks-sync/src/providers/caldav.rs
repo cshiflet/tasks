@@ -355,7 +355,12 @@ impl Provider for CalDavProvider {
         Ok(new_etag)
     }
 
-    async fn delete_task(&mut self, calendar_remote_id: &str, remote_id: &str) -> SyncResult<()> {
+    async fn delete_task(
+        &mut self,
+        calendar_remote_id: &str,
+        remote_id: &str,
+        etag: Option<&str>,
+    ) -> SyncResult<()> {
         let guard = self.session.lock().await;
         let s = guard
             .as_ref()
@@ -368,15 +373,35 @@ impl Provider for CalDavProvider {
             .join(&format!("{remote_id}.ics"))
             .map_err(|e| SyncError::Protocol(format!("bad obj href: {e}")))?;
         s.trusted_origin.check(&obj_url)?;
-        let resp = s
-            .http
-            .delete(obj_url)
-            .header(AUTHORIZATION, s.auth.clone())
+        // Send `If-Match` so a concurrent server-side edit
+        // surfaces as 412 -> Conflict instead of being silently
+        // overwritten by our delete. Servers that don't honour
+        // it return success regardless; we keep the previous
+        // 404-tolerance for "already gone server-side".
+        let mut req = s.http.delete(obj_url).header(AUTHORIZATION, s.auth.clone());
+        if let Some(tag) = etag {
+            req = req.header(
+                IF_MATCH,
+                HeaderValue::from_str(&format!("\"{tag}\""))
+                    .map_err(|e| SyncError::Protocol(format!("bad etag header: {e}")))?,
+            );
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| SyncError::Network(format!("DELETE: {e}")))?;
-        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
-            let status = resp.status();
+        let status = resp.status();
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            return Err(SyncError::Conflict {
+                remote_id: remote_id.to_string(),
+                local: etag.map(str::to_string),
+                server_message: msg,
+            });
+        }
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
             let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
                 .await
                 .unwrap_or_default();

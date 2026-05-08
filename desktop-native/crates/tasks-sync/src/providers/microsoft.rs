@@ -324,7 +324,15 @@ impl Provider for MicrosoftToDoProvider {
         Ok(parsed.etag)
     }
 
-    async fn delete_task(&mut self, calendar_remote_id: &str, remote_id: &str) -> SyncResult<()> {
+    async fn delete_task(
+        &mut self,
+        calendar_remote_id: &str,
+        remote_id: &str,
+        // Microsoft Graph's todo DELETE accepts but ignores
+        // `If-Match` on this resource as of 2026-04. Carry the
+        // parameter for trait-shape parity with CalDAV.
+        _etag: Option<&str>,
+    ) -> SyncResult<()> {
         let auth = self.ensure_fresh().await?;
         let guard = self.session.lock().await;
         let s = guard.as_ref().expect("session populated above");

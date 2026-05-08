@@ -237,8 +237,21 @@ pub trait Provider: Send + Sync {
     /// `If-Match` to detect concurrent edits. Returns the new etag.
     async fn push_task(&mut self, task: &RemoteTask) -> SyncResult<Option<String>>;
 
-    /// Delete a task remotely.
-    async fn delete_task(&mut self, calendar_remote_id: &str, remote_id: &str) -> SyncResult<()>;
+    /// Delete a task remotely. `etag` is the server-side etag the
+    /// local DB recorded at last pull (CalDAV's `cd_etag`); when
+    /// provided, providers that support `If-Match` (CalDAV) send
+    /// it so a concurrent server-side edit surfaces as
+    /// `SyncError::Conflict` instead of being silently
+    /// overwritten by the delete. REST providers (Google,
+    /// Microsoft) ignore the etag because their delete endpoints
+    /// don't expose precondition headers; EteSync ignores it
+    /// because the SDK abstracts the wire-level etag away.
+    async fn delete_task(
+        &mut self,
+        calendar_remote_id: &str,
+        remote_id: &str,
+        etag: Option<&str>,
+    ) -> SyncResult<()>;
 
     /// Create a fresh calendar / task list on the server. Returns
     /// the metadata the engine needs to upsert into `caldav_lists`

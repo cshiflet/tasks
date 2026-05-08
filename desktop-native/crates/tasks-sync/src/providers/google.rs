@@ -385,7 +385,15 @@ impl Provider for GoogleTasksProvider {
         Ok(parsed.etag)
     }
 
-    async fn delete_task(&mut self, calendar_remote_id: &str, remote_id: &str) -> SyncResult<()> {
+    async fn delete_task(
+        &mut self,
+        calendar_remote_id: &str,
+        remote_id: &str,
+        // Google Tasks REST has no `If-Match` on DELETE; the
+        // `etag` field is read-only on this resource. Accept
+        // for trait-shape parity and ignore.
+        _etag: Option<&str>,
+    ) -> SyncResult<()> {
         let auth = self.ensure_fresh().await?;
         let guard = self.session.lock().await;
         let s = guard.as_ref().expect("session populated above");

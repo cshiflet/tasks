@@ -316,7 +316,16 @@ impl Provider for EteSyncProvider {
         .map_err(|e| SyncError::Other(format!("spawn_blocking: {e}")))?
     }
 
-    async fn delete_task(&mut self, calendar_remote_id: &str, remote_id: &str) -> SyncResult<()> {
+    async fn delete_task(
+        &mut self,
+        calendar_remote_id: &str,
+        remote_id: &str,
+        // EteSync's SDK abstracts the wire-level etag — concurrent
+        // edits surface as `Error::Conflict` from `item_mgr.batch`,
+        // not via an HTTP precondition. So we accept the parameter
+        // for trait-shape symmetry but don't use it here.
+        _etag: Option<&str>,
+    ) -> SyncResult<()> {
         let state = self.state.clone();
         let cal_uid = calendar_remote_id.to_string();
         let item_uid = remote_id.to_string();
