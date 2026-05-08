@@ -1,0 +1,18 @@
+# Per-workspace cargo settings. Currently just the linker swap;
+# `[build]` / `[net]` / `[term]` knobs can land alongside if we
+# need them.
+#
+# Why this file ships at all: the default GNU ld dominates the
+# wall-clock on incremental Linux builds for our ~8K-LOC bridge
+# crate. mold links the same binary in ~100 ms vs several seconds
+# for ld, so touch-and-rebuild cycles are 2–5× faster after the
+# initial compile finishes. macOS / Windows builds don't see this
+# config (the [target.…linux-gnu] gate scopes it).
+#
+# Setup deps (Linux): `apt install mold clang`. Setup script +
+# Dockerfile.dev + the CI workflow install both. macOS uses Apple
+# clang's bundled lld and doesn't need a separate package; Windows
+# uses MSVC's link.exe.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

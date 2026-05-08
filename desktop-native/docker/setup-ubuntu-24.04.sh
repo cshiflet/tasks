@@ -26,6 +26,7 @@ sudo apt-get install -y --no-install-recommends \
     libqt6svg6-dev \
     libsqlite3-dev \
     libssl-dev \
+    mold \
     pkg-config \
     qml6-module-qt-labs-folderlistmodel \
     qml6-module-qt-labs-platform \

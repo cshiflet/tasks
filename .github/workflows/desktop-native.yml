@@ -47,11 +47,17 @@ jobs:
       # the dbus-sys link step. ubuntu-latest's runner image
       # doesn't pre-install -dev headers; install-qt installs Qt
       # but nothing else.
+      #
+      # mold + clang power the per-workspace `.cargo/config.toml`
+      # linker swap that cuts incremental link time from seconds
+      # to ~100 ms. CI matches the dev box so a config drift
+      # would show up as a build error rather than a silent fall
+      # back to GNU ld.
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              libdbus-1-dev pkg-config
+              libdbus-1-dev pkg-config mold clang
 
       - name: Install Qt 6
         uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
