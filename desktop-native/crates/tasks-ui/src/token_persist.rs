@@ -80,9 +80,20 @@ impl StorageTier {
     }
 
     /// Probe each tier in order and return the first that's
-    /// healthy. Always returns `Ok` — at worst we fall back to
-    /// in-memory.
-    pub fn probe() -> (Self, Arc<dyn TokenStore>, Arc<dyn SecretStore>) {
+    /// healthy. `request` honors a user-requested tier:
+    /// `"auto"` walks keychain → encrypted-file → in-memory;
+    /// `"in_memory"` short-circuits to the degraded fallback;
+    /// anything else logs a warning and falls back to `"auto"`.
+    /// Always returns `Ok` — at worst, in-memory.
+    pub fn probe(request: &str) -> (Self, Arc<dyn TokenStore>, Arc<dyn SecretStore>) {
+        if request == "in_memory" {
+            return Self::in_memory();
+        }
+        if request != "auto" {
+            tracing::warn!(
+                "credential_storage_choice = {request:?} is unknown; falling back to auto"
+            );
+        }
         match KeychainTokenStore::probe() {
             Ok(s) => {
                 let arc: Arc<KeychainTokenStore> = Arc::new(s);
@@ -105,7 +116,11 @@ impl StorageTier {
             }
             Err(e) => tracing::warn!("token store: encrypted-file fallback unavailable: {e}"),
         }
-        tracing::warn!("token store: degraded to in-memory; credentials will not survive restart");
+        Self::in_memory()
+    }
+
+    fn in_memory() -> (Self, Arc<dyn TokenStore>, Arc<dyn SecretStore>) {
+        tracing::info!("token store: in-memory tier active; credentials will not survive restart");
         let mem = Arc::new(InMemorySecretStore::new());
         (
             StorageTier::InMemory,

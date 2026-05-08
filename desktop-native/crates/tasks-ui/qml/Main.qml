@@ -80,6 +80,80 @@ ApplicationWindow {
             root.visibility = Window.Maximized;
         }
         viewModel.openDefaultDatabase();
+        // Surface the credential-storage disclosure if the user
+        // hasn't acknowledged it yet for the active non-keychain
+        // tier, OR if the tier is in_memory (which always
+        // re-prompts because it discards credentials on exit).
+        // Defer one tick so the ApplicationWindow has settled
+        // and the dialog opens with sensible centring.
+        Qt.callLater(_maybeShowCredentialDisclosure);
+    }
+
+    function _maybeShowCredentialDisclosure() {
+        if (!viewModel) { return; }
+        const tier = viewModel.credentialStorageTier;
+        if (tier === "keychain") { return; }
+        if (tier === "in_memory") {
+            credentialDisclosure.open();
+            return;
+        }
+        if (tier === "encrypted_file" && !viewModel.credentialStorageAcknowledged) {
+            credentialDisclosure.open();
+        }
+    }
+
+    // Pre-flight credential-storage disclosure. Fires on launch
+    // when the active tier isn't the OS keychain. For
+    // encrypted-file, dismissing flips the acknowledgment flag
+    // so the dialog stays put on subsequent launches. For
+    // in-memory, the dialog re-pops every launch because the
+    // limitation persists across launches.
+    Dialog {
+        id: credentialDisclosure
+        title: qsTr("Credential storage")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Ok
+        contentItem: ColumnLayout {
+            // Pinning width here (instead of Layout.maximumWidth on
+            // each Label) sidesteps the Dialog's implicitWidth
+            // binding loop — the contentItem's geometry is the
+            // dialog's only width input, so a fixed value is
+            // unambiguous.
+            width: 540
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                font.bold: true
+                text: viewModel.credentialStorageTier === "in_memory"
+                    ? qsTr("Credentials are stored in memory only.")
+                    : qsTr("Credentials are stored in an encrypted file under your config directory.")
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: viewModel.credentialStorageTier === "in_memory"
+                    ? qsTr("Sync passwords and OAuth tokens you save during this session " +
+                           "will be discarded when the program exits. You will need to " +
+                           "re-sign in to every account on the next launch.\n\n" +
+                           "Switch to \"Auto\" or \"Master password\" in Settings → " +
+                           "General to enable persistence.")
+                    : qsTr("The encryption key is derived from a per-machine identifier; " +
+                           "anyone with read access to your home directory and the " +
+                           "machine-id file can decrypt the credentials. The OS keychain " +
+                           "(libsecret on Linux, Keychain on macOS, Credential Manager " +
+                           "on Windows) is more secure when available — install / " +
+                           "configure one of those to upgrade automatically.\n\n" +
+                           "You can also pick \"Master password\" in Settings → " +
+                           "General once that mode lands in a future release.")
+            }
+        }
+        onAccepted: {
+            if (viewModel.credentialStorageTier !== "in_memory") {
+                viewModel.acknowledgeCredentialStorage();
+            }
+        }
     }
 
     // Persist on close only — drag/resize fires too often to write

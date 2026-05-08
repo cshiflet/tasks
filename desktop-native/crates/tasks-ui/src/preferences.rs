@@ -89,6 +89,21 @@ pub struct Preferences {
     /// surfaces it as "Show OS notifications for task reminders".
     #[serde(default = "default_true")]
     pub notifications_enabled: bool,
+    /// User's preference for the credential storage tier:
+    ///   "auto"            — best available (keychain → encrypted-file → in-memory).
+    ///   "in_memory"       — force in-memory regardless of availability.
+    ///   "master_password" — encrypted-file with Argon2(passphrase). Lands later.
+    /// The bridge's runtime tier may differ from the request when
+    /// "auto" is in effect or the requested tier failed to probe;
+    /// that's surfaced separately via `credentialStorageTier`.
+    #[serde(default = "default_credential_storage_choice")]
+    pub credential_storage_choice: String,
+    /// True once the user has dismissed the pre-flight warning
+    /// dialog about a non-keychain storage tier. Stops the dialog
+    /// from re-popping each launch in the encrypted-file case.
+    /// In-memory always re-prompts (it's a degraded mode).
+    #[serde(default)]
+    pub credential_storage_acknowledged: bool,
     /// Per-CalDAV-list query-pref overrides, keyed on the list's
     /// `cdl_uuid`. Missing key → inherit every field from the
     /// global defaults above. See [`ListOverride`].
@@ -98,6 +113,10 @@ pub struct Preferences {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_credential_storage_choice() -> String {
+    "auto".to_string()
 }
 
 fn default_window_width() -> i32 {
@@ -123,6 +142,8 @@ impl Default for Preferences {
             window_y: 0,
             window_maximized: false,
             notifications_enabled: true,
+            credential_storage_choice: default_credential_storage_choice(),
+            credential_storage_acknowledged: false,
             list_overrides: HashMap::new(),
         }
     }

@@ -259,12 +259,29 @@ pub mod qobject {
         // `"encrypted_file"` (Tier 2, AES-256-GCM under
         // <config_dir>/tasks-desktop/tokens.dat with a key derived
         // from the machine identifier), or `"in_memory"` (Tier 3
-        // fallback when the other two probes fail; tokens vanish
-        // on restart). The QML pre-flight dialog reads this
-        // before any OAuth or password-account flow so the user
-        // can choose to abort if the tier doesn't match what they
-        // want. Stable for the process lifetime.
+        // fallback when the other two probes fail or when the user
+        // explicitly picks in-memory mode). The QML pre-flight
+        // dialog reads this before any OAuth or password-account
+        // flow so the user can choose to abort if the tier doesn't
+        // match what they want. Updated when the user changes the
+        // credential-storage choice via Settings → General; in
+        // that case any prior credentials are migrated into the
+        // new store before the property changes.
         #[qproperty(QString, credential_storage_tier)]
+        // What the user explicitly *requested* for credential
+        // storage in Settings: `"auto"` (default), `"in_memory"`,
+        // or — once the master-password batch lands —
+        // `"master_password"`. The actual `credentialStorageTier`
+        // above may differ when `"auto"` was requested but a
+        // higher tier failed to probe. Both flow through the
+        // `updateCredentialStorageChoice` invokable below.
+        #[qproperty(QString, credential_storage_choice)]
+        // Set to true once the user has dismissed the pre-flight
+        // disclosure for a non-keychain tier. Stops the dialog
+        // from re-popping each launch in the encrypted-file case.
+        // In-memory always re-prompts (it's a degraded mode that
+        // discards credentials on exit).
+        #[qproperty(bool, credential_storage_acknowledged)]
         #[qproperty(QString, oauth_manual_url)]
         // Account label paired with `oauth_manual_url` so the
         // Dialog can render "Sign in to <label>" without QML having
@@ -363,6 +380,27 @@ pub mod qobject {
         /// pending handle so the change is felt without waiting.
         #[qinvokable]
         fn update_notifications_enabled(self: Pin<&mut TaskListViewModel>, enabled: bool);
+
+        /// Switch the credential storage tier the bridge uses.
+        /// `choice` is one of `"auto"`, `"in_memory"` (and, once
+        /// the master-password batch lands, `"master_password"`).
+        /// On change: probes the new tier, migrates every OAuth
+        /// token + password from the old store into the new one,
+        /// deletes them from the old store, then swaps the Arcs
+        /// the bridge holds. Persists the choice through
+        /// `persist_prefs`. The QML side guards the in-memory
+        /// transition with a confirmation dialog because it
+        /// discards persisted credentials.
+        #[qinvokable]
+        fn update_credential_storage_choice(self: Pin<&mut TaskListViewModel>, choice: QString);
+
+        /// Mark the pre-flight credential-storage disclosure as
+        /// acknowledged. Persisted in `preferences.json` so the
+        /// dialog only fires once per install for the
+        /// encrypted-file tier; in-memory always re-prompts on
+        /// the next launch since it's a degraded state.
+        #[qinvokable]
+        fn acknowledge_credential_storage(self: Pin<&mut TaskListViewModel>);
 
         /// Persist the ApplicationWindow's geometry. Called from
         /// Main.qml's `onClosing` so we don't churn the prefs file
@@ -760,13 +798,23 @@ pub struct TaskListViewModelRust {
     /// `crate::token_persist::StorageTier::probe`; this Arc and
     /// `token_store` above always come from the same probe call.
     secret_store: Arc<dyn crate::token_persist::SecretStore>,
-    /// Stable string identifier of the active storage tier
+    /// Stable string identifier of the *active* storage tier
     /// (`"keychain"` / `"encrypted_file"` / `"in_memory"`),
     /// surfaced to QML via the `credentialStorageTier` Q_PROPERTY
-    /// for the pre-flight warning dialog. QString rather than
-    /// `String` so cxx-qt can mirror the field directly without
-    /// an extra getter.
+    /// for the pre-flight warning dialog. May differ from the
+    /// user's `credential_storage_choice` when `"auto"` was
+    /// requested but a higher tier failed to probe.
     credential_storage_tier: QString,
+    /// User's *requested* tier (`"auto"` / `"in_memory"` /
+    /// `"master_password"` once that lands). Persisted in
+    /// `preferences.json`. Driven by Settings → General →
+    /// Credential storage.
+    credential_storage_choice: QString,
+    /// Pre-flight acknowledgment flag for the non-keychain
+    /// storage tiers. Persisted in `preferences.json` so the
+    /// disclosure dialog only fires once per install for the
+    /// encrypted-file tier; in-memory always re-prompts.
+    credential_storage_acknowledged: bool,
     /// Per-CalDAV-list pref overrides keyed by `cdl_uuid`. Held
     /// in memory + serialised through `preferences.json` in
     /// `persist_prefs`. The active filter merges these over the
@@ -803,7 +851,7 @@ impl Default for TaskListViewModelRust {
         // QML so the pre-flight warning dialog can describe what
         // the user is actually getting.
         let (probed_tier, probed_token_store, probed_secret_store) =
-            crate::token_persist::StorageTier::probe();
+            crate::token_persist::StorageTier::probe(&saved.credential_storage_choice);
         let probed_tier_name = probed_tier.as_str().to_string();
         TaskListViewModelRust {
             count: 0,
@@ -906,6 +954,8 @@ impl Default for TaskListViewModelRust {
             token_store: probed_token_store,
             secret_store: probed_secret_store,
             credential_storage_tier: QString::from(&probed_tier_name),
+            credential_storage_choice: QString::from(&saved.credential_storage_choice),
+            credential_storage_acknowledged: saved.credential_storage_acknowledged,
             list_overrides: saved.list_overrides.clone(),
             last_sidebar_refresh: None,
             pending_sidebar_refresh: false,
@@ -1154,6 +1204,73 @@ impl qobject::TaskListViewModel {
         } else {
             self.as_ref().notifier.cancel_all();
         }
+    }
+
+    /// Swap the active credential storage tier and migrate every
+    /// existing OAuth token + account password into the new
+    /// store. No-op when the requested choice matches the
+    /// current one. Persists the new choice + the resulting
+    /// active tier name through `persist_prefs`. See the
+    /// matching invokable doc on the bridge surface for the
+    /// list of accepted values.
+    pub fn update_credential_storage_choice(mut self: Pin<&mut Self>, choice: QString) {
+        let new_choice = choice.to_string();
+        if new_choice == self.credential_storage_choice.to_string() {
+            return;
+        }
+        let (new_tier, new_token_store, new_secret_store) =
+            crate::token_persist::StorageTier::probe(&new_choice);
+        let new_tier_name = new_tier.as_str().to_string();
+
+        // Snapshot the bits the migration loop needs without
+        // holding the &Self borrow across the writes below.
+        let accounts: Vec<(String, i32)> = self
+            .as_ref()
+            .rust()
+            .accounts
+            .iter()
+            .map(|a| (a.uuid.clone(), a.kind))
+            .collect();
+        let from_tokens = Arc::clone(&self.as_ref().rust().token_store);
+        let from_secrets = Arc::clone(&self.as_ref().rust().secret_store);
+        let (tokens_moved, secrets_moved) = migrate_credentials(
+            &accounts,
+            from_tokens.as_ref(),
+            from_secrets.as_ref(),
+            new_token_store.as_ref(),
+            new_secret_store.as_ref(),
+        );
+        tracing::info!(
+            "credential migration: {tokens_moved} tokens, {secrets_moved} secrets \
+             moved into {new_tier_name}"
+        );
+
+        {
+            let mut inner = self.as_mut().rust_mut();
+            inner.token_store = new_token_store;
+            inner.secret_store = new_secret_store;
+        }
+        self.as_mut()
+            .set_credential_storage_tier(QString::from(&new_tier_name));
+        self.as_mut()
+            .set_credential_storage_choice(QString::from(&new_choice));
+        // In-memory always re-prompts on next launch — clear the
+        // acknowledgment so the warning re-pops if the user
+        // restarts after switching to in-memory.
+        let new_ack = new_tier != crate::token_persist::StorageTier::InMemory
+            && self.credential_storage_acknowledged;
+        self.as_mut().set_credential_storage_acknowledged(new_ack);
+        persist_prefs(self.as_ref().get_ref());
+    }
+
+    /// Mark the pre-flight credential-storage disclosure as
+    /// acknowledged. Persists immediately.
+    pub fn acknowledge_credential_storage(mut self: Pin<&mut Self>) {
+        if self.credential_storage_acknowledged {
+            return;
+        }
+        self.as_mut().set_credential_storage_acknowledged(true);
+        persist_prefs(self.as_ref().get_ref());
     }
 
     /// Persist window geometry so the next launch reopens at the
@@ -3964,6 +4081,54 @@ fn open_rw_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection
     Ok(conn)
 }
 
+/// Move every OAuth token + password secret tied to one of the
+/// `accounts` from the `from_*` stores into the `to_*` stores,
+/// then delete from the source. Best-effort per row: a failed
+/// `put` against the destination leaves the source intact (so a
+/// transient keychain hiccup doesn't lose credentials), and a
+/// successful migration of one row never blocks the rest.
+/// Returns `(tokens_moved, secrets_moved)` for logging.
+fn migrate_credentials(
+    accounts: &[(String, i32)],
+    from_tokens: &dyn tasks_sync::TokenStore,
+    from_secrets: &dyn crate::token_persist::SecretStore,
+    to_tokens: &dyn tasks_sync::TokenStore,
+    to_secrets: &dyn crate::token_persist::SecretStore,
+) -> (usize, usize) {
+    let mut tokens_moved = 0;
+    let mut secrets_moved = 0;
+    for (uuid, kind) in accounts {
+        // OAuth tokens — only Google / Microsoft carry these.
+        let provider_kind = match *kind {
+            KIND_GOOGLE_TASKS => Some(tasks_sync::ProviderKind::GoogleTasks),
+            KIND_MICROSOFT_TODO => Some(tasks_sync::ProviderKind::MicrosoftToDo),
+            _ => None,
+        };
+        if let Some(pk) = provider_kind {
+            if let Some(tokens) = from_tokens.get(pk, uuid) {
+                if to_tokens.put(pk, uuid, &tokens).is_ok() {
+                    let _ = from_tokens.delete(pk, uuid);
+                    tokens_moved += 1;
+                } else {
+                    tracing::warn!("migrate_credentials: token put failed for {uuid}");
+                }
+            }
+        }
+        // Password secrets — CalDAV / EteSync / EteBase use these.
+        if let Some(secret) = from_secrets.get_secret(uuid) {
+            if !secret.is_empty() {
+                if to_secrets.put_secret(uuid, &secret).is_ok() {
+                    let _ = from_secrets.delete_secret(uuid);
+                    secrets_moved += 1;
+                } else {
+                    tracing::warn!("migrate_credentials: secret put failed for {uuid}");
+                }
+            }
+        }
+    }
+    (tokens_moved, secrets_moved)
+}
+
 fn persist_prefs(vm: &qobject::TaskListViewModel) {
     let prefs = crate::preferences::Preferences {
         theme_mode: vm.theme_mode,
@@ -3978,6 +4143,8 @@ fn persist_prefs(vm: &qobject::TaskListViewModel) {
         window_y: vm.window_y,
         window_maximized: vm.window_maximized,
         notifications_enabled: vm.notifications_enabled,
+        credential_storage_choice: vm.credential_storage_choice.to_string(),
+        credential_storage_acknowledged: vm.credential_storage_acknowledged,
         list_overrides: vm.list_overrides.clone(),
     };
     prefs.save();
