@@ -472,12 +472,14 @@ fn record_push_success(
 }
 
 /// Open a writable handle to the desktop's SQLite. Mirrors the
-/// shape `tasks_core::write` uses so the locking semantics are
-/// the same.
+/// shape `tasks_core::write` uses so the locking semantics —
+/// WAL journal + 5 s busy_timeout — are the same; without that
+/// alignment, parallel sync workers (one per account when the
+/// auto-sync timer fans out) deadlock with `SQLITE_BUSY`.
 fn open_rw(path: &Path) -> rusqlite::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
-    conn.busy_timeout(std::time::Duration::from_millis(1_000))?;
+    tasks_core::tune_writeback_connection(&conn)?;
     Ok(conn)
 }
 

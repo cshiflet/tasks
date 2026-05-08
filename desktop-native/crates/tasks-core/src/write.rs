@@ -28,16 +28,17 @@ use rusqlite::{params, Connection, OpenFlags, Transaction};
 
 use crate::error::Result;
 
-/// Open a writable connection to `path` with the same defensive
-/// tuning the read-only path uses (short `busy_timeout`, no shared
-/// cache). Callers should drop the connection as soon as the write
-/// completes so the GUI's read-only handle reclaims the lock.
+/// Open a writable connection to `path` and apply our shared
+/// concurrency tuning. The shared part is in
+/// [`crate::db::tune_writeback_connection`] so every RW handle —
+/// including the engine's per-sync connections in tasks-sync —
+/// agrees on busy_timeout + journal_mode. Callers should drop
+/// the connection as soon as the write completes so the GUI's
+/// read-only handle reclaims the lock.
 fn open_rw(path: &Path) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
-    // One second is enough for any realistic transient contention
-    // (the only other writer is ourselves, during import).
-    conn.busy_timeout(std::time::Duration::from_millis(1_000))?;
+    crate::db::tune_writeback_connection(&conn)?;
     Ok(conn)
 }
 

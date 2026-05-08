@@ -4279,7 +4279,12 @@ fn open_rw_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection
     let flags =
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = rusqlite::Connection::open_with_flags(path, flags)?;
-    conn.busy_timeout(std::time::Duration::from_millis(1_000))?;
+    // Shared WAL + busy_timeout tuning so this transient bridge
+    // handle and the engine's per-sync handles agree on locking
+    // semantics. Without that alignment, parallel sync workers
+    // (one per account when the auto-sync timer fans out) hit
+    // SQLITE_BUSY against this handle's writes.
+    tasks_core::tune_writeback_connection(&conn)?;
     Ok(conn)
 }
 

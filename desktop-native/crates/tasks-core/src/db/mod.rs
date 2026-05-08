@@ -136,12 +136,7 @@ impl Database {
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&path, flags)?;
-        // 1 s busy_timeout: matches `tasks_core::write::open_rw`.
-        // The desktop client may have a transient writer (sync
-        // engine running on the tokio runtime) plus this handle,
-        // and SQLITE_BUSY on a sub-second contended lock is
-        // recoverable without bothering the user.
-        conn.busy_timeout(std::time::Duration::from_millis(1_000))?;
+        tune_writeback_connection(&conn)?;
 
         let actual_hash = read_identity_hash(&conn)?;
         if actual_hash != PINNED_IDENTITY_HASH {
@@ -202,6 +197,40 @@ fn create_empty_db(path: &Path) -> Result<()> {
 /// Reject a path whose final component is a symlink. Non-existent
 /// paths are OK (the caller may be about to create the file);
 /// anything else that fails `symlink_metadata` is also surfaced
+/// Apply the desktop client's writer-side concurrency tuning.
+/// Used by every RW handle: the long-lived bridge connection,
+/// the per-write transient handles in `tasks_core::write`, and
+/// the per-sync engine handles in `tasks_sync::engine`.
+///
+/// Two settings:
+///
+/// * `journal_mode = WAL` so concurrent reads + a single writer
+///   coexist without taking out a database-wide lock. Without
+///   WAL, parallel `sync_account` calls (one per account fanned
+///   out by the periodic auto-sync timer) deadlock against each
+///   other with `SQLITE_BUSY` even when their write windows are
+///   short — the rollback journal serialises everything through
+///   the file-level lock. WAL allows concurrent readers + one
+///   writer at a time, with the writer's commits going through
+///   the WAL file rather than blocking readers. WAL is set
+///   per-database, sticks across opens, so calling it on every
+///   open is a no-op after the first.
+///
+/// * `busy_timeout = 5 s` so the rare transient contention that
+///   does happen (writer-vs-writer when two syncs commit within
+///   ms of each other) still surfaces as a delay rather than an
+///   error. The bridge's interactive writes are sub-100ms, the
+///   sync engine's per-task transactions are similar; 5 s is
+///   enough headroom for any realistic batch the engine commits
+///   while another worker is mid-commit. Tuned up from the
+///   earlier 1 s after the user reported "database is locked"
+///   on parallel sync of 4 accounts pulling 800+ tasks each.
+pub fn tune_writeback_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(())
+}
+
 /// so IO errors on the parent dir don't get silently swallowed.
 ///
 /// `symlink_metadata` does NOT follow symlinks — that's the whole
