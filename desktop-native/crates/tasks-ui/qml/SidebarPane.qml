@@ -464,7 +464,15 @@ Pane {
                                 ? (root.vm.accountSyncStates[_accountIndex] || "")
                                 : ""
                             property bool _justSucceeded: false
-                            onCurrentStateChanged: {
+                            // Signal name is `_currentStateChanged` (the
+                            // leading underscore from the property name
+                            // is preserved). The handler form is
+                            // `on_CurrentStateChanged` — capitalising
+                            // the first letter after the underscore.
+                            // Plain `onCurrentStateChanged` is a
+                            // different name and silently fails as a
+                            // QML load error.
+                            on_CurrentStateChanged: {
                                 if (_currentState.startsWith("Synced")) {
                                     _justSucceeded = true;
                                     successTimer.restart();

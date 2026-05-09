@@ -113,8 +113,19 @@ jobs:
           #   * `Unable to assign [undefined]` — usually a stale-array
           #     access after a model-change race
           #   * `TypeError:` from QML — unresolved property on a VM
-          #   * `file::…qml:…:` unknown-component / import errors
-          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:" smoke-stderr.log; then
+          #   * `: error:` — generic compile-error trailer
+          #   * `Cannot assign to non-existent property` — typo'd
+          #     property/handler name (e.g. `onFooChanged` vs
+          #     `on_FooChanged` for an underscored property). Without
+          #     this, the QML engine still loads the parent component
+          #     but the handler silently doesn't fire, and the smoke
+          #     test happily reports rc=124. 2026-05 we shipped a
+          #     SidebarPane regression of exactly this shape.
+          #   * `Type … unavailable` — a Type-A.qml fails to load and
+          #     a Type-B.qml that uses it fails too; the cascade is
+          #     the only signal we get when a child QML file has a
+          #     load error of any kind.
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:|Cannot assign to non-existent property|Type [A-Za-z_]+ unavailable" smoke-stderr.log; then
             echo "QML smoke test found warnings — see matches above" >&2
             exit 1
           fi
