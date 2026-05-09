@@ -29,9 +29,14 @@ the compose stack uses the alpine image.
 
 ## Local modifications
 
-None today. All files are byte-identical to upstream at the SHA
-above. If we ever diverge, list the changes here so the next bump
-can re-apply them after a fresh copy.
+| File          | Change                                       | Why                                       |
+|---------------|----------------------------------------------|-------------------------------------------|
+| `Dockerfile`  | Added `curl` to the runtime `apk add` list   | The compose-level healthcheck calls `curl`; without it the container is reported unhealthy because the healthcheck command itself fails with "executable not found." |
+
+When bumping upstream, re-apply this change after the fresh copy:
+add `curl` at the end of the runtime `apk add --no-cache …` list
+(distinct from the `--virtual .build-deps` line that gets removed
+later in the same RUN block).
 
 ## Bumping to a newer upstream
 

@@ -25,7 +25,13 @@ WORKDIR ${BASE_DIR}
 RUN set -eux; \
     # Prepare packages required by the base image
     apk upgrade --no-cache; \
-    apk add --no-cache openssl mailcap libpq libffi libldap libsasl bash; \
+    # `curl` is a local addition (not in upstream's apk list) so the
+    # docker-compose healthcheck — `curl -sS http://localhost:3735/`
+    # — has a binary to invoke. Without it the healthcheck fails
+    # with "executable not found", marking the container unhealthy
+    # even though the Django dev server is responding fine. See
+    # UPSTREAM.md "Local modifications" for the bump procedure.
+    apk add --no-cache openssl mailcap libpq libffi libldap libsasl bash curl; \
     apk add --no-cache --virtual .build-deps coreutils gcc make wget linux-headers \
         cyrus-sasl-dev libc-dev libffi-dev openssl-dev postgresql-dev openldap-dev git; \
     # Download Etebase and install dependencies

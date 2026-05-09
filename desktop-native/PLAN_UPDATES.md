@@ -935,3 +935,67 @@ code, one new dev-dep.
 **Decision needed:** whether the wiremock dep cost is
 worth the pin on F1 ordering. If yes, this lands in one
 follow-up commit alongside the F4 read-only-DB test.
+
+### 13.5 User-supplied master password (currently reserved-only)
+
+**Problem.** `EncryptedFileTokenStore` derives its AES-256-GCM
+key from `HKDF-SHA256(machine-id, per-file-salt)`. Machine-id
+is readable on every supported platform by any local process
+running as the user (Linux `/etc/machine-id` is world-readable;
+macOS IORegistry UUID and Windows scheduler UUID are similarly
+exposed). The encrypted-file tier therefore protects against
+`tasks.db` / `oauth.bin` exfiltrated *without* the rest of the
+machine (cloud-backup leak, USB-stick theft) — but does NOT
+protect against another local user-mode process reading both
+the file AND the machine-id and decrypting locally.
+
+A user-supplied master password closes that gap: the cipher
+key becomes `Argon2id(passphrase, per-file-salt)`, machine-id
+no longer enters the derivation, and the passphrase lives only
+in process memory (SecretString) for the lifetime of the run.
+
+**Status today.** Slot reserved, nothing wired:
+
+  * `KdfMarker::MasterPassword = 1` is in the file-format
+    enum and the byte-table layout.
+  * `decode_file` reads the marker and returns a clear
+    "master-password mode is not supported in this build"
+    error.
+  * `decode_rejects_master_password_until_supported` pins
+    the forward-compat rejection.
+
+What's missing: the Argon2id derivation (parameter selection
+— memory cost / time cost / parallelism), a passphrase-prompt
+QML dialog at startup when the file uses the MasterPassword
+marker, a "set / change / remove master password" flow in
+Settings, a migration path that re-encrypts the file when the
+user opts in or out, and the in-memory passphrase lifecycle
+(prompted re-entry on session lock, cleared on unlock).
+
+**Options.**
+
+1. **Argon2id with conservative params + always-prompt at
+   startup.** Library: `argon2` crate. Parameters: 64 MiB / 3
+   iter / 1 lane (OWASP 2024 floor). Prompt blocks app launch
+   until the user enters the passphrase; mistype gets re-
+   prompted (with rate-limit). On enable / disable, re-encrypt
+   the file once. ~400 LOC + a new QML dialog.
+2. **Optional master password — opt-in via Settings.** Same
+   as 1 but unmarked installs continue using machine-id. The
+   user ticks "use a master password" and provides one; the
+   file is re-encrypted with MasterPassword marker. Removing
+   it re-encrypts back to MachineId. More UX surface; same
+   crypto.
+3. **Defer.** The threat model gap is real but requires same-
+   machine attacker access, which most desktop users don't
+   defend against in any other layer either.
+
+**Recommendation:** option 2 once Milestone 1 / 2 GUI testing
+is settled. The forward-compat slot was deliberately reserved
+for this; abandoning it would be a soft regression. Engineering
+effort is comparable to one of the M2 sub-features.
+
+**Decision needed:** whether to land this before M3 (CalDAV
+write path) or after; the param-selection details (Argon2id is
+non-trivial to size — too aggressive locks out laptops on
+battery, too weak makes the password meaningless).
