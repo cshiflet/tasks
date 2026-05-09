@@ -6,7 +6,7 @@
 - `kmp/` — Kotlin Multiplatform module (targets `androidTarget()` and `jvm()`; currently shares query builders and a handful of Compose UI components)
 - `data/` — Kotlin Multiplatform data module (Room entities, DAOs, schemas). Canonical schema JSON lives in `data/schemas/org.tasks.data.db.Database/<version>.json`.
 - `wear/` and `wear-datalayer/` — Wear OS companion
-- `desktop-native/` — **Native (Rust + Qt 6) desktop client.** See `desktop-native/README.md`. Separate from any Kotlin/JVM desktop experiment.
+- `desktop-native/` — **Native (Rust + Qt 6) desktop client.** See `desktop-native/README.md` and `desktop-native/CLAUDE.md`. Separate from any Kotlin/JVM desktop experiment.
 
 ## Ignore
 
