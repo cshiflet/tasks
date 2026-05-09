@@ -735,3 +735,203 @@ Remaining Settings/Accounts follow-ups (explicit):
 - Swap the OAuth provider entries from "coming soon" to a real
   `authorize()` button once the browser-opener + loopback
   plumbing is reachable from QML.
+
+## 13. Pending design decisions surfaced by the security + review passes
+
+Five items deferred from the security pass (commit `a6e1172ab`)
+and the five-axis review pass (commit `28f77f210`) need design
+calls before they're implementable. Each is scoped here as a
+mini-spec: problem statement, options, recommendation, and the
+question the user has to answer.
+
+### 13.1 F6 — silent in-memory credential degradation
+
+**Problem.** When `KeychainTokenStore::probe()` succeeds at one
+launch but `EncryptedFileTokenStore::probe()` fails at a later
+launch (encrypted file's auth tag fails to verify, the file is
+gone, machine-id rotated after a system re-image), `StorageTier`
+silently falls through to `InMemorySecretStore` and just logs
+at `warn!`. The QML disclosure dialog doesn't re-pop because
+`credential_storage_acknowledged` is still `true` from the
+prior session. The user sees their tokens "needed re-issuing"
+without learning their persistent tier degraded — a phishing
+opportunity if the next OAuth re-sign-in feels routine.
+
+**Options.**
+
+1. **Re-pop the disclosure on every probe-tier downgrade.** Detect
+   "active tier ≠ user-requested tier (or last-recorded persistent
+   tier)" at startup; if downgraded, clear
+   `credential_storage_acknowledged` and surface a banner. Most
+   conservative; flag-the-user-every-time.
+2. **Re-pop only when the active tier landed on `InMemory`.**
+   Narrower trigger. `Keychain → EncryptedFile` fallback
+   wouldn't bother the user (still persistent), but
+   `EncryptedFile → InMemory` would — that's the volatile
+   case where re-sign-in *will* be required.
+3. **Add a "credential storage demoted" status banner without
+   re-popping the disclosure** — the user keeps using the app
+   but sees the demotion in the Accounts pane.
+
+**Recommendation:** option 2 + a small per-session "demoted"
+flag the Accounts pane reads. Re-popping the modal disclosure
+on every launch the keychain is briefly unavailable (e.g. on
+GNOME login before the keyring unlocks) would be too noisy.
+
+**Decision needed:** which trigger semantics. Once chosen,
+implementation is ~30 lines in `bridge.rs::open_at_path` +
+a per-row label binding in `AccountsPane.qml`.
+
+### 13.2 F9 — OAuth re-sign-in throttling
+
+**Problem.** Today `begin_oauth_sign_in` and `start_oauth` have
+no minimum interval between attempts. A buggy QML signal
+handler or a malicious clipboard auto-paste could fire the
+flow in a tight loop, opening a system-browser tab on each
+call and burning through PKCE / state pairs against the
+authorisation server (which Google + Microsoft both rate-limit
+on their end, surfacing as opaque 4xx responses).
+
+**Options.**
+
+1. **Per-account "earliest-next-attempt" timestamp.** Refuse
+   to start a new flow if the previous one began less than N
+   seconds ago. N = 5 s for first three attempts, exponential
+   backoff after. Surface as a status-bar message
+   ("Throttled: try again in {n}s") and an inert Sign-in
+   button.
+2. **Single in-flight guard.** Only one OAuth flow at a time
+   regardless of which account. `oauth_stop` already exists
+   for the cancellation path; gate `start_oauth` on
+   `oauth_stop.is_none()`.
+3. **Rely on the AS rate limit.** Don't add a client-side
+   throttle; let the AS's 4xx surface. Simplest but exposes
+   the user to the noise.
+
+**Recommendation:** options 1 + 2 together (one in-flight
+plus per-account cooldown). The cooldown numbers are
+engineering, not policy — pick conservative defaults
+(5 s / 15 s / 60 s exponential) and revisit only if a real
+flow surfaces a friction point.
+
+**Decision needed:** the cooldown numbers; the surface (toast
+vs inline status); whether throttle on user-initiated re-
+sign-in only or also on auto-sync re-auth attempts.
+
+### 13.3 Rustls upgrade — `reqwest 0.11` → `0.12`
+
+**Problem.** `cargo audit` flags three CVEs in `rustls-webpki
+0.101.7` (RUSTSEC-2026-0098 / -0099 / -0104): two name-
+constraint bypasses on cert validation, one reachable panic
+in CRL parsing. We pin `rustls-tls` explicitly in both
+`tasks-sync` and `tasks-ui` Cargo.toml entries, so the
+advisory applies to every CalDAV / Google / Microsoft / Etebase
+request. The CVE fix path is `rustls-webpki ≥0.103.13`, which
+requires `rustls ≥0.23`, which means `reqwest 0.12`.
+
+**The migration cost is non-trivial.** `reqwest 0.12`
+changes:
+
+- Builder ergonomics: `redirect::Policy::none()` and
+  per-request `header()` calls are stable, but several
+  `Client` setters renamed.
+- Default features: drops `default-tls`; we already opt in
+  with `rustls-tls`, so no breakage there.
+- Stream consumption: `Response::bytes_stream()` API changed
+  shape — our `read_body_capped` consumer needs a 5-line
+  update.
+- TLS error types: a couple of variants moved between
+  `reqwest::Error` sources.
+
+**Options.**
+
+1. **Bump reqwest to 0.12 across the workspace.** One
+   commit; touches every provider + `bridge.rs::http_for_oauth`.
+   Run the whole test suite + manual smoke against a real
+   CalDAV/Etebase to flush out behavioural drift.
+2. **Pin `rustls-webpki` via `[patch.crates-io]`.** Force the
+   transitive dep; reqwest 0.11 will keep using its old API
+   on the rest of the rustls stack. May or may not work
+   depending on rustls 0.21 ↔ rustls-webpki 0.103
+   compatibility (likely a semver hazard).
+3. **Switch from `rustls-tls` to `native-tls`.** Drops the
+   advisory entirely (uses OpenSSL on Linux, SChannel on
+   Windows, Secure Transport on macOS). Behavioural
+   differences across platforms become our problem.
+4. **Accept the risk + document.** The advisories are
+   pre-conditional (require attacker control of cert chain,
+   already MITM-able is a higher bar for our user-supplied
+   server URLs). Track the upgrade for a follow-up
+   milestone.
+
+**Recommendation:** option 1, but on its own branch
+(`claude/rustls-upgrade`) so the merge to main can revert
+cleanly if a manual smoke surfaces drift. Estimate: 200-400
+lines touched, ~3 hours of human dev time after the patch.
+
+**Decision needed:** which option; if 1, when (likely
+post-GUI-QA so the upgrade doesn't invalidate manual
+testing).
+
+### 13.4 Test-architecture gaps — F1 + F4
+
+Two regression-test gaps the five-axis review surfaced. Pairing
+them because both need a small piece of test infrastructure
+the codebase doesn't yet have.
+
+**F1 — CalDAV `connect()` ordering not directly tested.** The
+load-bearing property of the CRITICAL fix in
+`caldav.rs::connect()` is "given a server that returns an
+absolute cross-host `<d:href>`, the second authenticated
+PROPFIND must NOT be issued, and connect() must return
+`SyncError::Protocol`." `trusted_origin_rejects_off_origin_targets`
+tests `TrustedOrigin::check` in isolation but doesn't drive
+the connect() flow.
+
+**F4 — `update_password_account` rollback not unit-tested.**
+The "put_secret OK, DB UPDATE fails → delete_secret rollback"
+branch is exercised only by code review. Forcing it from
+outside requires either a closed/read-only DB connection or
+an injectable DB writer the test can fail.
+
+**Options for F1 (HTTP-mocking).**
+
+1. **Add `wiremock` as a dev-dep.** Standard Rust HTTP-mock
+   crate; lets us write `Mock::given(method("PROPFIND"))
+   .respond_with(ResponseTemplate::new(207)
+   .set_body_xml(absolute_href_response()))`. ~15 KB of
+   compiled test code.
+2. **Hand-roll a `tokio::net::TcpListener`-based responder
+   in test.** Smaller dep cost; messier test code. CalDAV's
+   PROPFIND verb makes this awkward (reqwest wraps the
+   custom-method support; we'd be hand-coding HTTP/1.1).
+3. **Ship without the test.** F1's mechanism is
+   straightforwardly verifiable by code reading; the cost
+   of a regression hides in a future change re-ordering
+   the four lines that establish + check trusted_origin.
+   Documented gap.
+
+**Options for F4 (DB-writer injection).**
+
+1. **Extract a `WriteAccountFn` trait the test can implement.**
+   Replaces the inline `open_rw_conn(&path).and_then(...)` with
+   a callable. Adds one type to the bridge module. ~20 lines.
+2. **Point `db_path` at a read-only file in the test.** Forces
+   `open_rw_conn` to error before the UPDATE runs — exercises
+   the rollback path without a refactor. Limitation: doesn't
+   cover the "open succeeds, UPDATE fails" branch (which is
+   what the rollback was originally designed for); tests the
+   whole-failure case instead.
+3. **Ship without the test.** Same trade-off as F1: the fix
+   mechanism is reviewable but a future regression in the
+   rollback ordering would be invisible to CI.
+
+**Recommendation:** for F1, option 1 (wiremock). For F4,
+option 2 (read-only DB file) — the broader fix mechanism
+catches what we actually care about (no leaked secret on
+DB failure of any shape). Combined cost: ~80 lines of test
+code, one new dev-dep.
+
+**Decision needed:** whether the wiremock dep cost is
+worth the pin on F1 ordering. If yes, this lands in one
+follow-up commit alongside the F4 read-only-DB test.
