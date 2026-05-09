@@ -64,7 +64,11 @@ pub fn truncate_for_status(body: &str) -> String {
             more = true;
             break;
         }
-        out.push(if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c });
+        out.push(if matches!(c, '\n' | '\r' | '\t') {
+            ' '
+        } else {
+            c
+        });
     }
     let trimmed = out.trim();
     if more {
