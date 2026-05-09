@@ -297,3 +297,175 @@ directly to this module as they're needed.
   listing but isn't in the current one is soft-deleted locally —
   matches the Android client and gives the UI's trash filter
   something to surface.
+
+## 18. SQLite concurrency: **WAL + 5 s busy_timeout via a single helper**
+
+Every RW handle in the workspace (`tasks_core::write` writers, the
+sync engine's `open_rw`, the bridge's `open_rw_conn`) now goes
+through `tasks_core::tune_writeback_connection`, which sets
+`journal_mode = WAL` and `busy_timeout = 5 s`.
+
+**Chosen** over the earlier per-handle 50–500 ms timeouts because:
+
+- **Parallel-account sync wedged on `SQLITE_BUSY`.** When the
+  periodic auto-sync timer fans out one worker per CalDAV /
+  Google / Microsoft / EteSync account, rollback-journal mode
+  serialises every writer through a database-wide lock; the
+  user reported `database is locked` on a 4-account fan-out
+  within seconds. WAL allows concurrent readers + one writer
+  with the writer's commits going through the WAL file rather
+  than blocking readers.
+- **5 s tolerance.** Writer-vs-writer transient contention
+  (two syncs committing within ms of each other) used to surface
+  as an error at the previous 100 ms / 500 ms timeouts. The
+  bridge's interactive writes are sub-100 ms; the engine's
+  per-task transactions are similar; 5 s is enough headroom for
+  any realistic batch the engine commits while another worker
+  is mid-commit.
+- **Single helper means no drift.** A future RW path that forgets
+  to call the helper would silently regress to rollback journal
+  + a default 100 ms timeout. `crates/tasks-core/tests/tune_writeback.rs`
+  pins both settings.
+
+Supersedes the earlier note in §12 about a 50 ms safety-net
+timeout — the load-bearing setting is now WAL itself, not the
+timeout.
+
+## 19. CalDAV `trusted_origin`: anchor to the **user-supplied `server_url`**, not the server-returned `calendar_home`
+
+`CalDavProvider::connect` derives `TrustedOrigin::from_url(&root)`
+**before** the first PROPFIND; the joined `principal_url` and
+`calendar_home` are then `trusted_origin.check()`-ed.
+
+**Chosen** over the earlier "anchor `trusted_origin` once
+discovery resolves to `calendar_home`" shape because:
+
+- **Hostile servers can return absolute hrefs.** `Url::join`
+  discards the base when the joined value is absolute, so a
+  server returning
+  `<d:href>https://attacker.example/principal/</d:href>` pointed
+  the next PROPFIND (carrying our Basic / Bearer header) at
+  the attacker host. Worse, anchoring `trusted_origin` to the
+  joined `calendar_home` re-anchored the trust boundary on the
+  attacker, defeating the H-1 origin-isolation invariant for
+  every subsequent authenticated request.
+- **Same-origin discovery is the realistic case.** Fastmail,
+  Nextcloud, iCloud, Radicale all return same-origin or
+  relative `<d:href>` paths. Cross-host discovery would mean
+  the user pasted the wrong URL into Settings → Accounts;
+  surfacing it as a Protocol error is the right UX.
+
+Trade-off accepted: a future CalDAV deployment that *requires*
+cross-host discovery (server X returns absolute hrefs under
+server Y) will fail to connect. Workaround: point `server_url`
+at server Y directly.
+
+## 20. OAuth loopback receiver: **layered defence-in-depth**
+
+The PKCE callback receiver enforces three independent checks
+before accepting a request:
+
+1. `bind_with_redirect(host, _)` allowlists the **host string**
+   to `{127.0.0.1, localhost, ::1, [::1]}` — the value
+   advertised in the OAuth `redirect_uri` AND matched against
+   the inbound `Host:` header.
+2. The kernel-level bind is hardcoded to `127.0.0.1:0`.
+3. After `accept()`, the **peer address** is checked with
+   `peer.ip().is_loopback()` and non-loopback peers are
+   dropped.
+
+**Chosen** over relying on either the kernel bind or the host
+match alone because:
+
+- **Two of the three are belt-and-suspenders.** Kernel bind
+  blocks off-link peers today; if a future change drops the
+  bind to `0.0.0.0` (e.g. for an IPv6 dual-stack experiment),
+  Host-header pinning alone is LAN-spoofable.
+- **The host allowlist closes a future-caller hazard.** Without
+  it, a future call that lifted a string out of user input
+  could pull the browser's redirect through arbitrary DNS —
+  the kernel still binds loopback, but the `redirect_uri` (and
+  the `Host:` header it expects) name the wrong host.
+
+Three layers means any one regressing doesn't open the trust
+boundary; the test suite pins each independently
+(`bind_with_redirect_rejects_non_loopback_hosts` covers (1);
+the slow-loris / wrong-host / wrong-path tests cover (2)+(3)).
+
+## 21. Credential storage: **probe cascade** (keychain → encrypted file → in-memory)
+
+`StorageTier::probe()` tries `KeychainTokenStore::probe()`
+first; on failure, falls through to
+`EncryptedFileTokenStore::probe()`; on that failure, drops to
+`InMemorySecretStore`. The active tier is exposed to QML via
+the `credential_storage_tier` Q_PROPERTY so the disclosure
+dialog reflects what's actually in use.
+
+**Chosen** over single-tier picks (forced keychain, forced
+file) because:
+
+- **Linux without Secret Service is real.** Headless servers,
+  desktop environments without `gnome-keyring` / KWallet
+  running, or just first-launch-before-the-user-unlocks-the-
+  keyring all fail keychain probe. Falling through to an
+  AES-256-GCM-encrypted file (HKDF-SHA256 from
+  `/etc/machine-id` on Linux, IORegistry UUID on macOS,
+  scheduler-supplied UUID on Windows) keeps tokens persistent
+  without a "your password evaporated" experience.
+- **Encrypted-file probe can also fail.** Read-only filesystem,
+  `/etc/machine-id` rotated since the file was written (system
+  re-image), or the file's auth tag fails verification. The
+  in-memory tier is the last resort with explicit user-visible
+  status ("credentials will not survive restart").
+- **The user can pin a tier.**
+  `update_credential_storage_choice` takes `"auto"` /
+  `"keychain"` / `"encrypted_file"` / `"in_memory"`; `"auto"`
+  runs the cascade, the others force-select with no fallback.
+  The probed tier is shown in the disclosure; the user's
+  choice is what gets persisted in `preferences.json`.
+
+Trade-off accepted: switching tiers copies credentials forward
+but does NOT delete them from the prior backend (no
+transaction primitive across keychain / file / in-memory).
+Surfaces as F5 in the security pass; documented rather than
+fixed because reaching back into a keychain entry to delete
+risks data loss if the user later switches back.
+
+## 22. Sync engine: **deletes before pushes, per-row tolerance**
+
+`SyncEngine::push_dirty` runs the soft-delete pass *before*
+the dirty-row push pass. Both passes are per-row tolerant: a
+transient `Auth` / `Network` / `Protocol` / `Local` error
+from a single row logs at warn and continues to the next
+row, instead of `return Err` aborting the whole cycle.
+
+**Chosen** over the earlier "pushes-first, abort-on-first-
+error" shape because:
+
+- **One bad row blocked everything.** A single expired
+  credential on one dirty row aborted `push_dirty` mid-loop,
+  skipping the delete pass *and* every other dirty row.
+  Concretely: a user with one CalDAV account whose etag had
+  drifted couldn't propagate any deletes from any account
+  until they hand-fixed the etag.
+- **Deletes are atomic remote-side.** Soft-deletes are
+  body-less, etag-less (or `If-Match`-gated), no merge
+  semantics. Running them first means they don't get blocked
+  by a sticky push.
+- **Conflicts on delete have their own story.** A
+  `SyncError::Conflict` from `delete_task` (CalDAV's
+  `If-Match` returned 412 because a third party edited the
+  row) is NOT a transient — the engine counts it into
+  `outcome.conflicts` separately, leaves `cd_etag` /
+  `cd_deleted` unchanged, and lets the next pull refresh the
+  etag so the user can re-issue the delete consciously.
+  Without this branch, the second delete would silently
+  overwrite the third-party edit.
+
+Five tests in `engine.rs::tests` pin the ordering, the
+per-row tolerance, and the conflict branch
+(`push_dirty_propagates_local_soft_deletes`,
+`push_dirty_retries_failed_deletes_next_cycle`,
+`push_dirty_propagates_deletes_even_when_push_fails`,
+`push_dirty_threads_cd_etag_into_delete_task`,
+`push_dirty_surfaces_delete_conflict_without_clearing_state`).
