@@ -2143,23 +2143,25 @@ impl qobject::TaskListViewModel {
         let allow_signup = is_local_etebase_url(&stored.server);
         let token_store = Arc::clone(&self.as_ref().token_store);
         let provider: Box<dyn Provider + Send> = match stored.kind {
-            KIND_CALDAV => {
+            KIND_CALDAV | KIND_ETESYNC => {
+                // Hoist the password-credentials build out of the
+                // per-kind arms — both providers consume the same
+                // AccountCredentials shape, the only difference is
+                // which Provider type wraps it. Mirrors the shape
+                // `create_list_on_account` already uses.
                 let creds = AccountCredentials::new_password(
                     &stored.server,
                     &stored.username,
                     secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
                 );
-                Box::new(CalDavProvider::new(creds, label.clone()))
-            }
-            KIND_ETESYNC => {
-                let creds = AccountCredentials::new_password(
-                    &stored.server,
-                    &stored.username,
-                    secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
-                );
-                Box::new(
-                    EteSyncProvider::new(creds, label.clone()).with_signup_fallback(allow_signup),
-                )
+                if stored.kind == KIND_CALDAV {
+                    Box::new(CalDavProvider::new(creds, label.clone()))
+                } else {
+                    Box::new(
+                        EteSyncProvider::new(creds, label.clone())
+                            .with_signup_fallback(allow_signup),
+                    )
+                }
             }
             KIND_GOOGLE_TASKS | KIND_MICROSOFT_TODO => {
                 let provider_kind = if stored.kind == KIND_GOOGLE_TASKS {
