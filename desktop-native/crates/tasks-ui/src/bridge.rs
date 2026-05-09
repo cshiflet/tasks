@@ -1632,6 +1632,32 @@ impl qobject::TaskListViewModel {
             }
         });
         if let Err(e) = res {
+            // Roll back the secret-store put if the DB UPDATE
+            // failed. Without this, on next launch
+            // `load_password_accounts` would prefer the new
+            // secret-store value and the account would *appear*
+            // to have been rotated — but the DB column would
+            // still hold the *old* plaintext password
+            // indefinitely (mirrors the dual-existence shape
+            // Round-3 A-R3-2 fixed in `migrate_legacy_passwords`,
+            // applied here to the user-edit path). Failure to
+            // roll back is logged at error so the user has a
+            // chance to notice.
+            if password_written_to_store {
+                if let Err(rollback_err) = self.as_ref().rust().secret_store.delete_secret(&uuid) {
+                    tracing::error!(
+                        "update_password_account: DB UPDATE failed for {uuid} ({e}); \
+                         rollback delete_secret ALSO failed ({rollback_err}); \
+                         the new password is in the secret store while the column \
+                         still holds the previous plaintext"
+                    );
+                } else {
+                    tracing::error!(
+                        "update_password_account: DB UPDATE failed for {uuid} ({e}); \
+                         rolled back the put_secret; account row unchanged"
+                    );
+                }
+            }
             self.as_mut()
                 .set_status(QString::from(&format!("DB write failed: {e}")));
             return;
@@ -3990,8 +4016,27 @@ fn reqwest_client_for_oauth() -> Result<reqwest::Client, reqwest::Error> {
 }
 
 fn is_local_etebase_url(server_url: &str) -> bool {
-    let lower = server_url.to_ascii_lowercase();
-    lower.contains("://127.0.0.1") || lower.contains("://localhost") || lower.contains("://[::1]")
+    // Parse the URL and check the host exactly. The earlier
+    // substring-based check (`server_url.contains("://127.0.0.1")`)
+    // matched any URL containing that string anywhere — including
+    // `https://attacker.example/?next=://127.0.0.1`. When matched,
+    // `EteSyncProvider::with_signup_fallback(true)` is enabled and
+    // a login failure escalates to `Account::signup` against the
+    // *server URL* with the user's chosen password as the signup
+    // payload — i.e. the user's password is leaked verbatim to
+    // any host that can stuff a loopback substring into a URL the
+    // user pastes. Use the parser-anchored host instead so only
+    // genuine loopback URLs trigger the auto-signup path.
+    let Ok(url) = url::Url::parse(server_url) else {
+        return false;
+    };
+    match url.host_str() {
+        Some(h) => {
+            let h = h.to_ascii_lowercase();
+            h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]"
+        }
+        None => false,
+    }
 }
 
 fn syncable_account_for_task(db: &Database, task_id: i64) -> Option<String> {
@@ -5044,5 +5089,45 @@ mod tests {
             secret_store.get_secret("uuid-1").as_deref(),
             Some("fresh-from-store")
         );
+    }
+
+    /// Security review F7: `is_local_etebase_url` must use a
+    /// parsed-URL host check, not substring containment. The
+    /// earlier `server_url.contains("://127.0.0.1")` matched
+    /// any URL containing that substring anywhere, including
+    /// `https://attacker.example/?next=://127.0.0.1` — when
+    /// matched, EteSync's `with_signup_fallback(true)` would
+    /// post the user's password to the attacker as a signup.
+    #[test]
+    fn is_local_etebase_url_only_matches_genuine_loopback_hosts() {
+        // Genuine loopback URLs the test EteSync deployments use.
+        for url in &[
+            "http://127.0.0.1:3735/",
+            "https://127.0.0.1/",
+            "http://localhost:8000/",
+            "http://LocalHost/",
+            "http://[::1]:1234/",
+            "http://[::1]/",
+        ] {
+            assert!(
+                is_local_etebase_url(url),
+                "expected genuine loopback URL to match: {url:?}"
+            );
+        }
+        // Substring-trick URLs that the previous check matched.
+        for url in &[
+            "https://attacker.example/?next=://127.0.0.1",
+            "https://attacker.example/path/?redirect=://localhost",
+            "https://localhost.attacker.example/",
+            "https://127.0.0.1.attacker.example/",
+            "ftp://example.com/",
+            "not a url",
+            "",
+        ] {
+            assert!(
+                !is_local_etebase_url(url),
+                "expected non-loopback URL to be rejected: {url:?}"
+            );
+        }
     }
 }

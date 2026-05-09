@@ -24,7 +24,7 @@ use reqwest::{Client, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use super::http_util::{read_body_capped, DEFAULT_BODY_CAP};
+use super::http_util::{read_body_capped, truncate_for_status, DEFAULT_BODY_CAP};
 use super::microsoft_json::{
     parse_task_lists, parse_tasks, remote_to_task_json, task_list_to_remote_calendar,
     task_to_remote,
@@ -436,8 +436,12 @@ where
     let status = resp.status();
     let text = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
     if !status.is_success() {
+        // See google.rs equivalent: truncate for the QML status
+        // bar; full body still goes to tracing at debug.
+        tracing::debug!("microsoft token exchange failure body: {text}");
         return Err(SyncError::Auth(format!(
-            "token exchange failed: {status}: {text}"
+            "token exchange failed: {status}: {}",
+            truncate_for_status(&text)
         )));
     }
     parse_token_response(&text)
@@ -459,7 +463,11 @@ async fn refresh_access_token(
     let status = resp.status();
     let text = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
     if !status.is_success() {
-        return Err(SyncError::Auth(format!("refresh failed: {status}: {text}")));
+        tracing::debug!("microsoft refresh failure body: {text}");
+        return Err(SyncError::Auth(format!(
+            "refresh failed: {status}: {}",
+            truncate_for_status(&text)
+        )));
     }
     parse_token_response(&text)
 }

@@ -53,6 +53,10 @@ webbrowser = "1"
 # tasks-sync. Pinned to the same major + features as tasks-sync so
 # Cargo unifies the build into a single rustls-backed reqwest.
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+# Strict URL parsing for the loopback / EteSync host-allowlist
+# checks. Already in the dep tree via reqwest; expose it directly
+# so the bridge doesn't have to thread through reqwest::Url.
+url = "2"
 # OS-native notifications for task alarms. Abstracts
 # org.freedesktop.Notifications on Linux, NSUserNotification on
 # macOS (requires a packaged .app bundle to actually render), and

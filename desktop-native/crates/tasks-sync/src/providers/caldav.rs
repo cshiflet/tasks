@@ -145,6 +145,25 @@ impl Provider for CalDavProvider {
             .build()
             .map_err(|e| SyncError::Network(format!("reqwest build: {e}")))?;
 
+        // Anchor the trusted origin to the *user-supplied* root
+        // BEFORE the first PROPFIND. A hostile or compromised
+        // CalDAV server can return absolute `<d:href>` values
+        // pointing at any host — `Url::join` discards the base
+        // when the joined value is absolute, so without this
+        // clamp `principal_url` / `calendar_home` could land on
+        // an attacker-controlled host AND `trusted_origin`
+        // (formerly anchored to the post-discovery `calendar_home`)
+        // would re-anchor there, defeating the H-1 origin
+        // protection on every subsequent authenticated request.
+        // Pin to the user's input so cross-host hrefs surface as
+        // a clear protocol error instead of silently siphoning
+        // Basic / Bearer credentials. Legitimate CalDAV servers
+        // (Fastmail, Nextcloud, iCloud, Radicale) return
+        // same-origin or relative hrefs — cross-host discovery
+        // would require the user to point `server_url` at the
+        // real backend host directly.
+        let trusted_origin = TrustedOrigin::from_url(&root)?;
+
         // Step 1: PROPFIND / for current-user-principal.
         let principal_body = propfind(
             &http,
@@ -161,6 +180,11 @@ impl Provider for CalDavProvider {
         let principal_url = root
             .join(&principal_href)
             .map_err(|e| SyncError::Protocol(format!("bad principal href: {e}")))?;
+        // Refuse to send the auth header to an off-origin
+        // PROPFIND target — see the trusted_origin rationale
+        // above. The server-supplied principal href could be a
+        // fully-qualified URL pointing anywhere.
+        trusted_origin.check(&principal_url)?;
 
         // Step 2: PROPFIND principal for calendar-home-set.
         let home_body = propfind(
@@ -178,7 +202,7 @@ impl Provider for CalDavProvider {
         let calendar_home = root
             .join(&home_href)
             .map_err(|e| SyncError::Protocol(format!("bad home-set href: {e}")))?;
-        let trusted_origin = TrustedOrigin::from_url(&calendar_home)?;
+        trusted_origin.check(&calendar_home)?;
 
         *self.session.lock().await = Some(Session {
             http,

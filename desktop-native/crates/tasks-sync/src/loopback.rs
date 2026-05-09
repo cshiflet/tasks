@@ -65,7 +65,23 @@ impl LoopbackReceiver {
     /// start with `/`; use `"/"` for providers (Microsoft) that
     /// require the redirect URI to have no extra path so it
     /// matches a registration of `http://localhost`.
+    ///
+    /// `host` MUST be one of `127.0.0.1`, `localhost`, `[::1]`,
+    /// or `::1` — the kernel always binds the listener to
+    /// `127.0.0.1:0` regardless, but the value advertised in
+    /// the OAuth `redirect_uri` (and matched against the
+    /// inbound `Host:` header) has to stay loopback. A future
+    /// caller passing an attacker-supplied hostname here would
+    /// otherwise pull the browser's redirect through arbitrary
+    /// DNS and accept a `Host:` header naming that host —
+    /// turning a same-machine OAuth flow into a cross-host
+    /// callback target.
     pub fn bind_with_redirect(host: &str, path: &str) -> Result<Self, OAuthError> {
+        if !is_loopback_host(host) {
+            return Err(OAuthError::Random(format!(
+                "loopback host must be 127.0.0.1, localhost, ::1, or [::1]; got {host:?}"
+            )));
+        }
         let path = if path.starts_with('/') {
             path.to_string()
         } else {
@@ -157,7 +173,24 @@ impl LoopbackReceiver {
                 ));
             }
             match self.listener.accept() {
-                Ok((stream, _peer)) => {
+                Ok((stream, peer)) => {
+                    // Defence-in-depth: today the bind is hard-
+                    // coded to `127.0.0.1:0`, so the kernel won't
+                    // hand us an off-link peer. A future change
+                    // that drops the bind to `0.0.0.0` (e.g. for
+                    // dual-stack experiments) would lose that
+                    // guarantee, leaving Host-header pinning as
+                    // the only line of defence — a real LAN
+                    // attacker can spoof Host. Reject any peer
+                    // that isn't a loopback address up front.
+                    if !peer.ip().is_loopback() {
+                        tracing::warn!(
+                            "loopback receiver: rejecting non-loopback peer {}",
+                            peer.ip()
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     match handle_stream(stream, expected_state, &expected_host, &expected_path) {
                         Ok(params) => return Ok(params),
                         Err(OAuthError::MalformedRedirect(msg)) => {
@@ -190,6 +223,15 @@ impl LoopbackReceiver {
 /// client that dribbles bytes to hold the socket open. This also
 /// addresses L-4 — no separate fix needed.
 const STREAM_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Allowlist of host strings the OAuth `redirect_uri` is
+/// permitted to advertise. Matched against the value passed
+/// into [`LoopbackReceiver::bind_with_redirect`] so a future
+/// caller can't accidentally point the flow at a public
+/// hostname even though the kernel-level bind is loopback.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
 
 fn handle_stream(
     mut stream: TcpStream,
@@ -377,6 +419,42 @@ mod tests {
         assert!(uri.starts_with("http://127.0.0.1:"));
         assert!(uri.ends_with("/cb"));
         assert!(r.port() > 1024);
+    }
+
+    /// Round-N security review F2: `bind_with_redirect` must
+    /// reject any host string that isn't a documented loopback
+    /// alias. Without this, a future caller (or an accidental
+    /// path that lifts a string out of user input) could
+    /// advertise a public hostname in the OAuth `redirect_uri`
+    /// and accept a matching `Host:` header from the browser —
+    /// pulling the callback through arbitrary DNS even though
+    /// the kernel-level bind stays loopback.
+    #[test]
+    fn bind_with_redirect_rejects_non_loopback_hosts() {
+        for host in &[
+            "example.com",
+            "attacker.evil",
+            "192.168.1.1",
+            "0.0.0.0",
+            "",
+            // case-sensitive on purpose: the OAuth URI is a
+            // text-only contract with the AS; matching is exact.
+            "Localhost",
+            "127.0.0.2",
+        ] {
+            let result = LoopbackReceiver::bind_with_redirect(host, "/cb");
+            assert!(
+                result.is_err(),
+                "bind_with_redirect({host:?}) should be rejected"
+            );
+        }
+        // The four allowed forms must succeed.
+        for host in &["127.0.0.1", "localhost", "::1", "[::1]"] {
+            assert!(
+                LoopbackReceiver::bind_with_redirect(host, "/cb").is_ok(),
+                "bind_with_redirect({host:?}) should be accepted"
+            );
+        }
     }
 
     #[test]

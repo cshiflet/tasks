@@ -35,7 +35,7 @@ use serde::Deserialize;
 use super::google_json::{
     parse_tasklists, parse_tasks, remote_to_task_json, task_to_remote, tasklist_to_remote_calendar,
 };
-use super::http_util::{read_body_capped, DEFAULT_BODY_CAP};
+use super::http_util::{read_body_capped, truncate_for_status, DEFAULT_BODY_CAP};
 use crate::oauth::{
     build_authorization_request, build_refresh_request_body, build_token_request_body,
 };
@@ -502,8 +502,16 @@ where
     let status = resp.status();
     let text = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
     if !status.is_success() {
+        // Body cap so a stuck proxy / DNS-rebind / honest-but-
+        // verbose token endpoint doesn't wedge the status bar
+        // with megabytes of HTML, and so an `error_description`
+        // that echoes the rejected OAuth `code` doesn't survive
+        // intact in any tracing sink the bridge later writes
+        // the SyncError into.
+        tracing::debug!("google token exchange failure body: {text}");
         return Err(SyncError::Auth(format!(
-            "token exchange failed: {status}: {text}"
+            "token exchange failed: {status}: {}",
+            truncate_for_status(&text)
         )));
     }
     parse_token_response(&text)
@@ -526,7 +534,11 @@ async fn refresh_access_token(
     let status = resp.status();
     let text = read_body_capped(resp, DEFAULT_BODY_CAP).await?;
     if !status.is_success() {
-        return Err(SyncError::Auth(format!("refresh failed: {status}: {text}")));
+        tracing::debug!("google refresh failure body: {text}");
+        return Err(SyncError::Auth(format!(
+            "refresh failed: {status}: {}",
+            truncate_for_status(&text)
+        )));
     }
     parse_token_response(&text)
 }
