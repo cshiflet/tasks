@@ -85,6 +85,16 @@ impl StorageTier {
     /// `"in_memory"` short-circuits to the degraded fallback;
     /// anything else logs a warning and falls back to `"auto"`.
     /// Always returns `Ok` — at worst, in-memory.
+    ///
+    /// The returned [`SecretStore`] is a [`CascadingSecretStore`]
+    /// in `"auto"` mode: it routes writes to the chosen primary
+    /// tier first, then to the encrypted-file tier (if probed),
+    /// then to in-memory. This replaces the legacy plaintext-
+    /// to-`cda_password` fallback the bridge used to take when
+    /// the active tier rejected a write — see
+    /// `CascadingSecretStore`'s docs.
+    /// `"in_memory"` mode skips the cascade (the user explicitly
+    /// asked for volatile-only credentials).
     pub fn probe(request: &str) -> (Self, Arc<dyn TokenStore>, Arc<dyn SecretStore>) {
         if request == "in_memory" {
             return Self::in_memory();
@@ -94,27 +104,48 @@ impl StorageTier {
                 "credential_storage_choice = {request:?} is unknown; falling back to auto"
             );
         }
+        // Probe Tier-2 (encrypted-file) and Tier-3 (in-memory)
+        // up front so they're available as fallbacks in the
+        // cascade regardless of which tier ends up primary.
+        let enc_file_concrete: Option<Arc<EncryptedFileTokenStore>> =
+            match EncryptedFileTokenStore::probe() {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!("token store: encrypted-file fallback unavailable: {e}");
+                    None
+                }
+            };
+        let in_memory_secrets: Arc<InMemorySecretStore> = Arc::new(InMemorySecretStore::new());
+
         match KeychainTokenStore::probe() {
             Ok(s) => {
-                let arc: Arc<KeychainTokenStore> = Arc::new(s);
+                let kc: Arc<KeychainTokenStore> = Arc::new(s);
+                let mut fallbacks: Vec<Arc<dyn SecretStore>> = Vec::new();
+                if let Some(enc) = &enc_file_concrete {
+                    fallbacks.push(enc.clone() as Arc<dyn SecretStore>);
+                }
+                fallbacks.push(in_memory_secrets.clone() as Arc<dyn SecretStore>);
+                let cascade =
+                    CascadingSecretStore::new(kc.clone() as Arc<dyn SecretStore>, fallbacks);
                 return (
                     StorageTier::Keychain,
-                    arc.clone() as Arc<dyn TokenStore>,
-                    arc as Arc<dyn SecretStore>,
+                    kc as Arc<dyn TokenStore>,
+                    Arc::new(cascade) as Arc<dyn SecretStore>,
                 );
             }
             Err(e) => tracing::info!("token store: keychain unavailable: {e}"),
         }
-        match EncryptedFileTokenStore::probe() {
-            Ok(s) => {
-                let arc: Arc<EncryptedFileTokenStore> = Arc::new(s);
-                return (
-                    StorageTier::EncryptedFile,
-                    arc.clone() as Arc<dyn TokenStore>,
-                    arc as Arc<dyn SecretStore>,
-                );
-            }
-            Err(e) => tracing::warn!("token store: encrypted-file fallback unavailable: {e}"),
+        if let Some(enc) = enc_file_concrete {
+            // Encrypted-file is now the primary; the only
+            // remaining fallback is in-memory.
+            let fallbacks: Vec<Arc<dyn SecretStore>> =
+                vec![in_memory_secrets as Arc<dyn SecretStore>];
+            let cascade = CascadingSecretStore::new(enc.clone() as Arc<dyn SecretStore>, fallbacks);
+            return (
+                StorageTier::EncryptedFile,
+                enc as Arc<dyn TokenStore>,
+                Arc::new(cascade) as Arc<dyn SecretStore>,
+            );
         }
         Self::in_memory()
     }
@@ -127,6 +158,114 @@ impl StorageTier {
             Arc::new(tasks_sync::InMemoryTokenStore::new()),
             mem,
         )
+    }
+}
+
+/// Wrap a primary [`SecretStore`] with one or more lower-tier
+/// fallbacks. `put_secret` walks `[primary, fallbacks…]` until
+/// one accepts; `get_secret` walks the same chain returning the
+/// first hit; `delete_secret` is best-effort across every
+/// store in the chain so a previously-promoted secret is wiped
+/// from wherever it landed.
+///
+/// Why: before the cascade, `bridge.rs::add_password_account`
+/// and `update_password_account` fell back to writing
+/// **plaintext** into `caldav_accounts.cda_password` whenever
+/// the active tier's `put_secret` returned an error mid-session
+/// (keychain locked, encrypted-file disk error, etc.). The
+/// cascade replaces that plaintext-column path: when the
+/// primary tier rejects, the secret instead lands in the
+/// encrypted-file tier (or in-memory as a last resort). The
+/// user's "selected tier" is still the primary write target —
+/// the cascade only fires when the primary literally won't
+/// accept the write. Trades a small tier-purity property
+/// (secret may land in a lower tier than the user picked) for
+/// a meaningful security guarantee (no plaintext on disk).
+///
+/// `delete_secret` walks the whole chain rather than only the
+/// primary because we don't track which tier any given uuid
+/// landed in — and a stale entry left in a lower tier would
+/// silently shadow the primary on the next `get_secret`.
+pub struct CascadingSecretStore {
+    primary: Arc<dyn SecretStore>,
+    fallbacks: Vec<Arc<dyn SecretStore>>,
+}
+
+impl CascadingSecretStore {
+    pub fn new(primary: Arc<dyn SecretStore>, fallbacks: Vec<Arc<dyn SecretStore>>) -> Self {
+        Self { primary, fallbacks }
+    }
+
+    fn chain(&self) -> impl Iterator<Item = &Arc<dyn SecretStore>> {
+        std::iter::once(&self.primary).chain(self.fallbacks.iter())
+    }
+}
+
+impl SecretStore for CascadingSecretStore {
+    fn put_secret(&self, account_uuid: &str, secret: &str) -> Result<(), TokenStoreError> {
+        let mut last_err: Option<TokenStoreError> = None;
+        for (idx, store) in self.chain().enumerate() {
+            match store.put_secret(account_uuid, secret) {
+                Ok(()) => {
+                    if idx > 0 {
+                        // Primary refused; we landed on a lower
+                        // tier. Log loud enough that the user
+                        // sees this in `RUST_LOG=info` — they
+                        // probably want to know their keychain
+                        // briefly broke. Don't `error!` — the
+                        // credential IS persisted, just on a
+                        // lower tier than chosen.
+                        tracing::warn!(
+                            "secret store: primary tier refused put for {account_uuid}; \
+                             fell through to fallback tier {idx}"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "secret store: tier {idx} rejected put for {account_uuid}: {e}"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        // Every tier including in-memory rejected the write.
+        // In practice this is unreachable because
+        // `InMemorySecretStore::put_secret` only fails if the
+        // mutex is poisoned; surface the last error so the
+        // bridge can decide whether to abort the operation.
+        Err(last_err
+            .unwrap_or_else(|| TokenStoreError::Backend("cascade has no stores configured".into())))
+    }
+
+    fn get_secret(&self, account_uuid: &str) -> Option<String> {
+        for store in self.chain() {
+            if let Some(s) = store.get_secret(account_uuid) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    fn delete_secret(&self, account_uuid: &str) -> Result<(), TokenStoreError> {
+        // Best-effort across every tier — a previously-promoted
+        // secret may live in any of them. Aggregate errors;
+        // succeed if at least one delete went through (or if
+        // all stores reported the entry didn't exist).
+        let mut first_err: Option<TokenStoreError> = None;
+        for store in self.chain() {
+            if let Err(e) = store.delete_secret(account_uuid) {
+                tracing::debug!("secret store: tier delete returned err for {account_uuid}: {e}");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -708,5 +847,100 @@ mod tests {
         bytes.resize(60, 0);
         let err = decode_file(&bytes).unwrap_err();
         assert!(err.contains("master-password"));
+    }
+
+    /// A SecretStore that always rejects writes. Models the
+    /// "keychain locked mid-session" / "encrypted-file disk
+    /// gone read-only" failure modes for the cascade tests
+    /// below. `get_secret` returns `None` (we'd never have
+    /// written anything to it), `delete_secret` returns Ok
+    /// (idempotent vacuous delete).
+    struct AlwaysFailingPut;
+    impl SecretStore for AlwaysFailingPut {
+        fn put_secret(&self, _: &str, _: &str) -> Result<(), TokenStoreError> {
+            Err(TokenStoreError::Backend("simulated tier failure".into()))
+        }
+        fn get_secret(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn delete_secret(&self, _: &str) -> Result<(), TokenStoreError> {
+            Ok(())
+        }
+    }
+
+    /// Cascade put: when the primary tier rejects, the next
+    /// tier accepts. The secret lands on the lower tier and
+    /// `get_secret` finds it via the same chain walk. This is
+    /// the load-bearing replacement for the legacy plaintext-
+    /// to-`cda_password` fallback the bridge used to take.
+    #[test]
+    fn cascade_falls_through_to_lower_tier_on_put_failure() {
+        let primary: Arc<dyn SecretStore> = Arc::new(AlwaysFailingPut);
+        let fallback: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::new());
+        let cascade = CascadingSecretStore::new(primary.clone(), vec![fallback.clone()]);
+
+        // Put: primary fails, fallback accepts → Ok overall.
+        cascade.put_secret("uuid-1", "hunter2").unwrap();
+        // Read: walks the chain, hits the fallback.
+        assert_eq!(cascade.get_secret("uuid-1").as_deref(), Some("hunter2"));
+        // The primary still holds nothing.
+        assert!(primary.get_secret("uuid-1").is_none());
+    }
+
+    /// When the primary accepts the put, no fallback is
+    /// touched and `get_secret` reads from the primary first.
+    #[test]
+    fn cascade_prefers_primary_on_happy_path() {
+        let primary: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::new());
+        let fallback: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::new());
+        let cascade = CascadingSecretStore::new(primary.clone(), vec![fallback.clone()]);
+
+        cascade.put_secret("uuid-1", "primary-value").unwrap();
+        assert_eq!(
+            cascade.get_secret("uuid-1").as_deref(),
+            Some("primary-value")
+        );
+        // Fallback was never touched.
+        assert!(fallback.get_secret("uuid-1").is_none());
+    }
+
+    /// `delete_secret` is best-effort across every tier in
+    /// the chain — a previously-promoted secret could live
+    /// in any of them. Without this, a stale entry in a
+    /// lower tier would shadow the primary on the next
+    /// `get_secret`.
+    #[test]
+    fn cascade_delete_walks_every_tier() {
+        let primary: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::new());
+        let fallback: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::new());
+        // Stash the secret in BOTH tiers (simulates: primary
+        // failed once → fallback accepted; later primary recovered
+        // → next put landed on primary).
+        primary.put_secret("uuid-1", "primary-value").unwrap();
+        fallback.put_secret("uuid-1", "stale-value").unwrap();
+
+        let cascade = CascadingSecretStore::new(primary.clone(), vec![fallback.clone()]);
+        cascade.delete_secret("uuid-1").unwrap();
+        // BOTH tiers cleared.
+        assert!(primary.get_secret("uuid-1").is_none());
+        assert!(fallback.get_secret("uuid-1").is_none());
+        assert!(cascade.get_secret("uuid-1").is_none());
+    }
+
+    /// When every tier in the chain refuses a put, the
+    /// cascade surfaces the last error so the bridge can
+    /// abort the operation rather than silently dropping the
+    /// credential. In practice unreachable today (the
+    /// in-memory tier only fails on a poisoned mutex), but
+    /// the contract guarantees `Err` propagates.
+    #[test]
+    fn cascade_propagates_error_when_all_tiers_refuse() {
+        let primary: Arc<dyn SecretStore> = Arc::new(AlwaysFailingPut);
+        let fallback: Arc<dyn SecretStore> = Arc::new(AlwaysFailingPut);
+        let cascade = CascadingSecretStore::new(primary, vec![fallback]);
+        let err = cascade.put_secret("uuid-1", "hunter2").unwrap_err();
+        match err {
+            TokenStoreError::Backend(msg) => assert!(msg.contains("simulated tier failure")),
+        }
     }
 }

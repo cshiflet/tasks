@@ -1386,41 +1386,38 @@ impl qobject::TaskListViewModel {
         }
         let uuid = uuid::Uuid::new_v4().to_string();
 
-        // Persist into `caldav_accounts` so the bridge's sync path
-        // (and future restarts) can find this row by uuid. The
-        // password itself is sealed into the active credential
-        // store (keyring → encrypted file → in-memory, in that
-        // probe order); the column gets a blank string. If the
-        // store write fails we fall back to writing the password
-        // into the column (logged at warn) so sync isn't dropped
-        // outright — this is the same legacy fallback path that
-        // `migrate_legacy_passwords` reverses on next launch.
+        // Persist into `caldav_accounts` so the bridge's sync
+        // path (and future restarts) can find this row by uuid.
+        // The password itself goes into the
+        // `CascadingSecretStore` (keychain → encrypted-file →
+        // in-memory), which guarantees the password is never
+        // written as plaintext to the SQLite column. The
+        // column gets a blank string on success.
+        //
+        // The cascade walks every tier including in-memory; the
+        // only way `put_secret` returns `Err` is if every tier
+        // refuses (in practice unreachable —
+        // `InMemorySecretStore::put_secret` only fails on a
+        // poisoned mutex). On that pathological failure we
+        // refuse the operation rather than degrade to plaintext.
         let cda_account_type = match kind {
             KIND_CALDAV => 0,  // tasks_core::AccountType::CALDAV
             KIND_ETESYNC => 5, // tasks_core::AccountType::ETEBASE
             _ => unreachable!("kind validated above"),
         };
         if let Some(path) = self.db_path.clone() {
-            // Stash the password in the persistent secret store
-            // (keychain / encrypted file / in-memory depending on
-            // tier) and write an empty cda_password column. If the
-            // secret-store write fails, fall back to the column so
-            // sync still works in the degraded case — better than
-            // silently dropping the credential.
-            let stored_in_store = self
+            if let Err(e) = self
                 .as_ref()
                 .rust()
                 .secret_store
                 .put_secret(&uuid, &password_s)
-                .is_ok();
-            let column_value = if stored_in_store {
-                String::new()
-            } else {
-                tracing::warn!(
-                    "secret store write failed for {uuid}; falling back to cda_password"
-                );
-                password_s.clone()
-            };
+            {
+                self.as_mut().set_status(QString::from(&format!(
+                    "Credential storage unavailable; account not added: {e}"
+                )));
+                return;
+            }
+            let column_value = String::new();
             let res = open_rw_conn(&path).and_then(|conn| {
                 conn.execute(
                     // Plain INSERT — `OR REPLACE` is a footgun
@@ -1577,29 +1574,25 @@ impl qobject::TaskListViewModel {
         // dialog blank-defaults the field so a typo fix doesn't
         // require retyping the password).
         //
-        // Password write goes through the secret store as the
-        // canonical source — exactly what add_password_account
-        // does. Writing only the SQLite `cda_password` column
-        // here would regress on the next launch: load_password_accounts
-        // prefers a non-empty secret-store value over the column,
-        // so the *old* secret would shadow the freshly-edited
-        // column. Blank the column on success so the legacy-fallback
-        // path doesn't keep the stale plaintext around either.
-        let mut password_written_to_store = false;
+        // Password rotation goes through the
+        // `CascadingSecretStore` — the cascade walks every tier
+        // including in-memory, so put_secret only fails when
+        // every backend refuses (in practice unreachable, see
+        // `add_password_account`). The plaintext-column path
+        // that previously fired on `put_secret` failure is
+        // gone; a put_secret error now refuses the rotation
+        // entirely instead of degrading to plaintext on disk.
         if !password_s.is_empty() {
-            match self
+            if let Err(e) = self
                 .as_ref()
                 .rust()
                 .secret_store
                 .put_secret(&uuid, &password_s)
             {
-                Ok(()) => password_written_to_store = true,
-                Err(e) => {
-                    tracing::warn!(
-                        "update_password_account: secret store write failed for \
-                         {uuid}: {e}; falling back to plaintext column"
-                    );
-                }
+                self.as_mut().set_status(QString::from(&format!(
+                    "Credential storage unavailable; password not rotated: {e}"
+                )));
+                return;
             }
         }
         let res = open_rw_conn(&path).and_then(|conn| {
@@ -1612,21 +1605,13 @@ impl qobject::TaskListViewModel {
                 )
                 .map(|_| ())
             } else {
-                // Column value: blank when the secret store
-                // accepted the write (canonical source is the
-                // store; load path reads it first), or the
-                // plaintext as a fallback for the rare write
-                // failure above.
-                let column_value = if password_written_to_store {
-                    String::new()
-                } else {
-                    password_s.clone()
-                };
+                // Cascade always wins now; column blanks
+                // unconditionally on rotation.
                 conn.execute(
                     "UPDATE caldav_accounts \
                      SET cda_name = ?1, cda_url = ?2, cda_username = ?3, cda_password = ?4 \
                      WHERE cda_uuid = ?5",
-                    rusqlite::params![label_s, server_s, username_s, column_value, uuid],
+                    rusqlite::params![label_s, server_s, username_s, "", uuid],
                 )
                 .map(|_| ())
             }
@@ -1643,7 +1628,7 @@ impl qobject::TaskListViewModel {
             // applied here to the user-edit path). Failure to
             // roll back is logged at error so the user has a
             // chance to notice.
-            if password_written_to_store {
+            if !password_s.is_empty() {
                 if let Err(rollback_err) = self.as_ref().rust().secret_store.delete_secret(&uuid) {
                     tracing::error!(
                         "update_password_account: DB UPDATE failed for {uuid} ({e}); \
@@ -1661,26 +1646,6 @@ impl qobject::TaskListViewModel {
             self.as_mut()
                 .set_status(QString::from(&format!("DB write failed: {e}")));
             return;
-        }
-        // Sibling fix to the F4 rollback above. When the
-        // secret-store write FAILED (we fell back to writing
-        // plaintext to the column), a *stale* prior entry in
-        // the secret store would shadow the freshly-written
-        // column on next launch — `load_password_accounts`
-        // prefers the store. Clearing any stale entry on the
-        // put-fail path closes that asymmetry. Failure to
-        // clear is logged but not fatal — the worst case is
-        // the next launch reading the stale value and the
-        // user re-editing.
-        if !password_s.is_empty() && !password_written_to_store {
-            if let Err(stale_err) = self.as_ref().rust().secret_store.delete_secret(&uuid) {
-                tracing::warn!(
-                    "update_password_account: secret-store put failed AND \
-                     clearing any stale entry for {uuid} also failed ({stale_err}); \
-                     a prior store value may shadow the new plaintext column on \
-                     next launch"
-                );
-            }
         }
         {
             let mut inner = self.as_mut().rust_mut();
