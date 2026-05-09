@@ -594,7 +594,13 @@ fn check_tasks_origin(url: &str) -> SyncResult<()> {
 }
 
 /// Map an HTTP failure to the closest [`SyncError`] variant.
+/// Truncates `body` for the user-visible error string (the full
+/// body still reaches `tracing::debug!`); F8's status-bar guard
+/// applies to *every* error path, not just token exchange —
+/// list/push/delete are the more frequent failure surfaces.
 fn classify_http_error(status: StatusCode, body: String, op: &str) -> SyncError {
+    tracing::debug!("google {op} {status} body: {body}");
+    let body = truncate_for_status(&body);
     match status {
         StatusCode::UNAUTHORIZED => SyncError::Auth(format!("{op}: 401 {body}")),
         StatusCode::FORBIDDEN => SyncError::Auth(format!("{op}: 403 {body}")),

@@ -66,20 +66,27 @@ impl LoopbackReceiver {
     /// require the redirect URI to have no extra path so it
     /// matches a registration of `http://localhost`.
     ///
-    /// `host` MUST be one of `127.0.0.1`, `localhost`, `[::1]`,
-    /// or `::1` — the kernel always binds the listener to
-    /// `127.0.0.1:0` regardless, but the value advertised in
-    /// the OAuth `redirect_uri` (and matched against the
-    /// inbound `Host:` header) has to stay loopback. A future
-    /// caller passing an attacker-supplied hostname here would
-    /// otherwise pull the browser's redirect through arbitrary
-    /// DNS and accept a `Host:` header naming that host —
-    /// turning a same-machine OAuth flow into a cross-host
-    /// callback target.
+    /// `host` MUST be `"127.0.0.1"` or `"localhost"` — see
+    /// [`is_loopback_host`] for why IPv6 forms are excluded.
+    /// The kernel always binds the listener to `127.0.0.1:0`
+    /// regardless, but the value advertised in the OAuth
+    /// `redirect_uri` (and matched against the inbound `Host:`
+    /// header) has to stay loopback. A future caller passing
+    /// an attacker-supplied hostname here would otherwise
+    /// pull the browser's redirect through arbitrary DNS and
+    /// accept a `Host:` header naming that host — turning a
+    /// same-machine OAuth flow into a cross-host callback
+    /// target.
     pub fn bind_with_redirect(host: &str, path: &str) -> Result<Self, OAuthError> {
         if !is_loopback_host(host) {
-            return Err(OAuthError::Random(format!(
-                "loopback host must be 127.0.0.1, localhost, ::1, or [::1]; got {host:?}"
+            // `MalformedRedirect` is the closest existing
+            // variant — `Random` displays as "random source
+            // failed", which would mislead a reader into
+            // thinking a getrandom call broke. The host check
+            // is a config-shape failure, which fits
+            // MalformedRedirect's spirit.
+            return Err(OAuthError::MalformedRedirect(format!(
+                "loopback host must be 127.0.0.1 or localhost; got {host:?}"
             )));
         }
         let path = if path.starts_with('/') {
@@ -229,8 +236,17 @@ const STREAM_DEADLINE: Duration = Duration::from_secs(1);
 /// into [`LoopbackReceiver::bind_with_redirect`] so a future
 /// caller can't accidentally point the flow at a public
 /// hostname even though the kernel-level bind is loopback.
+///
+/// IPv6 forms (`::1` / `[::1]`) are deliberately omitted.
+/// `bind_with_redirect` calls `TcpListener::bind("127.0.0.1:0")`
+/// — IPv4 only. Advertising `http://[::1]:N/cb` to the
+/// authorisation server would route the browser to a port we
+/// don't listen on (ECONNREFUSED), and bare `::1` builds an
+/// ambiguous URL (`http://::1:N/cb`) most browsers parse
+/// incorrectly. Re-add the IPv6 entries only when the bind
+/// becomes genuinely dual-stack.
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    matches!(host, "127.0.0.1" | "localhost")
 }
 
 fn handle_stream(
@@ -441,6 +457,12 @@ mod tests {
             // text-only contract with the AS; matching is exact.
             "Localhost",
             "127.0.0.2",
+            // IPv6 forms are deliberately rejected — the bind
+            // is IPv4-only, so advertising an IPv6 redirect URI
+            // would route the browser to a port we don't listen
+            // on. Re-enable when bind goes dual-stack.
+            "::1",
+            "[::1]",
         ] {
             let result = LoopbackReceiver::bind_with_redirect(host, "/cb");
             assert!(
@@ -448,8 +470,8 @@ mod tests {
                 "bind_with_redirect({host:?}) should be rejected"
             );
         }
-        // The four allowed forms must succeed.
-        for host in &["127.0.0.1", "localhost", "::1", "[::1]"] {
+        // The two allowed forms must succeed.
+        for host in &["127.0.0.1", "localhost"] {
             assert!(
                 LoopbackReceiver::bind_with_redirect(host, "/cb").is_ok(),
                 "bind_with_redirect({host:?}) should be accepted"

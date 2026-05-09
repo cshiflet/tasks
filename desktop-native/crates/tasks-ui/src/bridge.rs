@@ -1662,6 +1662,26 @@ impl qobject::TaskListViewModel {
                 .set_status(QString::from(&format!("DB write failed: {e}")));
             return;
         }
+        // Sibling fix to the F4 rollback above. When the
+        // secret-store write FAILED (we fell back to writing
+        // plaintext to the column), a *stale* prior entry in
+        // the secret store would shadow the freshly-written
+        // column on next launch — `load_password_accounts`
+        // prefers the store. Clearing any stale entry on the
+        // put-fail path closes that asymmetry. Failure to
+        // clear is logged but not fatal — the worst case is
+        // the next launch reading the stale value and the
+        // user re-editing.
+        if !password_s.is_empty() && !password_written_to_store {
+            if let Err(stale_err) = self.as_ref().rust().secret_store.delete_secret(&uuid) {
+                tracing::warn!(
+                    "update_password_account: secret-store put failed AND \
+                     clearing any stale entry for {uuid} also failed ({stale_err}); \
+                     a prior store value may shadow the new plaintext column on \
+                     next launch"
+                );
+            }
+        }
         {
             let mut inner = self.as_mut().rust_mut();
             let acct = &mut inner.accounts[idx];
@@ -4034,8 +4054,13 @@ fn is_local_etebase_url(server_url: &str) -> bool {
     };
     match url.host_str() {
         Some(h) => {
+            // `url::Url::parse("http://[::1]/").host_str()` returns
+            // `"[::1]"` (with brackets), per `url 2.5.8`, so the
+            // bracketed form is the only IPv6 string this branch
+            // ever sees. A bare `"::1"` arm here was dead and was
+            // removed.
             let h = h.to_ascii_lowercase();
-            h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]"
+            h == "127.0.0.1" || h == "localhost" || h == "[::1]"
         }
         None => false,
     }

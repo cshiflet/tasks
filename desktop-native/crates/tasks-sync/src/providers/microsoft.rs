@@ -518,6 +518,13 @@ fn check_graph_origin(url: &str) -> SyncResult<()> {
 }
 
 fn classify_http_error(status: StatusCode, body: String, op: &str) -> SyncError {
+    // F8 was incomplete on first pass — truncated only token-exchange
+    // / refresh paths, not the much more frequent list/push/delete
+    // failure surfaces that flow through here. Same pattern as
+    // google.rs::classify_http_error: full body to tracing debug,
+    // capped body into the user-visible error string.
+    tracing::debug!("microsoft {op} {status} body: {body}");
+    let body = truncate_for_status(&body);
     match status {
         StatusCode::UNAUTHORIZED => SyncError::Auth(format!("{op}: 401 {body}")),
         StatusCode::FORBIDDEN => SyncError::Auth(format!("{op}: 403 {body}")),

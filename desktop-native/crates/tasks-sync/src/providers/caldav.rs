@@ -37,7 +37,7 @@ use super::caldav_xml::{
     PROPFIND_CALENDAR_HOME_SET, PROPFIND_CALENDAR_LIST, PROPFIND_CURRENT_USER_PRINCIPAL,
     REPORT_CALENDAR_QUERY_VTODO,
 };
-use super::http_util::{read_body_capped, DEFAULT_BODY_CAP};
+use super::http_util::{read_body_capped, truncate_for_status, DEFAULT_BODY_CAP};
 use crate::ical::{parse_vcalendar, serialize_vcalendar};
 use crate::provider::{
     AccountCredentials, Provider, ProviderKind, RemoteCalendar, RemoteTask, SyncError, SyncOutcome,
@@ -369,7 +369,11 @@ impl Provider for CalDavProvider {
             let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
                 .await
                 .unwrap_or_default();
-            return Err(SyncError::Network(format!("PUT {status}: {msg}")));
+            tracing::debug!("caldav PUT {status} body: {msg}");
+            return Err(SyncError::Network(format!(
+                "PUT {status}: {}",
+                truncate_for_status(&msg)
+            )));
         }
         let new_etag = resp
             .headers()
@@ -429,7 +433,11 @@ impl Provider for CalDavProvider {
             let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
                 .await
                 .unwrap_or_default();
-            return Err(SyncError::Network(format!("DELETE {status}: {msg}")));
+            tracing::debug!("caldav DELETE {status} body: {msg}");
+            return Err(SyncError::Network(format!(
+                "DELETE {status}: {}",
+                truncate_for_status(&msg)
+            )));
         }
         Ok(())
     }
@@ -511,9 +519,10 @@ impl Provider for CalDavProvider {
             let snippet = read_body_capped(resp, DEFAULT_BODY_CAP)
                 .await
                 .unwrap_or_default();
+            tracing::debug!("caldav MKCALENDAR {status} body: {snippet}");
             return Err(SyncError::Protocol(format!(
                 "MKCALENDAR returned {status}: {}",
-                snippet.chars().take(200).collect::<String>()
+                truncate_for_status(&snippet)
             )));
         }
         Ok(RemoteCalendar {
@@ -569,7 +578,11 @@ async fn propfind(
         let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
             .await
             .unwrap_or_default();
-        return Err(SyncError::Network(format!("PROPFIND {status}: {msg}")));
+        tracing::debug!("caldav PROPFIND {status} body: {msg}");
+        return Err(SyncError::Network(format!(
+            "PROPFIND {status}: {}",
+            truncate_for_status(&msg)
+        )));
     }
     read_body_capped(resp, DEFAULT_BODY_CAP).await
 }
@@ -596,7 +609,11 @@ async fn report(
         let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
             .await
             .unwrap_or_default();
-        return Err(SyncError::Network(format!("REPORT {status}: {msg}")));
+        tracing::debug!("caldav REPORT {status} body: {msg}");
+        return Err(SyncError::Network(format!(
+            "REPORT {status}: {}",
+            truncate_for_status(&msg)
+        )));
     }
     read_body_capped(resp, DEFAULT_BODY_CAP).await
 }

@@ -45,23 +45,32 @@ pub const ERROR_BODY_DISPLAY_CAP: usize = 256;
 /// collapsed to spaces so the status bar (a single Qt label)
 /// renders cleanly. Truncation is signalled with a `…(truncated)`
 /// suffix.
+///
+/// Walks `char_indices` until either the cap is hit or the input
+/// ends, so the work done here is O(min(len(body), cap)) — we
+/// never materialise a copy of an attacker-pumped 64 MiB body
+/// the way an upfront `body.chars().collect::<String>()` would.
+/// The defense against unbounded input is `read_body_capped`'s
+/// stream cap; this helper just trims the bounded result for
+/// display.
 pub fn truncate_for_status(body: &str) -> String {
-    let collapsed: String = body
-        .chars()
-        .map(|c| {
-            if matches!(c, '\n' | '\r' | '\t') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = collapsed.trim();
-    if trimmed.chars().count() <= ERROR_BODY_DISPLAY_CAP {
-        trimmed.to_string()
+    // Walk char-by-char up to the cap, replacing CR/LF/TAB with
+    // spaces. `more` flags that input remained after we stopped
+    // — drives the `…(truncated)` suffix below.
+    let mut out = String::with_capacity(ERROR_BODY_DISPLAY_CAP);
+    let mut more = false;
+    for (i, c) in body.chars().enumerate() {
+        if i >= ERROR_BODY_DISPLAY_CAP {
+            more = true;
+            break;
+        }
+        out.push(if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c });
+    }
+    let trimmed = out.trim();
+    if more {
+        format!("{trimmed}…(truncated)")
     } else {
-        let prefix: String = trimmed.chars().take(ERROR_BODY_DISPLAY_CAP).collect();
-        format!("{prefix}…(truncated)")
+        trimmed.to_string()
     }
 }
 
