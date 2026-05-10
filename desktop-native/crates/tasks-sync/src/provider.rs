@@ -270,6 +270,20 @@ pub trait Provider: Send + Sync {
         })
     }
 
+    /// Delete a calendar / list on the server. Implementations
+    /// should treat a 404 (or its provider equivalent) as success
+    /// — the caller's intent is "this list shouldn't exist
+    /// remotely" and "it didn't exist to begin with" satisfies
+    /// that. Other failures (auth, network, 5xx) bubble up so the
+    /// bridge can decide whether to keep the local mapping or
+    /// proceed with local cleanup anyway.
+    async fn delete_calendar(&mut self, _remote_id: &str) -> SyncResult<()> {
+        Err(SyncError::NotYetImplemented {
+            provider: "?",
+            method: "delete_calendar",
+        })
+    }
+
     /// Run a full sync cycle (pull changes, push local deltas,
     /// reconcile). The exact algorithm is provider-specific;
     /// callers just want the summary.

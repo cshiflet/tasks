@@ -117,6 +117,11 @@ pub fn remote_task_to_vtodo(task: &RemoteTask, now_ms: i64, merge_into: Option<V
     if v.created_ms.is_none() {
         v.created_ms = Some(now_ms);
     }
+    // RFC 5545 §3.6.2 REQUIRES DTSTAMP for VTODO. Set to now_ms so
+    // every PUT we generate carries it; without this strict CalDAV
+    // servers (Radicale, Cyrus, SOGo) reject the body with HTTP 409
+    // "Conflict in the request".
+    v.dtstamp_ms = Some(now_ms);
     v
 }
 

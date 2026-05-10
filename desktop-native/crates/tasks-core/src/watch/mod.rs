@@ -16,9 +16,11 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileI
 use crate::error::Result;
 
 /// How long to coalesce back-to-back filesystem notifications before
-/// signalling a reload. 250 ms matches the plan and keeps the UI from
-/// thrashing during a burst of WAL activity.
-const DEBOUNCE: Duration = Duration::from_millis(250);
+/// signalling a reload. 100 ms is short enough that an external writer
+/// (Syncthing, the Android client via the same DB file) feels snappy
+/// while still collapsing the WAL-frame burst that follows a single
+/// commit into one reload.
+const DEBOUNCE: Duration = Duration::from_millis(100);
 
 pub struct DatabaseWatcher {
     _debouncer: Debouncer<notify::RecommendedWatcher, FileIdMap>,

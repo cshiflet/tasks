@@ -348,7 +348,7 @@ impl Provider for CalDavProvider {
 
         let resp = s
             .http
-            .put(obj_url)
+            .put(obj_url.clone())
             .headers(headers)
             .body(body)
             .send()
@@ -370,6 +370,27 @@ impl Provider for CalDavProvider {
                 .await
                 .unwrap_or_default();
             tracing::debug!("caldav PUT {status} body: {msg}");
+            // Disambiguate: a 4xx with a generic "Conflict in the
+            // request" body (Radicale's catch-all) often means the
+            // parent calendar collection has been deleted server-
+            // side. PROPFIND the calendar URL once to confirm; if
+            // it's gone, surface an actionable message instead of
+            // burying the reason inside the server's vague reply.
+            // The user has to decide whether to delete the local
+            // list or recreate the calendar server-side — auto-
+            // recreating would silently undo a deliberate cleanup
+            // by another client. (Tracking the propagation of a
+            // remote list-delete back into the local DB is a
+            // separate, larger problem.)
+            if !calendar_exists(s, &cal_url).await.unwrap_or(true) {
+                return Err(SyncError::Local(format!(
+                    "calendar {} no longer exists on the server — \
+                     remove the list locally (Settings → Accounts) or \
+                     recreate it server-side; pushes will keep failing \
+                     until then",
+                    cal_url
+                )));
+            }
             return Err(SyncError::Network(format!(
                 "PUT {status}: {}",
                 truncate_for_status(&msg)
@@ -437,6 +458,38 @@ impl Provider for CalDavProvider {
             return Err(SyncError::Network(format!(
                 "DELETE {status}: {}",
                 truncate_for_status(&msg)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn delete_calendar(&mut self, remote_id: &str) -> SyncResult<()> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        let cal_url = Url::parse(remote_id)
+            .map_err(|e| SyncError::Protocol(format!("bad calendar url '{remote_id}': {e}")))?;
+        s.trusted_origin.check(&cal_url)?;
+        let resp = s
+            .http
+            .delete(cal_url)
+            .header(AUTHORIZATION, s.auth.clone())
+            .send()
+            .await
+            .map_err(|e| SyncError::Network(format!("DELETE calendar: {e}")))?;
+        let status = resp.status();
+        // 404 means "already gone server-side" — that satisfies
+        // the caller's intent ("this list shouldn't exist remotely
+        // anymore"). Any other failure surfaces so the bridge can
+        // decide whether to keep the local list mapping.
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+            let snippet = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            return Err(SyncError::Network(format!(
+                "DELETE calendar {status}: {}",
+                truncate_for_status(&snippet)
             )));
         }
         Ok(())
@@ -534,6 +587,48 @@ impl Provider for CalDavProvider {
             read_only: false,
         })
     }
+}
+
+/// PROPFIND `Depth: 0` against `cal_url`. Returns `Ok(true)` when
+/// the server responds with a multistatus that lists the URL (i.e.
+/// the calendar exists and we can see it), `Ok(false)` for `404 Not
+/// Found`, and surfaces other errors. Used by `push_task` to
+/// distinguish "calendar gone server-side" from genuine validation
+/// failures — without this the user sees a string of generic
+/// "Conflict in the request" 4xx replies and can't tell why.
+async fn calendar_exists(s: &Session, cal_url: &Url) -> SyncResult<bool> {
+    s.trusted_origin.check(cal_url)?;
+    let method = Method::from_bytes(b"PROPFIND")
+        .map_err(|e| SyncError::Other(format!("bad method: {e}")))?;
+    let resp = s
+        .http
+        .request(method, cal_url.clone())
+        .header(AUTHORIZATION, s.auth.clone())
+        .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+        .header("Depth", "0")
+        .body(
+            "<?xml version=\"1.0\"?>\
+             <d:propfind xmlns:d=\"DAV:\">\
+               <d:prop><d:resourcetype/></d:prop>\
+             </d:propfind>",
+        )
+        .send()
+        .await
+        .map_err(|e| SyncError::Network(format!("PROPFIND: {e}")))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        let snippet = read_body_capped(resp, DEFAULT_BODY_CAP)
+            .await
+            .unwrap_or_default();
+        return Err(SyncError::Network(format!(
+            "PROPFIND {status}: {}",
+            truncate_for_status(&snippet)
+        )));
+    }
+    Ok(true)
 }
 
 /// Minimal XML-text escape for displayname / other element text.

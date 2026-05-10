@@ -743,6 +743,17 @@ Pane {
                                         : "");
                             }
                         }
+                        MenuSeparator {}
+                        MenuItem {
+                            text: qsTr("Delete list…")
+                            onTriggered: {
+                                deleteListConfirm.openFor(
+                                    row.myLabel,
+                                    row.myId.startsWith("caldav:")
+                                        ? row.myId.slice("caldav:".length)
+                                        : "");
+                            }
+                        }
                     }
                 }
             }
@@ -866,6 +877,48 @@ Pane {
                 CheckBox { id: bottomOverride; text: qsTr("Completed at bottom") }
                 CheckBox { id: bottomBox; enabled: bottomOverride.checked }
                 Item { Layout.fillWidth: true }
+            }
+        }
+    }
+
+    // Confirmation dialog for "Delete list…" — destructive +
+    // covers the orphan-cleanup case (calendar already gone
+    // server-side) so we'd rather one extra click than have a
+    // misclick wipe a real list. The bridge does the actual work
+    // (best-effort server DELETE + local sweep + active-filter
+    // recovery) once the user confirms.
+    Dialog {
+        id: deleteListConfirm
+        title: qsTr("Delete list?")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Yes | Dialog.No
+        property string _listLabel: ""
+        property string _listUuid: ""
+
+        function openFor(label, uuid) {
+            if (!uuid) { return; }
+            _listLabel = label;
+            _listUuid = uuid;
+            open();
+        }
+
+        ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.maximumWidth: 360
+                wrapMode: Text.WordWrap
+                text: qsTr(
+                    "Delete \"%1\" and all of its tasks?\n\n" +
+                    "Best-effort: tries to delete the calendar on the server too. " +
+                    "If the calendar is already missing server-side (orphan), the " +
+                    "local rows are still cleaned up.").arg(deleteListConfirm._listLabel)
+            }
+        }
+
+        onAccepted: {
+            if (root.vm) {
+                root.vm.deleteCaldavList(deleteListConfirm._listUuid);
             }
         }
     }

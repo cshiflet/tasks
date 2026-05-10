@@ -78,7 +78,16 @@ Pane {
                 id: rowDelegate
                 width: list.width
                 highlighted: root.vm && root.vm.selectedId === root.vm.taskIds[index]
-                onClicked: if (root.vm) root.vm.selectTask(root.vm.taskIds[index])
+                // ItemDelegate's own onClicked was being silently swallowed
+                // when the watcher loop kept re-publishing the model
+                // (delegate destroyed mid-press, release went nowhere).
+                // The publish_tasks early-return guard fixes the underlying
+                // churn, but TapHandler is kept here for symmetry with
+                // SidebarPane and as defense-in-depth against any future
+                // delegate-recreation footgun.
+                TapHandler {
+                    onTapped: if (root.vm) root.vm.selectTask(root.vm.taskIds[index])
+                }
 
                 // List affiliation is shown as an inline chip in the
                 // contentItem below, not as a left-edge stripe — keeps

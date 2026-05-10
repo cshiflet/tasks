@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::provider::{Provider, RemoteCalendar, RemoteTask, SyncError, SyncOutcome, SyncResult};
 
@@ -91,17 +91,41 @@ impl<'a> SyncEngine<'a> {
 
     /// Connect + pull every calendar's tasks. Returns the count of
     /// rows pulled. Does not push.
+    ///
+    /// **Concurrency contract:** every HTTP round trip happens
+    /// *before* the write transaction opens, and the transaction
+    /// itself uses `BEGIN IMMEDIATE` so the write lock is acquired
+    /// at BEGIN time (where rusqlite's busy_timeout retry is
+    /// reliable) rather than on the first write inside a `BEGIN
+    /// DEFERRED` (where contention with another writer can surface
+    /// as `SQLITE_BUSY` even in WAL mode). Parallel-account sync
+    /// previously held the write lock for the duration of HTTP I/O,
+    /// which deadlocked the second account on `database is locked`
+    /// once HTTP exceeded the 5 s busy_timeout — staging all reads
+    /// in memory first cuts the lock-held window down to the actual
+    /// write batch.
     pub async fn pull_all(&mut self) -> SyncResult<SyncOutcome> {
         self.ensure_connected().await?;
         let calendars = self.provider.list_calendars().await?;
 
+        // Stage every remote calendar's task list in memory before
+        // opening the write tx. Order preserved so `tombstone_missing_tasks`
+        // and `relink_parents` see exactly the same data the loops
+        // below write.
+        let mut staged: Vec<(RemoteCalendar, Vec<RemoteTask>)> =
+            Vec::with_capacity(calendars.len());
+        for cal in calendars {
+            let tasks = self.provider.list_tasks(&cal.remote_id).await?;
+            staged.push((cal, tasks));
+        }
+
         let mut conn =
             open_rw(self.db_path).map_err(|e| SyncError::Local(format!("open db: {e}")))?;
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| SyncError::Local(format!("begin tx: {e}")))?;
 
-        for cal in &calendars {
+        for (cal, _) in &staged {
             upsert_calendar(&tx, cal, self.account_filter.as_deref())
                 .map_err(|e| SyncError::Local(format!("calendar: {e}")))?;
         }
@@ -112,15 +136,21 @@ impl<'a> SyncEngine<'a> {
         // every task first (parent stays 0), then a second pass
         // backfills `tasks.parent` once every remoteId is in place.
         let mut all_tasks: Vec<RemoteTask> = Vec::new();
-        for cal in &calendars {
-            let tasks = self.provider.list_tasks(&cal.remote_id).await?;
+        for (cal, tasks) in &staged {
             let mut seen_remote_ids: Vec<String> = Vec::with_capacity(tasks.len());
-            for t in &tasks {
-                let (task_id, chosen_modified) = upsert_task(&tx, t)
+            for t in tasks {
+                let outcome = upsert_task(&tx, t)
                     .map_err(|e| SyncError::Local(format!("task {}: {e}", t.remote_id)))?;
-                upsert_caldav_task(&tx, task_id, t, chosen_modified)
+                // upsert_caldav_task always runs even on a no-op so
+                // the etag + last_sync stamp track what we just saw
+                // from the server (etags can re-mint without the
+                // task body changing). Only the count gates on the
+                // actual data change.
+                upsert_caldav_task(&tx, outcome.id, t, outcome.modified)
                     .map_err(|e| SyncError::Local(format!("caldav_task {}: {e}", t.remote_id)))?;
-                tasks_pulled += 1;
+                if outcome.changed {
+                    tasks_pulled += 1;
+                }
                 seen_remote_ids.push(t.remote_id.clone());
             }
             // Anything in this calendar we had before but the
@@ -131,7 +161,7 @@ impl<'a> SyncEngine<'a> {
             let removed = tombstone_missing_tasks(&tx, &cal.remote_id, &seen_remote_ids, now)
                 .map_err(|e| SyncError::Local(format!("tombstone: {e}")))?;
             tasks_deleted += removed;
-            all_tasks.extend(tasks);
+            all_tasks.extend(tasks.iter().cloned());
         }
 
         let parent_links = relink_parents(&tx, &all_tasks)
@@ -142,7 +172,7 @@ impl<'a> SyncEngine<'a> {
 
         tracing::info!(
             "sync pull: {} calendars, {} tasks, {} parent links, {} tombstoned",
-            calendars.len(),
+            staged.len(),
             tasks_pulled,
             parent_links,
             tasks_deleted,
@@ -157,7 +187,7 @@ impl<'a> SyncEngine<'a> {
         // reached the server" rather than "the server has new
         // tombstones for us."
         Ok(SyncOutcome {
-            calendars_pulled: calendars.len(),
+            calendars_pulled: staged.len(),
             tasks_pulled,
             tasks_pushed: 0,
             tasks_deleted: 0,
@@ -631,7 +661,21 @@ fn upsert_calendar(
 /// back to the legacy synthesis (`completed_ms.max(due_ms).max(1)`)
 /// so completed/scheduled tasks still sort sensibly in the
 /// "recently modified" view.
-fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Result<(i64, i64)> {
+/// Outcome of a single [`upsert_task`] call.
+///
+/// `changed` distinguishes a row that was actually written (INSERT, or
+/// UPDATE that advanced the row's `modified` stamp) from a row the
+/// server returned but local already had at the same or newer
+/// `modified` — the "no-op" case. The caller uses this to keep the
+/// per-sync `tasks_pulled` count meaningful as a delta rather than a
+/// total of "tasks the server returned."
+struct UpsertOutcome {
+    id: i64,
+    modified: i64,
+    changed: bool,
+}
+
+fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Result<UpsertOutcome> {
     let existing: Option<i64> = tx
         .query_row(
             "SELECT _id FROM tasks WHERE remoteId = ?1",
@@ -650,10 +694,16 @@ fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Resu
     let recurrence_arg: Option<&str> = t.recurrence.as_deref();
 
     if let Some(id) = existing {
-        tx.execute(
+        // `WHERE modified < ?7` makes the UPDATE a no-op when the
+        // row's stored modified stamp already meets-or-beats the
+        // chosen value — i.e. the server hasn't advanced the row
+        // since our last pull. `affected == 0` then signals "nothing
+        // changed locally" up to pull_all, which uses it to count
+        // only delta rows toward `tasks_pulled` (the badge).
+        let affected = tx.execute(
             "UPDATE tasks SET title = ?1, notes = ?2, dueDate = ?3, \
              completed = ?4, importance = ?5, recurrence = ?6, modified = ?7 \
-             WHERE _id = ?8",
+             WHERE _id = ?8 AND modified < ?7",
             params![
                 title_arg,
                 notes_arg,
@@ -665,7 +715,11 @@ fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Resu
                 id,
             ],
         )?;
-        Ok((id, chosen_modified))
+        Ok(UpsertOutcome {
+            id,
+            modified: chosen_modified,
+            changed: affected > 0,
+        })
     } else {
         tx.execute(
             "INSERT INTO tasks \
@@ -686,7 +740,11 @@ fn upsert_task(tx: &rusqlite::Transaction<'_>, t: &RemoteTask) -> rusqlite::Resu
                 t.remote_id,
             ],
         )?;
-        Ok((tx.last_insert_rowid(), chosen_modified))
+        Ok(UpsertOutcome {
+            id: tx.last_insert_rowid(),
+            modified: chosen_modified,
+            changed: true,
+        })
     }
 }
 
@@ -1149,12 +1207,21 @@ mod tests {
             })
             .unwrap();
 
-        // Mutate the remote title and pull again.
+        // Mutate the remote title and bump last_modified_ms so the
+        // engine's "is this row actually newer?" gate sees a real
+        // change. Real CalDAV / EteSync / Google / Microsoft servers
+        // always advance modified on edit (LAST-MODIFIED / DTSTAMP
+        // in iCalendar, etag bump elsewhere); a server that mutated
+        // body without bumping modified would be a bug, and the
+        // engine intentionally trusts modified as the merge anchor.
         mock.tasks
             .get_mut("cal-1")
             .unwrap()
             .iter_mut()
-            .for_each(|t| t.title = Some("Renamed".into()));
+            .for_each(|t| {
+                t.title = Some("Renamed".into());
+                t.last_modified_ms = Some(tasks_core::now_ms() + 1);
+            });
         let mut engine2 = SyncEngine::new(&db_path, Box::new(mock));
         engine2.pull_all().await.unwrap();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1172,6 +1239,37 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(task_count, 1);
+    }
+
+    /// `pull_all`'s `tasks_pulled` counter — surfaced in the per-
+    /// account "Synced (N↓ / M↑)" badge — must report a delta, not a
+    /// total. A server that returns the same set of unchanged tasks
+    /// on every poll (every CalDAV / Google Tasks / MS To Do server
+    /// without a sync-token API does this) would otherwise lock the
+    /// badge at the initial-pull count forever, hiding any real
+    /// activity.
+    #[tokio::test]
+    async fn second_pull_with_no_remote_changes_reports_zero_pulled() {
+        let (_tmp, db_path) = fresh_db();
+        let mut tasks = HashMap::new();
+        tasks.insert("cal-1".to_string(), vec![task("u-1", "cal-1", None)]);
+        let mock = MockProvider {
+            calendars: vec![calendar("cal-1", "Work")],
+            tasks,
+            ..Default::default()
+        };
+        let provider1 = mock.clone();
+        let mut engine = SyncEngine::new(&db_path, Box::new(provider1));
+        let first = engine.pull_all().await.unwrap();
+        assert_eq!(first.tasks_pulled, 1, "first pull writes the row");
+
+        // Re-pull the same data with no remote-side mutation.
+        let mut engine2 = SyncEngine::new(&db_path, Box::new(mock));
+        let second = engine2.pull_all().await.unwrap();
+        assert_eq!(
+            second.tasks_pulled, 0,
+            "second pull saw no actual change → badge should read 0↓"
+        );
     }
 
     /// MockProvider variant whose push_task hands back a canned

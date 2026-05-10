@@ -574,6 +574,16 @@ pub mod qobject {
         #[qinvokable]
         fn update_list_color(self: Pin<&mut TaskListViewModel>, cdl_uuid: QString, color: i32);
 
+        /// Delete a CalDAV / EteSync list. Best-effort server-side
+        /// DELETE first (404 treated as success — covers the orphan
+        /// case where the calendar is already gone server-side);
+        /// then sweep the local `caldav_tasks` + `tasks` rows that
+        /// belong to it and the `caldav_lists` row itself. If the
+        /// active filter was on this list, switches to "all" so the
+        /// middle pane doesn't sit on a dangling filter id.
+        #[qinvokable]
+        fn delete_caldav_list(self: Pin<&mut TaskListViewModel>, cdl_uuid: QString);
+
         /// H-4: free-text substring search across task title +
         /// notes. Empty input restores the currently-active filter.
         /// Called from the toolbar search field on every text edit.
@@ -780,6 +790,14 @@ pub struct TaskListViewModelRust {
     db_path: Option<PathBuf>,
     db: Option<Database>,
     task_cache: Vec<Task>,
+    /// SQLite `PRAGMA data_version` counter at the time of the most
+    /// recent watcher-triggered reload. The watcher fires on any
+    /// activity in the parent dir of the DB, including -shm/-wal
+    /// touches caused by our own reads in WAL mode — without this
+    /// gate, every reload feeds back into the watcher loop. 0 is a
+    /// sentinel meaning "never sampled"; SQLite's data_version is
+    /// always non-zero for an opened database.
+    last_data_version: i64,
     /// User preferences fed to `run_by_filter_id`. The UI panel for
     /// editing these isn't wired yet (Milestone 1 scope); for now it
     /// stays at the Android defaults.
@@ -958,6 +976,7 @@ impl Default for TaskListViewModelRust {
             db_path: None,
             db: None,
             task_cache: Vec::new(),
+            last_data_version: 0,
             preferences: QueryPreferences {
                 sort_mode: saved.sort_mode,
                 sort_ascending: saved.sort_ascending,
@@ -2296,8 +2315,12 @@ impl qobject::TaskListViewModel {
                             // when there were any so the everyday
                             // sync stays visually quiet.
                             let summary = if outcome.tasks_deleted > 0 {
+                                // ASCII " trash" suffix instead of the
+                                // 🗑 emoji (U+1F5D1) — Qt's bundled
+                                // fonts often miss supplementary-plane
+                                // glyphs and render this as tofu.
                                 format!(
-                                    "Synced ({}↓ / {}↑ / {}🗑)",
+                                    "Synced ({}↓ / {}↑ / {} trash)",
                                     outcome.tasks_pulled,
                                     outcome.tasks_pushed,
                                     outcome.tasks_deleted
@@ -2473,11 +2496,25 @@ impl qobject::TaskListViewModel {
         });
 
         match create_result {
-            Ok(_cal) => {
+            Ok(cal) => {
                 self.as_mut().set_status(QString::from(&format!(
                     "Created list on {}; pulling…",
                     stored.label
                 )));
+                // Switch the active filter to the new list before
+                // kicking off the sync, so a follow-up quick-add
+                // lands on it instead of whatever calendar was
+                // previously focused. Without this the user trips
+                // over: "I just created a list, my next task should
+                // go there" — but `add_new_task` reads
+                // `active_filter_id`, which still points at the
+                // prior list. caldav_lists won't have the new row
+                // until the spawned sync completes; the sidebar
+                // refreshes a moment later, but the active-filter
+                // pointer is enough for `add_new_task`'s prefix
+                // strip to do the right thing.
+                self.as_mut()
+                    .select_filter(QString::from(&format!("caldav:{}", cal.remote_id)));
                 // Run a sync so the new calendar lands in
                 // caldav_lists and the sidebar refreshes.
                 self.as_mut().sync_account(QString::from(&uuid));
@@ -2488,6 +2525,142 @@ impl qobject::TaskListViewModel {
                 self.as_mut().set_status(QString::from(&msg));
             }
         }
+    }
+
+    /// Right-click → "Delete list…" target. Best-effort server
+    /// DELETE on the calendar URL (404 = success, since the goal
+    /// is "this list shouldn't exist remotely"), then sweep the
+    /// local rows: every `tasks` row that joined to a
+    /// `caldav_tasks` for this list, then the `caldav_tasks` rows
+    /// themselves, then the `caldav_lists` row. Switches the
+    /// active filter to "all" if it was sitting on the list being
+    /// deleted, otherwise the middle pane would be left querying
+    /// a dangling filter id.
+    pub fn delete_caldav_list(mut self: Pin<&mut Self>, cdl_uuid: QString) {
+        let uuid = cdl_uuid.to_string();
+        if uuid.is_empty() {
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't delete list."));
+            return;
+        };
+        // Look up which account owns this list so we know whose
+        // credentials to use for the server-side DELETE.
+        let (account_uuid, list_label) = match open_rw_conn(&path).and_then(|conn| {
+            conn.query_row(
+                "SELECT cdl_account, COALESCE(cdl_name, '') FROM caldav_lists WHERE cdl_uuid = ?1",
+                rusqlite::params![&uuid],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+        }) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let msg = format!("Couldn't look up list for delete: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                return;
+            }
+        };
+        let display = if list_label.is_empty() {
+            uuid.clone()
+        } else {
+            list_label.clone()
+        };
+
+        // Best-effort server-side DELETE. Requires the same
+        // credentials the sync_account path uses; for orphans
+        // (calendar already 404 server-side) the provider's
+        // delete_calendar treats 404 as success, so we still fall
+        // through to local cleanup. Other failures abort —
+        // dropping local state for a list whose remote half is
+        // still alive would leave the user with no way to see
+        // their own data.
+        if let Some(stored) = self
+            .accounts
+            .iter()
+            .find(|a| a.uuid == account_uuid)
+            .cloned()
+        {
+            let Some(rt_handle) = ensure_runtime_handle(self.as_mut()) else {
+                return;
+            };
+            let allow_signup = is_local_etebase_url(&stored.server);
+            let creds = AccountCredentials::new_password(
+                &stored.server,
+                &stored.username,
+                secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+            );
+            let mut provider: Box<dyn Provider + Send> = match stored.kind {
+                KIND_CALDAV => Box::new(CalDavProvider::new(creds, stored.label.clone())),
+                KIND_ETESYNC => Box::new(
+                    EteSyncProvider::new(creds, stored.label.clone())
+                        .with_signup_fallback(allow_signup),
+                ),
+                _ => {
+                    self.as_mut().set_status(QString::from(
+                        "Deleting lists on this provider isn't supported yet.",
+                    ));
+                    return;
+                }
+            };
+            let cdl_uuid_owned = uuid.clone();
+            let server_result = rt_handle.block_on(async move {
+                provider.connect().await?;
+                provider.delete_calendar(&cdl_uuid_owned).await
+            });
+            if let Err(e) = server_result {
+                let msg = format!("Couldn't delete list \"{display}\" on server: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                return;
+            }
+        }
+        // (No matching account row → list is fully orphaned; just
+        // clean local state without surfacing an account-lookup
+        // error to the user.)
+
+        // Local cleanup: tasks → caldav_tasks → caldav_lists. Order
+        // matters because the join helpers above key off cd_calendar.
+        let cleanup = open_rw_conn(&path).and_then(|mut conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM tasks WHERE _id IN \
+                 (SELECT cd_task FROM caldav_tasks WHERE cd_calendar = ?1)",
+                rusqlite::params![&uuid],
+            )?;
+            tx.execute(
+                "DELETE FROM caldav_tasks WHERE cd_calendar = ?1",
+                rusqlite::params![&uuid],
+            )?;
+            tx.execute(
+                "DELETE FROM caldav_lists WHERE cdl_uuid = ?1",
+                rusqlite::params![&uuid],
+            )?;
+            tx.commit()
+        });
+        if let Err(e) = cleanup {
+            let msg = format!("Local cleanup failed for \"{display}\": {e}");
+            tracing::warn!("{msg}");
+            self.as_mut().set_status(QString::from(&msg));
+            return;
+        }
+
+        // If the user was viewing the list we just deleted, drop
+        // the active filter back to "all" so the middle pane
+        // doesn't query a dangling id.
+        let active_filter = self.active_filter_id.to_string();
+        if active_filter == format!("caldav:{uuid}") {
+            self.as_mut().select_filter(QString::from(FILTER_ALL));
+        } else {
+            // Even if we didn't switch, a deleted list's rows
+            // shouldn't keep showing in the current view.
+            self.as_mut().reload_active_filter();
+        }
+        refresh_sidebar(self.as_mut());
+        self.as_mut()
+            .set_status(QString::from(&format!("Deleted list \"{display}\".")));
     }
 
     /// Create a new task in the open DB with `title`. If the user
@@ -2683,7 +2856,12 @@ impl qobject::TaskListViewModel {
     }
 
     pub fn select_task(mut self: Pin<&mut Self>, id: i64) {
+        tracing::trace!(
+            "select_task: id={id}, task_cache.len={}",
+            self.task_cache.len()
+        );
         let Some(task) = self.task_cache.iter().find(|t| t.id == id).cloned() else {
+            tracing::trace!("select_task: id={id} not in task_cache");
             clear_detail_pane(self.as_mut());
             return;
         };
@@ -3053,6 +3231,16 @@ fn set_account_state(mut vm: Pin<&mut qobject::TaskListViewModel>, uuid: &str, s
 }
 
 fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>) {
+    // Skip if the new task list is byte-identical to the previously
+    // published one. Re-publishing tears down + recreates every QML
+    // delegate via the set_count(0) → set_count(N) cycle below, which
+    // kills hover state mid-press and makes clicks un-actionable.
+    // Cheap pointer-walk equality on Vec<Task> is far less work than
+    // the QStringList rebuilds that follow.
+    if tasks == vm.as_ref().task_cache {
+        return;
+    }
+    tracing::trace!("publish_tasks: count={}", tasks.len());
     let mut task_ids: QList<i64> = QList::default();
     let mut indents: QList<i32> = QList::default();
     let mut completed_flags: QList<bool> = QList::default();
@@ -3169,12 +3357,17 @@ fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>)
     vm.as_mut().set_task_tag_uid_lists(tag_uid_lists);
     vm.as_mut().set_task_list_names(list_names);
     vm.as_mut().set_task_list_colors(list_color_list);
+    // task_cache must be installed BEFORE set_count(N) republishes the
+    // delegates. select_task() looks the clicked id up in task_cache;
+    // if a click lands between set_count(N) and the cache assignment
+    // the lookup fails and clear_detail_pane silently runs — the user
+    // sees a row that never opens in the detail pane.
+    vm.as_mut().rust_mut().task_cache = tasks;
     vm.as_mut().set_count(count);
     // The list pane header already prints "N task(s)" — no need to
     // repeat it on every reload, and the previous status chatter
     // overwrote whatever genuine error message was sitting in the
     // status bar.
-    vm.as_mut().rust_mut().task_cache = tasks;
 }
 
 /// H-7 helper: bulk-fetch the per-task tag info — both the
@@ -3456,6 +3649,10 @@ fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mod
                 let mut inner = vm.as_mut().rust_mut();
                 inner.db_path = Some(path.clone());
                 inner.db = Some(db);
+                // Fresh DB → reset the watcher's data_version baseline
+                // so the first watcher tick after open compares against
+                // the new file, not whatever the previous DB had.
+                inner.last_data_version = 0;
             }
             vm.as_mut().reload_active_filter();
             start_watcher(vm.as_mut(), path);
@@ -4170,7 +4367,7 @@ fn do_refresh_sidebar(mut vm: Pin<&mut qobject::TaskListViewModel>) {
 /// accounts. Mirrors the Android client's CaldavDao deletion
 /// shape.
 fn delete_account_cascade(conn: &mut rusqlite::Connection, cda_uuid: &str) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // Capture the affected task IDs before we tear down the
     // join rows that point at them.
     let mut task_ids: Vec<i64> = Vec::new();
@@ -4233,7 +4430,7 @@ fn delete_account_cascade(conn: &mut rusqlite::Connection, cda_uuid: &str) -> ru
 /// — those bodies still surface in "All active". Runs once per
 /// open_at_path; idempotent.
 fn vacuum_orphan_tasks(conn: &mut rusqlite::Connection) -> rusqlite::Result<usize> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // An orphan = caldav_tasks row whose cd_calendar isn't in
     // caldav_lists, OR whose calendar's cdl_account isn't in
     // caldav_accounts.
@@ -4658,6 +4855,15 @@ fn start_auto_sync(mut vm: Pin<&mut qobject::TaskListViewModel>) {
         .expect("spawn auto-sync thread");
 }
 
+/// Read SQLite's `PRAGMA data_version` from `conn`. The pragma is
+/// a counter that increments on every commit visible to this
+/// connection — including writes by other processes. Used by the
+/// watcher callback to gate reloads on actual data changes vs
+/// incidental -shm/-wal touches caused by our own reads.
+fn read_data_version(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+}
+
 /// Spawn a background thread that watches the directory containing
 /// `path` and queues a `reload_active_filter` on the Qt thread when
 /// the debouncer fires.
@@ -4691,6 +4897,30 @@ fn start_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf) {
                 Ok(_event) => {
                     if let Err(e) =
                         qt_thread.queue(|mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                            // SQLite WAL mode touches -shm on every read
+                            // (mmap'd shared lock state) and the watcher
+                            // catches those events too — without a gate,
+                            // every reload here triggers another -shm
+                            // touch and the loop runs at the debounce
+                            // cadence forever. data_version increments
+                            // on actual commits (any connection, this
+                            // process or another), so it's the cheapest
+                            // way to tell "did anything actually change?"
+                            // from "watcher fired on our own activity".
+                            let new_version = match pinned.as_ref().db.as_ref() {
+                                Some(db) => match read_data_version(db.connection()) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        tracing::trace!("data_version query failed: {e}");
+                                        return;
+                                    }
+                                },
+                                None => return,
+                            };
+                            if new_version == pinned.as_ref().last_data_version {
+                                return;
+                            }
+                            pinned.as_mut().rust_mut().last_data_version = new_version;
                             pinned.as_mut().reload_active_filter();
                             // External writers (Syncthing, the Android
                             // app via the same DB file) may have added,

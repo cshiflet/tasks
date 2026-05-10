@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OpenFlags, Transaction};
+use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::error::Result;
 
@@ -164,7 +164,7 @@ pub fn create_task(
     caldav_calendar_uuid: Option<&str>,
 ) -> Result<i64> {
     let mut conn = open_rw(path)?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     let task_remote_id = uuid::Uuid::new_v4().to_string();
     let title_arg: Option<&str> = if title.is_empty() { None } else { Some(title) };
@@ -382,8 +382,11 @@ pub fn update_task_fields(
     // Wrap both the tasks UPDATE and the optional caldav_tasks
     // UPDATE in one transaction so a mid-write interrupt leaves
     // the pair consistent. For a one-row edit the overhead is
-    // negligible and the safety margin is worth it.
-    let tx = conn.transaction()?;
+    // negligible and the safety margin is worth it. BEGIN IMMEDIATE
+    // (vs DEFERRED) acquires the write lock at BEGIN time so
+    // concurrent writers contend at the busy_timeout-respecting
+    // step rather than on the first INSERT/UPDATE.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     // Empty notes / title should store as NULL (matching Android's
     // `Task.notes: String?`): otherwise a cleared field persists as

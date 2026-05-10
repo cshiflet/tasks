@@ -11,7 +11,7 @@
 //! * Top-level `VCALENDAR` envelope; we look at the first `VTODO`.
 //! * VTODO properties: `UID`, `SUMMARY`, `DESCRIPTION`, `PRIORITY`,
 //!   `DTSTART`, `DUE`, `COMPLETED`, `STATUS`, `RRULE`, `CATEGORIES`,
-//!   `RELATED-TO;RELTYPE=PARENT`, `LAST-MODIFIED`, `CREATED`.
+//!   `RELATED-TO;RELTYPE=PARENT`, `LAST-MODIFIED`, `CREATED`, `DTSTAMP`.
 //! * Nested `VALARM` blocks with `ACTION` + `TRIGGER` (offset or
 //!   absolute).
 //!
@@ -102,6 +102,11 @@ pub struct VTodo {
     pub parent_uid: Option<String>,
     pub last_modified_ms: Option<i64>,
     pub created_ms: Option<i64>,
+    /// RFC 5545 §3.6.2: REQUIRED for VTODO. Strict CalDAV servers
+    /// (Radicale, Cyrus, SOGo) reject a body without DTSTAMP with
+    /// HTTP 409 "Conflict in the request". Always populate before
+    /// serialising — `remote_task_to_vtodo` does this.
+    pub dtstamp_ms: Option<i64>,
     pub alarms: Vec<VAlarm>,
 }
 
@@ -239,6 +244,20 @@ pub fn serialize_vcalendar(todo: &VTodo) -> String {
     write_line(&mut out, "CALSCALE:GREGORIAN");
     write_line(&mut out, "BEGIN:VTODO");
     write_line(&mut out, &format!("UID:{}", escape_text(&todo.uid)));
+    // DTSTAMP is REQUIRED for VTODO per RFC 5545 §3.6.2. Strict
+    // CalDAV servers (Radicale, Cyrus, SOGo) reject a body without
+    // it as 409 "Conflict in the request". Fall back to
+    // last_modified_ms / created_ms / 0 so a partially-populated
+    // VTodo still serialises to something rather than panicking.
+    let dtstamp = todo
+        .dtstamp_ms
+        .or(todo.last_modified_ms)
+        .or(todo.created_ms)
+        .unwrap_or(0);
+    write_line(
+        &mut out,
+        &format!("DTSTAMP:{}", format_utc_datetime(dtstamp)),
+    );
     if let Some(s) = &todo.summary {
         write_line(&mut out, &format!("SUMMARY:{}", escape_text(s)));
     }
@@ -445,6 +464,10 @@ fn apply_vtodo_property(todo: &mut VTodo, p: &Property) -> IcalResult<()> {
         "CREATED" => {
             let (ms, _) = parse_date_value(&p.value, ParamValueKind::DateTime)?;
             todo.created_ms = Some(ms);
+        }
+        "DTSTAMP" => {
+            let (ms, _) = parse_date_value(&p.value, ParamValueKind::DateTime)?;
+            todo.dtstamp_ms = Some(ms);
         }
         _ => {} // Unknown property; ignore (X-vendor extensions, etc.)
     }
@@ -726,6 +749,7 @@ VERSION:2.0\r\n\
 PRODID:-//Tasks.org//Tasks//EN\r\n\
 BEGIN:VTODO\r\n\
 UID:abc-123\r\n\
+DTSTAMP:20240116T120000Z\r\n\
 SUMMARY:Buy milk\r\n\
 DESCRIPTION:From the store\\, on the corner\r\n\
 PRIORITY:5\r\n\
@@ -764,6 +788,7 @@ END:VCALENDAR\r\n";
         assert_eq!(v.parent_uid.as_deref(), Some("parent-uid"));
         assert_eq!(v.last_modified_ms, Some(1_705_406_400_000));
         assert_eq!(v.created_ms, Some(1_705_305_600_000));
+        assert_eq!(v.dtstamp_ms, Some(1_705_406_400_000));
         assert_eq!(v.alarms.len(), 1);
         assert_eq!(v.alarms[0].action, "DISPLAY");
         assert_eq!(v.alarms[0].trigger, AlarmTrigger::Offset(-30 * 60 * 1000));
@@ -784,6 +809,42 @@ END:VCALENDAR\r\n";
         let serialised = serialize_vcalendar(&original);
         let reparsed = parse_vcalendar(&serialised).unwrap();
         assert_eq!(reparsed, original);
+    }
+
+    /// RFC 5545 §3.6.2 makes DTSTAMP REQUIRED on VTODO. Without it
+    /// strict CalDAV servers (Radicale, Cyrus, SOGo) reject the PUT
+    /// with HTTP 409 "Conflict in the request" — that's how the
+    /// missing-DTSTAMP bug surfaced in the field. The serializer
+    /// must emit it even when the source VTodo only has the older
+    /// LAST-MODIFIED / CREATED stamps.
+    #[test]
+    fn serialised_vtodo_always_has_dtstamp() {
+        let mut v = VTodo {
+            uid: "no-stamps".into(),
+            ..VTodo::default()
+        };
+        // Sanity: nothing populated → falls back to 0 but the line still appears.
+        let s = serialize_vcalendar(&v);
+        assert!(
+            s.contains("\r\nDTSTAMP:"),
+            "DTSTAMP missing from minimal VTodo:\n{s}"
+        );
+
+        // last_modified_ms only → DTSTAMP picks it up.
+        v.last_modified_ms = Some(1_705_406_400_000);
+        let s = serialize_vcalendar(&v);
+        assert!(
+            s.contains("\r\nDTSTAMP:20240116T120000Z\r\n"),
+            "DTSTAMP didn't fall back to LAST-MODIFIED:\n{s}"
+        );
+
+        // Explicit dtstamp_ms wins over fallbacks.
+        v.dtstamp_ms = Some(1_705_492_800_000);
+        let s = serialize_vcalendar(&v);
+        assert!(
+            s.contains("\r\nDTSTAMP:20240117T120000Z\r\n"),
+            "DTSTAMP didn't honour the explicit field:\n{s}"
+        );
     }
 
     #[test]
