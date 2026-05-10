@@ -1,0 +1,220 @@
+name: desktop-native
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop-native/**'
+      - 'data/schemas/**'
+      - '.github/workflows/desktop-native.yml'
+  pull_request:
+    paths:
+      - 'desktop-native/**'
+      - 'data/schemas/**'
+      - '.github/workflows/desktop-native.yml'
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Opt JS-based actions into Node 24 ahead of the 2026-06-02 default
+  # flip. See desktop-native-release.yml for the full rationale.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Qt version pinned across every job so the per-push CI matches
+  # the binaries the release workflow produces. apt's distro Qt is
+  # 6.4.2 on ubuntu-latest, which silently accepts removed-in-6.6
+  # property assignments (e.g. `month`/`year` on `DayOfWeekRow`)
+  # and lets buggy QML through; install-qt-action gives us the
+  # same 6.6.3 every release ships, so a regression that breaks on
+  # Windows / macOS now fails Linux CI too.
+  QT_VERSION: '6.6.3'
+
+jobs:
+  # Linux job runs fmt + clippy + the schema-hash guard in addition to
+  # `cargo test`, since those checks only need to run once per commit.
+  check-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # libdbus-1-dev + pkg-config are link-time prerequisites for
+      # the `keyring` crate's secret-service backend (Tier-1 token
+      # store on Linux). Without them `cargo clippy` exits 101 at
+      # the dbus-sys link step. ubuntu-latest's runner image
+      # doesn't pre-install -dev headers; install-qt installs Qt
+      # but nothing else.
+      #
+      # mold + clang power the per-workspace `.cargo/config.toml`
+      # linker swap that cuts incremental link time from seconds
+      # to ~100 ms. CI matches the dev box so a config drift
+      # would show up as a build error rather than a silent fall
+      # back to GNU ld.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              libdbus-1-dev pkg-config mold clang
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test (includes schema-hash guard)
+        run: cargo test --workspace --no-fail-fast
+
+      - name: GUI smoke test (offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          # Bump QML binding warnings into stderr so the grep below can
+          # catch regressions. Without this, `Unable to assign [undefined]`
+          # et al. only show up at the default QtWarningMsg level.
+          QT_LOGGING_RULES: "qt.qml.binding*.warning=true"
+        run: |
+          cargo build --workspace
+          # Launch the binary for 3 seconds under offscreen Qt; any QML
+          # import error or crash surfaces as a non-SIGTERM exit code.
+          # stderr is tee'd so the grep below can catch QML warnings
+          # the process emits without exiting.
+          set +e
+          timeout 3 ./target/debug/tasks-desktop 2> smoke-stderr.log
+          rc=$?
+          set -e
+          # timeout returns 124 on expiry or 143 when the child was
+          # SIGTERMed — either means the process ran without crashing.
+          if [ "$rc" != "124" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
+            echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            cat smoke-stderr.log >&2 || true
+            exit $rc
+          fi
+          # Fail the job if the engine logged any known-bad patterns:
+          #   * binding loops (always a symptom of a real dep cycle)
+          #   * `Unable to assign [undefined]` — usually a stale-array
+          #     access after a model-change race
+          #   * `TypeError:` from QML — unresolved property on a VM
+          #   * `: error:` — generic compile-error trailer
+          #   * `Cannot assign to non-existent property` — typo'd
+          #     property/handler name (e.g. `onFooChanged` vs
+          #     `on_FooChanged` for an underscored property). Without
+          #     this, the QML engine still loads the parent component
+          #     but the handler silently doesn't fire, and the smoke
+          #     test happily reports rc=124. 2026-05 we shipped a
+          #     SidebarPane regression of exactly this shape.
+          #   * `Type … unavailable` — a Type-A.qml fails to load and
+          #     a Type-B.qml that uses it fails too; the cascade is
+          #     the only signal we get when a child QML file has a
+          #     load error of any kind.
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:|Cannot assign to non-existent property|Type [A-Za-z_]+ unavailable" smoke-stderr.log; then
+            echo "QML smoke test found warnings — see matches above" >&2
+            exit 1
+          fi
+
+  # macOS and Windows jobs only run build + test — fmt/clippy/schema-hash
+  # are deterministic across OSes and would just burn CI time.
+  check-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: GUI smoke test (offscreen Qt)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QT_LOGGING_RULES: "qt.qml.binding*.warning=true"
+        run: |
+          cargo build --workspace
+          set +e
+          # macOS `timeout` isn't BSD-default; use perl as a portable
+          # fallback.
+          perl -e 'alarm 3; exec @ARGV' -- ./target/debug/tasks-desktop \
+            2> smoke-stderr.log
+          rc=$?
+          set -e
+          if [ "$rc" != "142" ] && [ "$rc" != "143" ] && [ "$rc" != "0" ]; then
+            echo "tasks-desktop exited with unexpected rc=$rc" >&2
+            cat smoke-stderr.log >&2 || true
+            exit $rc
+          fi
+          if grep -E "Binding loop|Unable to assign \[undefined\]|TypeError|: error:" smoke-stderr.log; then
+            echo "QML smoke test found warnings — see matches above" >&2
+            exit 1
+          fi
+
+  check-windows:
+    # Pinned to windows-2022 (MSVC 2019). `windows-latest` is
+    # mid-migration to windows-2025 / VS 2026, and our cached
+    # Qt 6.6.3 binary is built against win64_msvc2019_64 — the
+    # 2026-05-08 runner-image roll surfaced as Install-Qt-Action
+    # failing 24 s into the job, immediately after a cache hit
+    # for the msvc2019 build. Revisit when install-qt-action
+    # ships a Qt 6 build for the new toolchain.
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      # Skipping the GUI smoke step on Windows for now — `QT_QPA_PLATFORM
+      # =offscreen` works, but invoking a short-lived process via PowerShell
+      # requires platform-specific plumbing that's not worth the coverage.
+      # Revisit once the Qt front-end has feature tests worth running on
+      # Windows specifically.
+

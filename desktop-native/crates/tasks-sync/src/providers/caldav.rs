@@ -1,0 +1,812 @@
+//! CalDAV provider — real implementation.
+//!
+//! Speaks the subset of RFC 4791 Tasks.org needs: service
+//! discovery (PROPFIND current-user-principal → calendar-home-set →
+//! list calendars), VTODO pull via `calendar-query` REPORT, and
+//! push/delete via WebDAV PUT/DELETE with `If-Match` etag gates.
+//!
+//! HTTP:
+//! * `reqwest` async client with rustls-tls.
+//! * Basic auth header built from `AccountCredentials`.
+//!   OAuth-protected servers (Fastmail / iCloud) plug into
+//!   `oauth_access_token` when that flow lands; the header builder
+//!   already honours it.
+//! * Custom methods (PROPFIND, REPORT) via
+//!   `Method::from_bytes(b"PROPFIND")`.
+//!
+//! XML bodies + response parsing live in
+//! [`crate::providers::caldav_xml`]; this file is the transport
+//! half.
+//!
+//! **Testing caveats**: can't exercise the network against a real
+//! server from CI. The fixture-driven tests in
+//! `caldav_xml::tests` cover the parsing side exhaustively; the
+//! compile path here is what the workspace build validates.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as B64_STANDARD;
+use base64::Engine;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, IF_MATCH};
+use reqwest::{Client, Method, Url};
+use secrecy::ExposeSecret;
+
+use super::caldav_xml::{
+    parse_calendar_home_set, parse_calendar_listing, parse_principal_response, parse_task_listing,
+    PROPFIND_CALENDAR_HOME_SET, PROPFIND_CALENDAR_LIST, PROPFIND_CURRENT_USER_PRINCIPAL,
+    REPORT_CALENDAR_QUERY_VTODO,
+};
+use super::http_util::{read_body_capped, truncate_for_status, DEFAULT_BODY_CAP};
+use crate::ical::{parse_vcalendar, serialize_vcalendar};
+use crate::provider::{
+    AccountCredentials, Provider, ProviderKind, RemoteCalendar, RemoteTask, SyncError, SyncOutcome,
+    SyncResult,
+};
+use crate::{remote_task_to_vtodo, vtodo_to_remote_task};
+
+/// Connected-session state populated by `connect()`.
+struct Session {
+    http: Client,
+    auth: HeaderValue,
+    calendar_home: Url,
+    /// Origin (scheme + host + port) derived from `calendar_home`
+    /// at connect time. Every follow-up URL the server hands us
+    /// (`<d:href>`, object URLs, etc.) is clamped against this so
+    /// a malicious server can't bounce an authenticated request at
+    /// an arbitrary third-party host and leak the Basic / Bearer
+    /// header.
+    trusted_origin: TrustedOrigin,
+}
+
+/// Scheme + host + (optional) port captured from a provider's
+/// trusted root URL. Follow-up URLs are rejected unless all three
+/// match — that closes the token-leak primitive where the server
+/// gets to pick where our Authorization header travels next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl TrustedOrigin {
+    fn from_url(url: &Url) -> SyncResult<Self> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| SyncError::Protocol(format!("no host in {url}")))?
+            .to_ascii_lowercase();
+        Ok(Self {
+            scheme: url.scheme().to_ascii_lowercase(),
+            host,
+            port: url.port_or_known_default(),
+        })
+    }
+
+    fn check(&self, target: &Url) -> SyncResult<()> {
+        let host = target
+            .host_str()
+            .map(|h| h.to_ascii_lowercase())
+            .unwrap_or_default();
+        let scheme = target.scheme().to_ascii_lowercase();
+        let port = target.port_or_known_default();
+        if scheme == self.scheme && host == self.host && port == self.port {
+            Ok(())
+        } else {
+            Err(SyncError::Protocol(format!(
+                "off-origin redirect to {host}"
+            )))
+        }
+    }
+}
+
+pub struct CalDavProvider {
+    credentials: AccountCredentials,
+    account_label: String,
+    session: Arc<tokio::sync::Mutex<Option<Session>>>,
+}
+
+impl CalDavProvider {
+    pub fn new(credentials: AccountCredentials, account_label: impl Into<String>) -> Self {
+        Self {
+            credentials,
+            account_label: account_label.into(),
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for CalDavProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::CalDav
+    }
+
+    fn account_label(&self) -> &str {
+        &self.account_label
+    }
+
+    async fn connect(&mut self) -> SyncResult<()> {
+        let server_url = self
+            .credentials
+            .server_url
+            .clone()
+            .ok_or_else(|| SyncError::Auth("CalDAV requires server_url".into()))?;
+        let root =
+            Url::parse(&server_url).map_err(|e| SyncError::Auth(format!("bad server_url: {e}")))?;
+        let auth = build_auth_header(&self.credentials)?;
+        // reqwest 0.11's default redirect policy doesn't strip the
+        // Authorization header on cross-host redirects (H-2);
+        // disable auto-redirect so any 3xx surfaces to us as a
+        // protocol error instead of silently leaking the header.
+        let http = Client::builder()
+            .user_agent("tasks-desktop-native/0.1")
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| SyncError::Network(format!("reqwest build: {e}")))?;
+
+        // Anchor the trusted origin to the *user-supplied* root
+        // BEFORE the first PROPFIND. A hostile or compromised
+        // CalDAV server can return absolute `<d:href>` values
+        // pointing at any host — `Url::join` discards the base
+        // when the joined value is absolute, so without this
+        // clamp `principal_url` / `calendar_home` could land on
+        // an attacker-controlled host AND `trusted_origin`
+        // (formerly anchored to the post-discovery `calendar_home`)
+        // would re-anchor there, defeating the H-1 origin
+        // protection on every subsequent authenticated request.
+        // Pin to the user's input so cross-host hrefs surface as
+        // a clear protocol error instead of silently siphoning
+        // Basic / Bearer credentials. Legitimate CalDAV servers
+        // (Fastmail, Nextcloud, iCloud, Radicale) return
+        // same-origin or relative hrefs — cross-host discovery
+        // would require the user to point `server_url` at the
+        // real backend host directly.
+        let trusted_origin = TrustedOrigin::from_url(&root)?;
+
+        // Step 1: PROPFIND / for current-user-principal.
+        let principal_body = propfind(
+            &http,
+            root.clone(),
+            &auth,
+            0,
+            PROPFIND_CURRENT_USER_PRINCIPAL,
+        )
+        .await?;
+        let principal = parse_principal_response(&principal_body)?;
+        let principal_href = principal
+            .href
+            .ok_or_else(|| SyncError::Protocol("no current-user-principal in response".into()))?;
+        let principal_url = root
+            .join(&principal_href)
+            .map_err(|e| SyncError::Protocol(format!("bad principal href: {e}")))?;
+        // Refuse to send the auth header to an off-origin
+        // PROPFIND target — see the trusted_origin rationale
+        // above. The server-supplied principal href could be a
+        // fully-qualified URL pointing anywhere.
+        trusted_origin.check(&principal_url)?;
+
+        // Step 2: PROPFIND principal for calendar-home-set.
+        let home_body = propfind(
+            &http,
+            principal_url.clone(),
+            &auth,
+            0,
+            PROPFIND_CALENDAR_HOME_SET,
+        )
+        .await?;
+        let home = parse_calendar_home_set(&home_body)?;
+        let home_href = home
+            .href
+            .ok_or_else(|| SyncError::Protocol("no calendar-home-set in response".into()))?;
+        let calendar_home = root
+            .join(&home_href)
+            .map_err(|e| SyncError::Protocol(format!("bad home-set href: {e}")))?;
+        trusted_origin.check(&calendar_home)?;
+
+        *self.session.lock().await = Some(Session {
+            http,
+            auth,
+            calendar_home,
+            trusted_origin,
+        });
+        Ok(())
+    }
+
+    async fn list_calendars(&mut self) -> SyncResult<Vec<RemoteCalendar>> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        let body = propfind(
+            &s.http,
+            s.calendar_home.clone(),
+            &s.auth,
+            1,
+            PROPFIND_CALENDAR_LIST,
+        )
+        .await?;
+        let listings = parse_calendar_listing(&body)?;
+        let mut out = Vec::with_capacity(listings.len());
+        for l in listings {
+            // Resolve the relative href against the server root so
+            // subsequent REPORT / PUT calls hit the right URL.
+            let url = s
+                .calendar_home
+                .join(&l.href)
+                .map_err(|e| SyncError::Protocol(format!("bad calendar href {}: {e}", l.href)))?;
+            // Clamp against the authenticated origin: a malicious
+            // server could otherwise emit `<d:href>https://evil/…`
+            // and the next authenticated request would leak the
+            // Basic / Bearer header to that host.
+            s.trusted_origin.check(&url)?;
+            out.push(RemoteCalendar {
+                remote_id: url.as_str().to_string(),
+                name: l.display_name.unwrap_or_else(|| l.href.clone()),
+                url: Some(url.as_str().to_string()),
+                color: l.color.as_deref().and_then(parse_hex_color),
+                change_tag: l.ctag,
+                read_only: l.read_only,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn list_tasks(&mut self, calendar_remote_id: &str) -> SyncResult<Vec<RemoteTask>> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        let cal_url = Url::parse(calendar_remote_id).map_err(|e| {
+            SyncError::Protocol(format!("bad calendar url '{calendar_remote_id}': {e}"))
+        })?;
+        s.trusted_origin.check(&cal_url)?;
+        let body = report(
+            &s.http,
+            cal_url.clone(),
+            &s.auth,
+            REPORT_CALENDAR_QUERY_VTODO,
+        )
+        .await?;
+        let resources = parse_task_listing(&body)?;
+
+        let mut out = Vec::with_capacity(resources.len());
+        for r in resources {
+            let href = &r.href;
+            let data = match &r.calendar_data {
+                Some(d) => d,
+                None => continue,
+            };
+            let vtodo = match parse_vcalendar(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("skipping {}: unparseable VCALENDAR: {e}", href);
+                    continue;
+                }
+            };
+            let obj_url = cal_url
+                .join(href)
+                .map_err(|e| SyncError::Protocol(format!("bad task href {href}: {e}")))?;
+            // Clamp each `<d:href>` against the trusted origin so
+            // a rogue server can't hand us a third-party URL for a
+            // subsequent authenticated PUT/DELETE.
+            s.trusted_origin.check(&obj_url)?;
+            let mut rt = vtodo_to_remote_task(&vtodo, calendar_remote_id, Some(data.clone()));
+            // For CalDAV we key local rows by the VTODO UID so
+            // push/delete can look it up by the local row's
+            // remoteId; we stash the object URL in `etag` alongside
+            // the real etag separated by a pipe so the push path
+            // can reconstruct it without re-listing.
+            rt.etag = r.etag.clone();
+            rt.raw_vtodo = Some(data.clone());
+            // Tracking the href on the RemoteTask is a schema
+            // extension we'd need; for now callers that want to
+            // push rely on calendar_remote_id + VTODO UID.
+            let _ = obj_url;
+            out.push(rt);
+        }
+        Ok(out)
+    }
+
+    async fn push_task(&mut self, task: &RemoteTask) -> SyncResult<Option<String>> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        // The object URL follows Tasks.org's convention:
+        //   <calendar_url>/<UID>.ics
+        let cal_url = Url::parse(&task.calendar_remote_id).map_err(|e| {
+            SyncError::Protocol(format!(
+                "bad calendar url '{}': {e}",
+                task.calendar_remote_id
+            ))
+        })?;
+        s.trusted_origin.check(&cal_url)?;
+        let obj_url = cal_url
+            .join(&format!("{}.ics", task.remote_id))
+            .map_err(|e| SyncError::Protocol(format!("bad obj href: {e}")))?;
+        s.trusted_origin.check(&obj_url)?;
+
+        let body = {
+            let vtodo = remote_task_to_vtodo(task, tasks_core::now_ms(), None);
+            serialize_vcalendar(&vtodo)
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, s.auth.clone());
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/calendar; charset=utf-8"),
+        );
+        if let Some(etag) = &task.etag {
+            headers.insert(
+                IF_MATCH,
+                HeaderValue::from_str(&format!("\"{etag}\""))
+                    .map_err(|e| SyncError::Protocol(format!("bad etag header: {e}")))?,
+            );
+        }
+
+        let resp = s
+            .http
+            .put(obj_url.clone())
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| SyncError::Network(format!("PUT: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            return Err(SyncError::Conflict {
+                remote_id: task.remote_id.clone(),
+                local: task.etag.clone(),
+                server_message: msg,
+            });
+        }
+        if !status.is_success() {
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            tracing::debug!("caldav PUT {status} body: {msg}");
+            // Disambiguate: a 4xx with a generic "Conflict in the
+            // request" body (Radicale's catch-all) often means the
+            // parent calendar collection has been deleted server-
+            // side. PROPFIND the calendar URL once to confirm; if
+            // it's gone, surface an actionable message instead of
+            // burying the reason inside the server's vague reply.
+            // The user has to decide whether to delete the local
+            // list or recreate the calendar server-side — auto-
+            // recreating would silently undo a deliberate cleanup
+            // by another client. (Tracking the propagation of a
+            // remote list-delete back into the local DB is a
+            // separate, larger problem.)
+            if !calendar_exists(s, &cal_url).await.unwrap_or(true) {
+                return Err(SyncError::Local(format!(
+                    "calendar {} no longer exists on the server — \
+                     remove the list locally (Settings → Accounts) or \
+                     recreate it server-side; pushes will keep failing \
+                     until then",
+                    cal_url
+                )));
+            }
+            return Err(SyncError::Network(format!(
+                "PUT {status}: {}",
+                truncate_for_status(&msg)
+            )));
+        }
+        let new_etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string());
+        Ok(new_etag)
+    }
+
+    async fn delete_task(
+        &mut self,
+        calendar_remote_id: &str,
+        remote_id: &str,
+        etag: Option<&str>,
+    ) -> SyncResult<()> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        let cal_url = Url::parse(calendar_remote_id).map_err(|e| {
+            SyncError::Protocol(format!("bad calendar url '{calendar_remote_id}': {e}"))
+        })?;
+        s.trusted_origin.check(&cal_url)?;
+        let obj_url = cal_url
+            .join(&format!("{remote_id}.ics"))
+            .map_err(|e| SyncError::Protocol(format!("bad obj href: {e}")))?;
+        s.trusted_origin.check(&obj_url)?;
+        // Send `If-Match` so a concurrent server-side edit
+        // surfaces as 412 -> Conflict instead of being silently
+        // overwritten by our delete. Servers that don't honour
+        // it return success regardless; we keep the previous
+        // 404-tolerance for "already gone server-side".
+        let mut req = s.http.delete(obj_url).header(AUTHORIZATION, s.auth.clone());
+        if let Some(tag) = etag {
+            req = req.header(
+                IF_MATCH,
+                HeaderValue::from_str(&format!("\"{tag}\""))
+                    .map_err(|e| SyncError::Protocol(format!("bad etag header: {e}")))?,
+            );
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| SyncError::Network(format!("DELETE: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            return Err(SyncError::Conflict {
+                remote_id: remote_id.to_string(),
+                local: etag.map(str::to_string),
+                server_message: msg,
+            });
+        }
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+            let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            tracing::debug!("caldav DELETE {status} body: {msg}");
+            return Err(SyncError::Network(format!(
+                "DELETE {status}: {}",
+                truncate_for_status(&msg)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn delete_calendar(&mut self, remote_id: &str) -> SyncResult<()> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        let cal_url = Url::parse(remote_id)
+            .map_err(|e| SyncError::Protocol(format!("bad calendar url '{remote_id}': {e}")))?;
+        s.trusted_origin.check(&cal_url)?;
+        let resp = s
+            .http
+            .delete(cal_url)
+            .header(AUTHORIZATION, s.auth.clone())
+            .send()
+            .await
+            .map_err(|e| SyncError::Network(format!("DELETE calendar: {e}")))?;
+        let status = resp.status();
+        // 404 means "already gone server-side" — that satisfies
+        // the caller's intent ("this list shouldn't exist remotely
+        // anymore"). Any other failure surfaces so the bridge can
+        // decide whether to keep the local list mapping.
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+            let snippet = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            return Err(SyncError::Network(format!(
+                "DELETE calendar {status}: {}",
+                truncate_for_status(&snippet)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn sync_once(&mut self) -> SyncResult<SyncOutcome> {
+        // See EteSync provider: orchestration lives on
+        // `SyncEngine::sync_now`, which composes pull + push.
+        Err(SyncError::NotYetImplemented {
+            provider: "CalDAV",
+            method: "sync_once (use SyncEngine::sync_now)",
+        })
+    }
+
+    async fn create_calendar(
+        &mut self,
+        name: &str,
+        color: Option<i32>,
+    ) -> SyncResult<RemoteCalendar> {
+        let guard = self.session.lock().await;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| SyncError::Auth("CalDAV: connect() first".into()))?;
+        // Mint a fresh UUID-shaped path segment under the user's
+        // calendar home. Radicale, Nextcloud, Fastmail, iCloud and
+        // any RFC 4791 server let MKCALENDAR's request URI choose
+        // the resource path; collisions on a UUID v4 are vanishingly
+        // unlikely so retry-on-409 isn't worth the code yet.
+        let collection_id = uuid::Uuid::new_v4().to_string();
+        let target = s
+            .calendar_home
+            .join(&format!("{collection_id}/"))
+            .map_err(|e| SyncError::Protocol(format!("bad mkcalendar url: {e}")))?;
+        s.trusted_origin.check(&target)?;
+        // Minimal MKCALENDAR body: display name + (optional) Apple-
+        // style colour + restrict the calendar to VTODO so the
+        // server doesn't bind it to VEVENT and refuse our task PUTs.
+        let mut body = String::new();
+        body.push_str(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <c:mkcalendar xmlns:d=\"DAV:\" \
+                           xmlns:c=\"urn:ietf:params:xml:ns:caldav\" \
+                           xmlns:i=\"http://apple.com/ns/ical/\">\
+               <d:set><d:prop>",
+        );
+        body.push_str("<d:displayname>");
+        body.push_str(&xml_escape(name));
+        body.push_str("</d:displayname>");
+        if let Some(c) = color {
+            // Apple's calendar-color is a 32-bit ARGB stringified
+            // as `#RRGGBBAA`. Tasks.org stores ARGB so we shuffle
+            // bytes to RGBA before serialising.
+            let alpha = ((c as u32 >> 24) & 0xff) as u8;
+            let red = ((c as u32 >> 16) & 0xff) as u8;
+            let green = ((c as u32 >> 8) & 0xff) as u8;
+            let blue = (c as u32 & 0xff) as u8;
+            body.push_str(&format!(
+                "<i:calendar-color>#{red:02X}{green:02X}{blue:02X}{alpha:02X}</i:calendar-color>",
+            ));
+        }
+        body.push_str(
+            "<c:supported-calendar-component-set>\
+                <c:comp name=\"VTODO\"/>\
+              </c:supported-calendar-component-set>\
+            </d:prop></d:set></c:mkcalendar>",
+        );
+        let method = Method::from_bytes(b"MKCALENDAR")
+            .map_err(|e| SyncError::Other(format!("bad method: {e}")))?;
+        let resp = s
+            .http
+            .request(method, target.clone())
+            .header(AUTHORIZATION, s.auth.clone())
+            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| SyncError::Network(format!("MKCALENDAR: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let snippet = read_body_capped(resp, DEFAULT_BODY_CAP)
+                .await
+                .unwrap_or_default();
+            tracing::debug!("caldav MKCALENDAR {status} body: {snippet}");
+            return Err(SyncError::Protocol(format!(
+                "MKCALENDAR returned {status}: {}",
+                truncate_for_status(&snippet)
+            )));
+        }
+        Ok(RemoteCalendar {
+            remote_id: target.as_str().to_string(),
+            name: name.to_string(),
+            url: Some(target.as_str().to_string()),
+            color,
+            change_tag: None,
+            read_only: false,
+        })
+    }
+}
+
+/// PROPFIND `Depth: 0` against `cal_url`. Returns `Ok(true)` when
+/// the server responds with a multistatus that lists the URL (i.e.
+/// the calendar exists and we can see it), `Ok(false)` for `404 Not
+/// Found`, and surfaces other errors. Used by `push_task` to
+/// distinguish "calendar gone server-side" from genuine validation
+/// failures — without this the user sees a string of generic
+/// "Conflict in the request" 4xx replies and can't tell why.
+async fn calendar_exists(s: &Session, cal_url: &Url) -> SyncResult<bool> {
+    s.trusted_origin.check(cal_url)?;
+    let method = Method::from_bytes(b"PROPFIND")
+        .map_err(|e| SyncError::Other(format!("bad method: {e}")))?;
+    let resp = s
+        .http
+        .request(method, cal_url.clone())
+        .header(AUTHORIZATION, s.auth.clone())
+        .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+        .header("Depth", "0")
+        .body(
+            "<?xml version=\"1.0\"?>\
+             <d:propfind xmlns:d=\"DAV:\">\
+               <d:prop><d:resourcetype/></d:prop>\
+             </d:propfind>",
+        )
+        .send()
+        .await
+        .map_err(|e| SyncError::Network(format!("PROPFIND: {e}")))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        let snippet = read_body_capped(resp, DEFAULT_BODY_CAP)
+            .await
+            .unwrap_or_default();
+        return Err(SyncError::Network(format!(
+            "PROPFIND {status}: {}",
+            truncate_for_status(&snippet)
+        )));
+    }
+    Ok(true)
+}
+
+/// Minimal XML-text escape for displayname / other element text.
+/// Five entities cover everything XML 1.0 forbids in CDATA.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+// ---------- HTTP helpers ----------
+
+async fn propfind(
+    http: &Client,
+    url: Url,
+    auth: &HeaderValue,
+    depth: u8,
+    body: &'static str,
+) -> SyncResult<String> {
+    let method = Method::from_bytes(b"PROPFIND")
+        .map_err(|e| SyncError::Other(format!("bad method: {e}")))?;
+    let resp = http
+        .request(method, url)
+        .header(AUTHORIZATION, auth.clone())
+        .header("Depth", depth.to_string())
+        .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| SyncError::Network(format!("PROPFIND: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() && status.as_u16() != 207 {
+        let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+            .await
+            .unwrap_or_default();
+        tracing::debug!("caldav PROPFIND {status} body: {msg}");
+        return Err(SyncError::Network(format!(
+            "PROPFIND {status}: {}",
+            truncate_for_status(&msg)
+        )));
+    }
+    read_body_capped(resp, DEFAULT_BODY_CAP).await
+}
+
+async fn report(
+    http: &Client,
+    url: Url,
+    auth: &HeaderValue,
+    body: &'static str,
+) -> SyncResult<String> {
+    let method =
+        Method::from_bytes(b"REPORT").map_err(|e| SyncError::Other(format!("bad method: {e}")))?;
+    let resp = http
+        .request(method, url)
+        .header(AUTHORIZATION, auth.clone())
+        .header("Depth", "1")
+        .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| SyncError::Network(format!("REPORT: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() && status.as_u16() != 207 {
+        let msg = read_body_capped(resp, DEFAULT_BODY_CAP)
+            .await
+            .unwrap_or_default();
+        tracing::debug!("caldav REPORT {status} body: {msg}");
+        return Err(SyncError::Network(format!(
+            "REPORT {status}: {}",
+            truncate_for_status(&msg)
+        )));
+    }
+    read_body_capped(resp, DEFAULT_BODY_CAP).await
+}
+
+fn build_auth_header(credentials: &AccountCredentials) -> SyncResult<HeaderValue> {
+    // This is the single point where the secret crosses into an
+    // `HeaderValue`; `expose_secret()` is the documented M-1 API
+    // to opt out of the zeroize wrapper.
+    if let Some(token) = &credentials.oauth_access_token {
+        HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
+            .map_err(|e| SyncError::Auth(format!("bad oauth token header: {e}")))
+    } else if let (Some(user), Some(pass)) = (&credentials.username, &credentials.password) {
+        let encoded = B64_STANDARD.encode(format!("{user}:{}", pass.expose_secret()));
+        HeaderValue::from_str(&format!("Basic {encoded}"))
+            .map_err(|e| SyncError::Auth(format!("bad basic auth header: {e}")))
+    } else {
+        Err(SyncError::Auth(
+            "CalDAV needs either (username, password) or oauth_access_token".into(),
+        ))
+    }
+}
+
+fn parse_hex_color(s: &str) -> Option<i32> {
+    let s = s.trim().trim_start_matches('#');
+    let bytes = u32::from_str_radix(s, 16).ok()?;
+    let with_alpha = if s.len() == 6 {
+        0xFF00_0000 | bytes
+    } else {
+        bytes
+    };
+    Some(with_alpha as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_and_label_are_reported() {
+        let creds =
+            AccountCredentials::new_password("https://example.com/dav/", "alice", "hunter2");
+        let p = CalDavProvider::new(creds, "Fastmail / alice");
+        assert_eq!(p.kind(), ProviderKind::CalDav);
+        assert_eq!(p.account_label(), "Fastmail / alice");
+    }
+
+    #[test]
+    fn build_auth_header_picks_bearer_when_oauth_set() {
+        let creds = AccountCredentials::new_oauth("tok", None);
+        let h = build_auth_header(&creds).unwrap();
+        assert_eq!(h, "Bearer tok");
+    }
+
+    #[test]
+    fn build_auth_header_falls_back_to_basic() {
+        let creds = AccountCredentials::new_password("https://ex", "alice", "secret");
+        let h = build_auth_header(&creds).unwrap();
+        // base64("alice:secret") = "YWxpY2U6c2VjcmV0".
+        assert_eq!(h, "Basic YWxpY2U6c2VjcmV0");
+    }
+
+    #[test]
+    fn build_auth_header_rejects_empty_credentials() {
+        let creds = AccountCredentials::default();
+        assert!(build_auth_header(&creds).is_err());
+    }
+
+    #[test]
+    fn parse_hex_color_handles_common_shapes() {
+        assert_eq!(parse_hex_color("#ff0000"), Some(0xFFFF_0000_u32 as i32));
+        assert_eq!(parse_hex_color("00ff00"), Some(0xFF00_FF00_u32 as i32));
+        assert_eq!(parse_hex_color("AA112233"), Some(0xAA11_2233_u32 as i32));
+        assert!(parse_hex_color("nope").is_none());
+    }
+
+    #[test]
+    fn trusted_origin_rejects_off_origin_targets() {
+        // Guard against the H-1 attack: server hands us a `<d:href>`
+        // pointing at a third-party host, and the next authenticated
+        // request leaks our Basic / Bearer header there.
+        let home = Url::parse("https://dav.example.com/calendars/alice/").unwrap();
+        let origin = TrustedOrigin::from_url(&home).unwrap();
+
+        // Exact origin → accepted.
+        let ok = Url::parse("https://dav.example.com/calendars/alice/work/").unwrap();
+        assert!(origin.check(&ok).is_ok());
+
+        // Different host → rejected.
+        let evil = Url::parse("https://evil.example.org/calendars/alice/").unwrap();
+        let err = origin.check(&evil).unwrap_err();
+        assert!(matches!(err, SyncError::Protocol(msg) if msg.contains("evil.example.org")));
+
+        // Scheme downgrade → rejected.
+        let http = Url::parse("http://dav.example.com/calendars/alice/").unwrap();
+        assert!(origin.check(&http).is_err());
+
+        // Different port → rejected.
+        let other_port = Url::parse("https://dav.example.com:8443/calendars/alice/").unwrap();
+        assert!(origin.check(&other_port).is_err());
+    }
+}

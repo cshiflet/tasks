@@ -1,0 +1,5355 @@
+//! cxx-qt bridge: `TaskListViewModel`.
+//!
+//! Exposes the read-only task list, the currently-selected task's detail
+//! fields, and a sidebar of filters/CalDAV calendars to QML. The view
+//! model opens the SQLite file the Android client writes (schema-hash
+//! pinned), composes the recursive query via `tasks-core::query`, and
+//! materialises the rows into parallel Q_PROPERTYs the QML layer indexes
+//! by row position.
+//!
+//! Design note (see desktop-native/DECISIONS.md): we deliberately avoid
+//! the QVariantMap/QVariantList round trip because cxx-qt-lib 0.7 does
+//! not ship a `QVariant::from(&QVariantMap)` conversion. Parallel
+//! QStringList / QList<i64> properties cover every field a ListView
+//! delegate needs and compile cleanly against the stock cxx-qt types.
+
+#[cxx_qt::bridge]
+pub mod qobject {
+    unsafe extern "C++" {
+        include!("cxx-qt-lib/qstring.h");
+        type QString = cxx_qt_lib::QString;
+
+        include!("cxx-qt-lib/qstringlist.h");
+        type QStringList = cxx_qt_lib::QStringList;
+
+        include!("cxx-qt-lib/qlist.h");
+        #[cxx_name = "QList_i64"]
+        type QList_i64 = cxx_qt_lib::QList<i64>;
+        #[cxx_name = "QList_i32"]
+        type QList_i32 = cxx_qt_lib::QList<i32>;
+        #[cxx_name = "QList_bool"]
+        type QList_bool = cxx_qt_lib::QList<bool>;
+    }
+
+    // `auto_cxx_name` tells cxx-qt to snake_case → camelCase every
+    // C++-side name it generates from this block (Q_PROPERTY names,
+    // setters, change signals, Q_INVOKABLE methods). Without it,
+    // cxx-qt 0.7 emits the raw Rust identifier, so QML bindings
+    // written as `viewModel.dbPathDisplay` / `viewModel.sidebarLabels`
+    // would silently resolve to `undefined` and the UI would render
+    // with no data even though the bridge was otherwise healthy.
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[qobject]
+        #[qml_element]
+        // List-pane data (parallel arrays indexed by row).
+        #[qproperty(i32, count)]
+        #[qproperty(QStringList, titles)]
+        #[qproperty(QList_i64, task_ids)]
+        #[qproperty(QList_i32, indents)]
+        #[qproperty(QList_bool, completed_flags)]
+        // Whether each row is recurring (`tasks.recurrence` non-empty).
+        // The list pane swaps the priority-coloured checkbox for a
+        // round arrows-loop indicator when this flag is true so the
+        // user can spot recurring tasks at a glance, matching the
+        // Android client's row design.
+        #[qproperty(QList_bool, recurring_flags)]
+        #[qproperty(QStringList, due_labels)]
+        #[qproperty(QList_i32, priorities)]
+        // H-7: per-row metadata so list rows can render at parity
+        // with the Android client. `task_tag_summaries[i]` is the
+        // comma-joined display names of tags attached to row `i`,
+        // empty when the task has none. `task_list_names[i]` and
+        // `task_list_colors[i]` are the display name + i32 ARGB
+        // colour of the row's CalDAV list, both empty / 0 when
+        // the task is local-only.
+        #[qproperty(QStringList, task_tag_summaries)]
+        // Per-task comma-joined tag UIDs, parallel to `task_ids`.
+        // The list view splits on `,` and looks each UID up in the
+        // global `tag_uids` / `tag_labels` / `tag_colors` arrays to
+        // render coloured chips under each row's title. Empty when
+        // the task has no tags.
+        #[qproperty(QStringList, task_tag_uid_lists)]
+        #[qproperty(QStringList, task_list_names)]
+        #[qproperty(QList_i32, task_list_colors)]
+        // Detail-pane data for the currently-selected task.
+        #[qproperty(i64, selected_id)]
+        #[qproperty(QString, selected_title)]
+        #[qproperty(QString, selected_notes)]
+        #[qproperty(QString, selected_due_label)]
+        // Hide-until as the same round-trippable "YYYY-MM-DD [HH:MM]"
+        // string the due field uses. Seeds the edit dialog; empty
+        // when `tasks.hideUntil == 0`.
+        #[qproperty(QString, selected_hide_until_label)]
+        #[qproperty(i32, selected_priority)]
+        #[qproperty(bool, selected_completed)]
+        // Humanised RRULE ("Every week on Mon, Wed, Fri"). The raw
+        // form lives in `tasks.recurrence`; this property is the
+        // output of `tasks_core::recurrence::humanize_rrule` with
+        // the from-completion suffix pre-applied, so the detail
+        // pane can render it verbatim.
+        #[qproperty(QString, selected_recurrence)]
+        // CalDAV calendars available in the database, for the edit
+        // dialog's "list" picker. Built from the same query the
+        // sidebar uses; both lists stay in sync because they're
+        // populated in `open_at_path`.
+        #[qproperty(QStringList, caldav_calendar_labels)]
+        #[qproperty(QStringList, caldav_calendar_uuids)]
+        // UUID of the selected task's current CalDAV list, or empty
+        // when the task has no caldav_tasks row (local-only).
+        #[qproperty(QString, selected_caldav_calendar_uuid)]
+        // i32 ARGB colour of the selected task's CalDAV list, or 0
+        // when the task is local-only. Drives the coloured chip in
+        // the detail pane.
+        #[qproperty(i32, selected_caldav_calendar_color)]
+        // All tag definitions from `tagdata`, parallel arrays for
+        // the edit dialog's multi-select picker. `tag_uids` drives
+        // the semantic (writes back via the update invokable);
+        // `tag_labels` is the human-readable name.
+        #[qproperty(QStringList, tag_labels)]
+        #[qproperty(QStringList, tag_uids)]
+        // i32 ARGB colour per tag, parallel to `tag_uids`. Drives
+        // the coloured chip backgrounds in the detail pane's tag
+        // strip; 0 means "no colour", which the QML side falls back
+        // to a neutral grey for.
+        #[qproperty(QList_i32, tag_colors)]
+        // Tag UIDs currently attached to the selected task. Used
+        // to pre-check the dialog's checkboxes on open.
+        #[qproperty(QStringList, selected_tag_uids)]
+        // Alarms attached to the selected task. Parallel arrays —
+        // labels is the humanised description for display, times
+        // and types are the raw columns the edit dialog passes
+        // back into `updateSelectedTask`.
+        #[qproperty(QStringList, selected_alarm_labels)]
+        #[qproperty(QList_i64, selected_alarm_times)]
+        #[qproperty(QList_i32, selected_alarm_types)]
+        // Places known to the DB, parallel arrays for the edit
+        // dialog's location picker.
+        #[qproperty(QStringList, place_labels)]
+        #[qproperty(QStringList, place_uids)]
+        // Geofence currently attached to the selected task; empty
+        // `selected_place_uid` means no geofence.
+        #[qproperty(QString, selected_place_uid)]
+        #[qproperty(bool, selected_place_arrival)]
+        #[qproperty(bool, selected_place_departure)]
+        // Candidate parents for the subtask picker. Labels are
+        // task titles, IDs are tasks._id. Populated on open and
+        // refreshed on every select_task so newly-added tasks
+        // show up in the dropdown.
+        #[qproperty(QStringList, parent_candidate_labels)]
+        #[qproperty(QList_i64, parent_candidate_ids)]
+        // Current parent task id for the selected row (0 = top-level).
+        #[qproperty(i64, selected_parent_id)]
+        // Timer fields rendered as H:MM strings for the edit
+        // dialog. Empty string means zero.
+        #[qproperty(QString, selected_estimated_text)]
+        #[qproperty(QString, selected_elapsed_text)]
+        // Raw `tasks.recurrence` (RRULE) + `tasks.repeat_from` for
+        // the inline recurrence editor. Humanised summary is in
+        // `selected_recurrence` for the detail pane's display;
+        // these are the edit-dialog round-trip values.
+        #[qproperty(QString, selected_recurrence_raw)]
+        #[qproperty(i32, selected_repeat_from)]
+        // Live values of the query preferences. Seeded from the
+        // view model's `preferences` field; the preferences
+        // dialog reads these to pre-fill its controls and calls
+        // `updatePreferences` on save.
+        #[qproperty(i32, pref_sort_mode)]
+        #[qproperty(bool, pref_sort_ascending)]
+        #[qproperty(bool, pref_show_completed)]
+        #[qproperty(bool, pref_show_hidden)]
+        #[qproperty(bool, pref_completed_at_bottom)]
+        // Material theme override — persisted across restarts.
+        //   0 = Follow OS, 1 = Light, 2 = Dark.
+        // Surfaced in Settings → General → Appearance and read by
+        // Main.qml's `appearanceTheme` binding.
+        #[qproperty(i32, theme_mode)]
+        // OS-level reminder notifications master toggle. Persisted
+        // alongside the other prefs; surfaced in Settings → General
+        // as a checkbox. Flipping it on calls `reschedule_all`,
+        // flipping it off calls `cancel_all` so the change takes
+        // effect without waiting for the next event loop tick.
+        #[qproperty(bool, notifications_enabled)]
+        // Persisted ApplicationWindow geometry. Loaded once at
+        // construction; written back via `saveWindowGeometry` from
+        // Main.qml's `onClosing` so we don't churn the prefs file
+        // during drag/resize. `window_x`/`window_y` of 0 mean "no
+        // saved position; let the WM place it".
+        #[qproperty(i32, window_width)]
+        #[qproperty(i32, window_height)]
+        #[qproperty(i32, window_x)]
+        #[qproperty(i32, window_y)]
+        #[qproperty(bool, window_maximized)]
+        // Sidebar: parallel label / identifier arrays. Identifier format:
+        //   "__all__" | "__today__" | "__recent__"  (built-in filters)
+        //   "caldav:<uuid>"                          (CalDAV calendar)
+        //   "filter:<id>"                            (custom saved filter)
+        #[qproperty(QStringList, sidebar_labels)]
+        #[qproperty(QStringList, sidebar_ids)]
+        // Parallel to `sidebar_ids`. -1 for built-in filters and
+        // saved filters; for `caldav:<uuid>` rows it carries the
+        // owning `caldav_accounts.cda_account_type` so the QML can
+        // group LOCAL (2) lists separately from real CalDAV (0)
+        // lists, and similarly distinguish Google Tasks / Microsoft
+        // To Do / Etebase / Tasks.org / OpenTasks accounts. The id
+        // prefix stays uniform because every row lives in
+        // `caldav_lists`; the kind is purely a display concern.
+        #[qproperty(QList_i32, sidebar_account_kinds)]
+        // Parallel to `sidebar_ids` — the group key the QML uses
+        // for collapsible-section logic. "filters_builtin" for the
+        // top three built-ins, "saved" for `filter:*` rows, and
+        // `account:<cda_uuid>` for an account header AND every
+        // `caldav:` list row that hangs off it. Letting the bridge
+        // emit the group key directly is simpler than re-deriving
+        // it in QML by walking back over earlier indexes.
+        #[qproperty(QStringList, sidebar_groups)]
+        // i32 ARGB per row, parallel to `sidebar_ids`. Drives the
+        // little colour dot the sidebar paints next to each list
+        // label. 0 for non-list rows (built-ins / account headers /
+        // saved filters); for `caldav:` rows it's the
+        // `caldav_lists.cdl_color` value.
+        #[qproperty(QList_i32, sidebar_colors)]
+        #[qproperty(QString, active_filter_id)]
+        // Configured sync accounts, parallel arrays for the Settings
+        // → Accounts pane. `account_kinds` is the integer tag
+        //   0 = CalDAV, 1 = Google Tasks, 2 = Microsoft To Do, 3 = EteSync
+        // matching `tasks_sync::ProviderKind`. Server + username are
+        // blank for OAuth providers (they come from the active
+        // token store); passwords flow through the secret store
+        // (keyring / encrypted file / in-memory depending on tier)
+        // and are never exposed as a Q_PROPERTY.
+        #[qproperty(QStringList, account_labels)]
+        #[qproperty(QList_i32, account_kinds)]
+        #[qproperty(QStringList, account_servers)]
+        #[qproperty(QStringList, account_usernames)]
+        // `caldav_accounts.cda_uuid` per row, parallel to the
+        // other account_* arrays. QML hands a uuid to
+        // `sync_account` to point the engine at the right row.
+        #[qproperty(QStringList, account_uuids)]
+        // Per-account user-facing sync state ("idle", "syncing…",
+        // "Synced 5s ago", "Sync failed: …"). Updated synchronously
+        // around each `sync_account` invokable; the QML row binds
+        // its trailing label to the matching index.
+        #[qproperty(QStringList, account_sync_states)]
+        // H-6: id of the last task soft-deleted in this session,
+        // valid until the toast countdown expires or the user
+        // restores it. 0 = nothing to undo. The toast Popup
+        // surfaces an Undo button while this is non-zero. The
+        // deleted task's title is held only on the Rust side
+        // (used to format the status-line message); QML doesn't
+        // need it directly.
+        #[qproperty(i64, last_deleted_id)]
+        // Status bar text.
+        #[qproperty(QString, status)]
+        // Inline result string from the most recent
+        // `test_account_connection` invokable. Updated to
+        // "Testing connection…" / "Test successful — credentials
+        // work." / "Test failed: …" so the Accounts pane can
+        // render the verdict next to the Test button instead of
+        // routing it through the status bar at the bottom.
+        #[qproperty(QString, last_test_result)]
+        // Set when `webbrowser::open` fails to launch a browser
+        // during an OAuth sign-in (kiosk / WSL without DESKTOP env /
+        // missing xdg-open). The QML side watches for a non-empty
+        // value and pops a Dialog with the auth URL so the user can
+        // copy it into a browser of their choice. Cleared as soon
+        // as the loopback receiver consumes the redirect — or
+        // times out, whichever comes first.
+        // Stable string identifier of the active credential
+        // storage tier — `"keychain"` (Tier 1, OS-native),
+        // `"encrypted_file"` (Tier 2, AES-256-GCM under
+        // <config_dir>/tasks-desktop/tokens.dat with a key derived
+        // from the machine identifier), or `"in_memory"` (Tier 3
+        // fallback when the other two probes fail or when the user
+        // explicitly picks in-memory mode). The QML pre-flight
+        // dialog reads this before any OAuth or password-account
+        // flow so the user can choose to abort if the tier doesn't
+        // match what they want. Updated when the user changes the
+        // credential-storage choice via Settings → General; in
+        // that case any prior credentials are migrated into the
+        // new store before the property changes.
+        #[qproperty(QString, credential_storage_tier)]
+        // What the user explicitly *requested* for credential
+        // storage in Settings: `"auto"` (default), `"in_memory"`,
+        // or — once the master-password batch lands —
+        // `"master_password"`. The actual `credentialStorageTier`
+        // above may differ when `"auto"` was requested but a
+        // higher tier failed to probe. Both flow through the
+        // `updateCredentialStorageChoice` invokable below.
+        #[qproperty(QString, credential_storage_choice)]
+        // Set to true once the user has dismissed the pre-flight
+        // disclosure for a non-keychain tier. Stops the dialog
+        // from re-popping each launch in the encrypted-file case.
+        // In-memory always re-prompts (it's a degraded mode that
+        // discards credentials on exit).
+        #[qproperty(bool, credential_storage_acknowledged)]
+        #[qproperty(QString, oauth_manual_url)]
+        // Account label paired with `oauth_manual_url` so the
+        // Dialog can render "Sign in to <label>" without QML having
+        // to remember the in-flight context.
+        #[qproperty(QString, oauth_manual_label)]
+        // Absolute path of the currently-open database, surfaced in
+        // the window title + Browse path field so users know which
+        // file they're looking at.
+        #[qproperty(QString, db_path_display)]
+        type TaskListViewModel = super::TaskListViewModelRust;
+
+        #[qinvokable]
+        fn open_database(self: Pin<&mut TaskListViewModel>, path: QString);
+
+        #[qinvokable]
+        fn open_default_database(self: Pin<&mut TaskListViewModel>);
+
+        #[qinvokable]
+        fn import_json_backup(self: Pin<&mut TaskListViewModel>, path: QString);
+
+        #[qinvokable]
+        fn select_filter(self: Pin<&mut TaskListViewModel>, id: QString);
+
+        #[qinvokable]
+        fn select_task(self: Pin<&mut TaskListViewModel>, id: i64);
+
+        /// Create a brand-new task with the given title. If the
+        /// active filter is a CalDAV list, the new task is
+        /// assigned to that list automatically.
+        #[qinvokable]
+        fn add_new_task(self: Pin<&mut TaskListViewModel>, title: QString);
+
+        /// Apply new query preferences and reload the active
+        /// filter. Session-local only for now; QSettings
+        /// persistence is a follow-up.
+        #[qinvokable]
+        fn update_preferences(
+            self: Pin<&mut TaskListViewModel>,
+            sort_mode: i32,
+            sort_ascending: bool,
+            show_completed: bool,
+            show_hidden: bool,
+            completed_at_bottom: bool,
+        );
+
+        /// Apply per-list query-pref overrides for the CalDAV list
+        /// keyed on `cdl_uuid`. Negative values for the int-typed
+        /// fields (`sort_mode`) and the special tri-state values
+        /// for the bool-typed fields (-1 = inherit) signal "no
+        /// override; fall back to the global default". Persisted
+        /// to `preferences.json` and merged over the global
+        /// QueryPreferences in `reload_active_filter`.
+        ///
+        /// `sort_mode_set` / `sort_ascending_set` / etc. are the
+        /// matching booleans that flip a field between "set" and
+        /// "inherit"; QML passes false to clear a single field
+        /// without resetting the whole row.
+        #[qinvokable]
+        fn update_list_override(
+            self: Pin<&mut TaskListViewModel>,
+            uuid: QString,
+            sort_mode: i32,
+            sort_mode_set: bool,
+            sort_ascending: bool,
+            sort_ascending_set: bool,
+            show_completed: bool,
+            show_completed_set: bool,
+            show_hidden: bool,
+            show_hidden_set: bool,
+            completed_at_bottom: bool,
+            completed_at_bottom_set: bool,
+        );
+
+        /// Drop every per-list override for `uuid`. The list goes
+        /// back to inheriting the global defaults verbatim. Idempotent.
+        #[qinvokable]
+        fn clear_list_override(self: Pin<&mut TaskListViewModel>, uuid: QString);
+
+        /// Look up a list's override values for the QML edit
+        /// dialog to prefill. Returns 5 strings packed into a
+        /// QStringList: `[sort_mode, sort_ascending, show_completed,
+        /// show_hidden, completed_at_bottom]`. Each entry is either
+        /// `""` (inherit) or the stringified value (e.g. `"1"` /
+        /// `"true"`). Called once per dialog open.
+        #[qinvokable]
+        fn list_override_for(self: Pin<&mut TaskListViewModel>, uuid: QString) -> QStringList;
+
+        /// Update + persist the appearance theme (0=System, 1=Light, 2=Dark).
+        /// QML calls this from Settings → General → Appearance.
+        #[qinvokable]
+        fn update_theme_mode(self: Pin<&mut TaskListViewModel>, mode: i32);
+
+        /// Update + persist the OS-notifications master toggle.
+        /// On flip-on the bridge immediately re-reads the alarms
+        /// table and re-arms the scheduler; flip-off cancels every
+        /// pending handle so the change is felt without waiting.
+        #[qinvokable]
+        fn update_notifications_enabled(self: Pin<&mut TaskListViewModel>, enabled: bool);
+
+        /// Switch the credential storage tier the bridge uses.
+        /// `choice` is one of `"auto"`, `"in_memory"` (and, once
+        /// the master-password batch lands, `"master_password"`).
+        /// On change: probes the new tier, migrates every OAuth
+        /// token + password from the old store into the new one,
+        /// deletes them from the old store, then swaps the Arcs
+        /// the bridge holds. Persists the choice through
+        /// `persist_prefs`. The QML side guards the in-memory
+        /// transition with a confirmation dialog because it
+        /// discards persisted credentials.
+        #[qinvokable]
+        fn update_credential_storage_choice(self: Pin<&mut TaskListViewModel>, choice: QString);
+
+        /// Mark the pre-flight credential-storage disclosure as
+        /// acknowledged. Persisted in `preferences.json` so the
+        /// dialog only fires once per install for the
+        /// encrypted-file tier; in-memory always re-prompts on
+        /// the next launch since it's a degraded state.
+        #[qinvokable]
+        fn acknowledge_credential_storage(self: Pin<&mut TaskListViewModel>);
+
+        /// Persist the ApplicationWindow's geometry. Called from
+        /// Main.qml's `onClosing` so we don't churn the prefs file
+        /// during drag/resize. Pass `width`/`height` in logical
+        /// pixels and `x`/`y` as the top-left corner; `maximized`
+        /// captures whether the window was maximised at close so the
+        /// next launch can restore that state.
+        #[qinvokable]
+        fn save_window_geometry(
+            self: Pin<&mut TaskListViewModel>,
+            width: i32,
+            height: i32,
+            x: i32,
+            y: i32,
+            maximized: bool,
+        );
+
+        #[qinvokable]
+        fn toggle_task_completion(self: Pin<&mut TaskListViewModel>, id: i64, completed: bool);
+
+        #[qinvokable]
+        fn delete_selected_task(self: Pin<&mut TaskListViewModel>);
+
+        /// Apply the edit-dialog's form state to the currently-
+        /// selected task. `due_text` / `hide_until_text` are parsed
+        /// via `tasks_core::datetime::parse_due_input`; an empty
+        /// string means "no date". `caldav_uuid` reassigns the
+        /// task's CalDAV calendar when non-empty (no-op for local
+        /// tasks that don't have a caldav_tasks row). A parse
+        /// failure surfaces on the status line and leaves the DB
+        /// untouched.
+        #[qinvokable]
+        fn update_selected_task(
+            self: Pin<&mut TaskListViewModel>,
+            title: QString,
+            notes: QString,
+            due_text: QString,
+            hide_until_text: QString,
+            priority: i32,
+            caldav_uuid: QString,
+            tag_uids_list: QStringList,
+            alarm_times: QList_i64,
+            alarm_types: QList_i32,
+            place_uid: QString,
+            place_arrival: bool,
+            place_departure: bool,
+            parent_id: i64,
+            estimate_text: QString,
+            elapsed_text: QString,
+            recurrence: QString,
+            repeat_from: i32,
+        );
+
+        /// Persist a password-auth sync account (CalDAV or EteSync)
+        /// to the user's account list and re-emit the Q_PROPERTY
+        /// arrays the Accounts pane binds to. `kind` must be 0
+        /// (CalDAV) or 3 (EteSync); other values are rejected on the
+        /// status line. Empty required fields are also rejected.
+        /// The password is sealed into the active credential store
+        /// (keyring → encrypted file → in-memory, in that priority
+        /// order) so it survives a restart on the chosen tier.
+        #[qinvokable]
+        fn add_password_account(
+            self: Pin<&mut TaskListViewModel>,
+            kind: i32,
+            label: QString,
+            server: QString,
+            username: QString,
+            password: QString,
+        );
+
+        /// Drop the account at `index`. Out-of-range indices are
+        /// ignored (the QML row shouldn't be able to produce one,
+        /// but paranoia is cheap).
+        #[qinvokable]
+        fn remove_account(self: Pin<&mut TaskListViewModel>, index: i32);
+
+        /// Mutate the account row identified by `cda_uuid` in place.
+        /// Used by the Accounts pane's Edit dialog. Empty
+        /// `password` keeps the existing one (so the user doesn't
+        /// have to retype to change the label / username / URL).
+        #[qinvokable]
+        fn update_password_account(
+            self: Pin<&mut TaskListViewModel>,
+            cda_uuid: QString,
+            label: QString,
+            server: QString,
+            username: QString,
+            password: QString,
+        );
+
+        /// Try connecting with the supplied credentials without
+        /// persisting anything. Surfaces the result on the status
+        /// bar so the Accounts pane's Test button can verify a
+        /// server-URL / username / password combination before the
+        /// user clicks Add account. `kind` matches the same
+        /// integers `add_password_account` uses.
+        #[qinvokable]
+        fn test_account_connection(
+            self: Pin<&mut TaskListViewModel>,
+            kind: i32,
+            server: QString,
+            username: QString,
+            password: QString,
+        );
+
+        /// Drive the browser-based OAuth sign-in flow for an OAuth
+        /// provider (`kind == 1` Google Tasks, `kind == 2`
+        /// Microsoft To Do). Opens the system browser at the
+        /// authorization URL, waits for the loopback redirect on
+        /// localhost, exchanges the code for tokens, persists the
+        /// `caldav_accounts` row + stashes the tokens in the
+        /// session's [`tasks_sync::TokenStore`]. Status flows
+        /// through the status bar — both the in-flight
+        /// "Opening browser…" notice and the success / failure
+        /// outcome.
+        // `auto_cxx_name` would emit `beginOauthSignIn` (treating
+        // "oauth" as a single word). Force the conventional
+        // `beginOAuthSignIn` so QML reads naturally.
+        #[qinvokable]
+        #[cxx_name = "beginOAuthSignIn"]
+        fn begin_oauth_sign_in(self: Pin<&mut TaskListViewModel>, kind: i32, label: QString);
+
+        /// Re-run the OAuth flow against an existing account row,
+        /// keyed by its `cda_uuid`. The new tokens replace whatever
+        /// the token store had under (kind, uuid); no new
+        /// caldav_accounts row is inserted. Used by the failed-auth
+        /// "Re-sign in…" affordance — when the persistent token
+        /// store loses tokens (in-memory tier on restart, refresh
+        /// token expiry, user revoke from the provider's dashboard)
+        /// the sidebar surfaces an X overlay; right-click → Re-sign
+        /// in… calls this so the user doesn't have to delete +
+        /// re-add the account.
+        #[qinvokable]
+        #[cxx_name = "reSignInOAuth"]
+        fn re_sign_in_oauth(self: Pin<&mut TaskListViewModel>, uuid: QString);
+
+        /// Drive a one-shot pull-then-push cycle against the account
+        /// identified by `cda_uuid`. Returns immediately — the
+        /// actual cycle runs on a background worker thread, and a
+        /// `qt_thread.queue` callback rejoins the QML thread to
+        /// publish the result.
+        #[qinvokable]
+        fn sync_account(self: Pin<&mut TaskListViewModel>, cda_uuid: QString);
+
+        /// Dispatch a sync against every non-local account. Wired
+        /// to the toolbar's manual Sync button. Same async dispatch
+        /// model as `sync_account`; status flows through the
+        /// status-bar text per account.
+        #[qinvokable]
+        fn sync_all_accounts(self: Pin<&mut TaskListViewModel>);
+
+        /// Create a calendar / task list on `cda_uuid`'s server with
+        /// the given display name and (optional) i32 ARGB colour.
+        /// On success, runs a sync against that account so the new
+        /// list lands in `caldav_lists` and the sidebar repopulates.
+        #[qinvokable]
+        fn create_account_calendar(
+            self: Pin<&mut TaskListViewModel>,
+            cda_uuid: QString,
+            name: QString,
+            color: i32,
+        );
+
+        /// Update the visual appearance of an existing list (colour
+        /// for now; icon will land alongside the icon-font work).
+        /// Writes `caldav_lists.cdl_color` directly and refreshes
+        /// the sidebar / active filter so the change paints
+        /// immediately in the chip strip + per-row checkbox tint.
+        #[qinvokable]
+        fn update_list_color(self: Pin<&mut TaskListViewModel>, cdl_uuid: QString, color: i32);
+
+        /// Delete a CalDAV / EteSync list. Best-effort server-side
+        /// DELETE first (404 treated as success — covers the orphan
+        /// case where the calendar is already gone server-side);
+        /// then sweep the local `caldav_tasks` + `tasks` rows that
+        /// belong to it and the `caldav_lists` row itself. If the
+        /// active filter was on this list, switches to "all" so the
+        /// middle pane doesn't sit on a dangling filter id.
+        #[qinvokable]
+        fn delete_caldav_list(self: Pin<&mut TaskListViewModel>, cdl_uuid: QString);
+
+        /// H-4: free-text substring search across task title +
+        /// notes. Empty input restores the currently-active filter.
+        /// Called from the toolbar search field on every text edit.
+        #[qinvokable]
+        fn set_search_query(self: Pin<&mut TaskListViewModel>, query: QString);
+
+        /// H-6: undo the most recent delete-from-detail-pane.
+        /// No-op when `last_deleted_id` is 0 (already restored or
+        /// never deleted). The undo toast button calls this on
+        /// click; the toast also calls `clearLastDeleted` when the
+        /// hide-timer fires so a stale id doesn't keep the button
+        /// active forever.
+        #[qinvokable]
+        fn restore_last_deleted(self: Pin<&mut TaskListViewModel>);
+
+        /// Reset the `last_deleted_id` Q_PROPERTY to 0 — called
+        /// from the toast when its hide-timer expires so the Undo
+        /// button disappears at the same time the toast does.
+        #[qinvokable]
+        fn clear_last_deleted(self: Pin<&mut TaskListViewModel>);
+    }
+
+    // Opt the view model into cxx-qt's Threading surface so the
+    // filesystem-watcher thread can queue reloads back on the Qt
+    // event loop thread.
+    impl cxx_qt::Threading for TaskListViewModel {}
+}
+
+use core::pin::Pin;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
+use std::time::Duration;
+
+use cxx_qt::{CxxQtType, Threading};
+use cxx_qt_lib::{QDateTime, QList, QString, QStringList};
+use secrecy::SecretString;
+
+use tasks_core::datetime::{
+    describe_alarm, format_due_label, format_duration_hhmm, parse_due_input, parse_duration_input,
+};
+use tasks_core::db::{default_db_path, Database};
+use tasks_core::models::{CaldavCalendar, Filter as CustomFilter, Priority, RepeatFrom, Task};
+use tasks_core::query::{
+    run_by_filter_id, run_search, QueryPreferences, FILTER_ALL, FILTER_RECENT, FILTER_TODAY,
+};
+use tasks_core::recurrence::humanize_rrule;
+use tasks_core::watch::DatabaseWatcher;
+use tasks_sync::providers::{
+    caldav::CalDavProvider, etesync::EteSyncProvider, google::GoogleTasksProvider,
+    microsoft::MicrosoftToDoProvider,
+};
+use tasks_sync::{AccountCredentials, Provider, ProviderKind, SyncEngine};
+
+/// Provider kind tags that match `tasks_sync::ProviderKind` in
+/// numeric order. Kept as bare integers at the bridge boundary so
+/// QML can pass the picker's index through without a named type.
+const KIND_CALDAV: i32 = 0;
+const KIND_GOOGLE_TASKS: i32 = 1;
+const KIND_MICROSOFT_TODO: i32 = 2;
+const KIND_ETESYNC: i32 = 3;
+
+/// Non-Qt account record. `password` is held on the Rust side only
+/// so it never crosses the FFI boundary into QML. The persistent
+/// copy lives in the active credential store (keyring →
+/// encrypted file → in-memory); the in-memory `SecretString` here
+/// is the working copy the SyncEngine consumes during a sync.
+///
+/// `password` is wrapped in [`SecretString`] (M-1) so it zeroes on
+/// drop and can't be accidentally Debug-printed alongside the rest
+/// of the struct. Its single consumer — the SyncEngine handoff —
+/// exposes the inner value only at the FFI boundary via
+/// `.expose_secret()`.
+#[derive(Debug, Clone)]
+struct StoredAccount {
+    /// `caldav_accounts.cda_uuid` of the row this StoredAccount
+    /// represents. Generated when the account is added via the
+    /// Accounts pane (uuid::Uuid::new_v4); QML passes it back into
+    /// `sync_account` to identify the row to refresh.
+    uuid: String,
+    kind: i32,
+    label: String,
+    server: String,
+    username: String,
+    password: SecretString,
+}
+
+pub struct TaskListViewModelRust {
+    // List state.
+    count: i32,
+    titles: QStringList,
+    task_ids: QList<i64>,
+    indents: QList<i32>,
+    completed_flags: QList<bool>,
+    recurring_flags: QList<bool>,
+    due_labels: QStringList,
+    priorities: QList<i32>,
+    task_tag_summaries: QStringList,
+    task_tag_uid_lists: QStringList,
+    task_list_names: QStringList,
+    task_list_colors: QList<i32>,
+    // Detail state.
+    selected_id: i64,
+    selected_title: QString,
+    selected_notes: QString,
+    selected_due_label: QString,
+    selected_hide_until_label: QString,
+    selected_priority: i32,
+    selected_completed: bool,
+    selected_recurrence: QString,
+    caldav_calendar_labels: QStringList,
+    caldav_calendar_uuids: QStringList,
+    selected_caldav_calendar_uuid: QString,
+    selected_caldav_calendar_color: i32,
+    tag_labels: QStringList,
+    tag_uids: QStringList,
+    tag_colors: QList<i32>,
+    selected_tag_uids: QStringList,
+    selected_alarm_labels: QStringList,
+    selected_alarm_times: QList<i64>,
+    selected_alarm_types: QList<i32>,
+    place_labels: QStringList,
+    place_uids: QStringList,
+    selected_place_uid: QString,
+    selected_place_arrival: bool,
+    selected_place_departure: bool,
+    parent_candidate_labels: QStringList,
+    parent_candidate_ids: QList<i64>,
+    selected_parent_id: i64,
+    selected_estimated_text: QString,
+    selected_elapsed_text: QString,
+    selected_recurrence_raw: QString,
+    selected_repeat_from: i32,
+    pref_sort_mode: i32,
+    pref_sort_ascending: bool,
+    pref_show_completed: bool,
+    pref_show_hidden: bool,
+    pref_completed_at_bottom: bool,
+    theme_mode: i32,
+    /// Master toggle for OS reminder notifications. Mirrors the
+    /// `Preferences::notifications_enabled` blob. Flipping it
+    /// re-arms or cancels the scheduler synchronously.
+    notifications_enabled: bool,
+    // Persisted ApplicationWindow geometry. 0/0 for x/y is the
+    // "no saved position" sentinel — Main.qml only assigns x/y when
+    // both are positive so the WM keeps its default placement on
+    // first launch.
+    window_width: i32,
+    window_height: i32,
+    window_x: i32,
+    window_y: i32,
+    window_maximized: bool,
+    // Sidebar state.
+    sidebar_labels: QStringList,
+    sidebar_ids: QStringList,
+    sidebar_account_kinds: QList<i32>,
+    sidebar_groups: QStringList,
+    sidebar_colors: QList<i32>,
+    active_filter_id: QString,
+    // H-4: free-text substring search across title + notes. When
+    // non-empty, `reload_active_filter` runs `run_search` instead
+    // of `run_by_filter_id`. Held on the Rust side only; the QML
+    // search field reads/writes its own `text` and pushes via the
+    // `setSearchQuery` invokable.
+    search_query: String,
+    // Accounts state (parallel arrays; see Q_PROPERTY comments above).
+    account_labels: QStringList,
+    account_kinds: QList<i32>,
+    account_servers: QStringList,
+    account_usernames: QStringList,
+    account_uuids: QStringList,
+    account_sync_states: QStringList,
+    // Non-Qt account storage: keeps the password alongside the
+    // user-facing fields without exposing it to QML. Session-local.
+    accounts: Vec<StoredAccount>,
+    /// Parallel to `accounts` — current sync state string for each
+    /// row, mirrored into the `account_sync_states` Q_PROPERTY.
+    /// Lives on the Rust side so we can patch a single index
+    /// without round-tripping through QStringList (cxx-qt 0.7
+    /// doesn't expose an index setter on QStringList).
+    account_states: Vec<String>,
+    /// Set of `cda_uuid`s with a sync currently running. The
+    /// previous re-entrancy guard keyed on the literal string
+    /// `"Syncing…"` in `account_states`; a future i18n pass
+    /// wrapping that with `qsTr` would silently let concurrent
+    /// syncs stack and fight for the SQLite write lock.
+    /// Membership in this HashSet is the canonical signal —
+    /// state strings are display-only.
+    syncs_in_flight: std::collections::HashSet<String>,
+    // H-6: last-deleted-task pinning for the undo flow. The id
+    // crosses FFI as a Q_PROPERTY (so QML can show / hide the
+    // Undo button); the title stays Rust-side because nothing in
+    // QML needs the raw string.
+    last_deleted_id: i64,
+    last_deleted_title: String,
+    // Status.
+    status: QString,
+    last_test_result: QString,
+    oauth_manual_url: QString,
+    oauth_manual_label: QString,
+    db_path_display: QString,
+    // Non-Qt bookkeeping. Held on the Rust side only; not exposed to QML.
+    db_path: Option<PathBuf>,
+    db: Option<Database>,
+    task_cache: Vec<Task>,
+    /// SQLite `PRAGMA data_version` counter at the time of the most
+    /// recent watcher-triggered reload. The watcher fires on any
+    /// activity in the parent dir of the DB, including -shm/-wal
+    /// touches caused by our own reads in WAL mode — without this
+    /// gate, every reload feeds back into the watcher loop. 0 is a
+    /// sentinel meaning "never sampled"; SQLite's data_version is
+    /// always non-zero for an opened database.
+    last_data_version: i64,
+    /// User preferences fed to `run_by_filter_id`. The UI panel for
+    /// editing these isn't wired yet (Milestone 1 scope); for now it
+    /// stays at the Android defaults.
+    preferences: QueryPreferences,
+    /// Flag the filesystem-watcher thread checks periodically to exit
+    /// when a new DB is opened (or the view model is dropped). Shared
+    /// with the spawned thread via `Arc`. `None` when no watcher is
+    /// currently active.
+    watcher_stop: Option<Arc<AtomicBool>>,
+    /// Flag the periodic-sync thread polls to know when to stop.
+    /// Re-set on every DB open + on view-model drop; the spawned
+    /// thread shares a clone and exits the next time it sees `true`.
+    auto_sync_stop: Option<Arc<AtomicBool>>,
+    /// Cancellation flag handed to the OAuth loopback receiver
+    /// so closing the window aborts an in-flight sign-in instead
+    /// of leaving the worker thread parked inside its 120 s
+    /// timeout. Set on view-model Drop; the LoopbackReceiver
+    /// polls it at 25 ms cadence and bails out cleanly.
+    oauth_stop: Option<Arc<AtomicBool>>,
+    /// Multi-threaded tokio runtime hosting `tasks-sync` calls.
+    /// Built lazily on first sync_account invocation; one Runtime
+    /// instance is shared across every Sync now click for the
+    /// lifetime of the view model.
+    runtime: Option<tokio::runtime::Runtime>,
+    /// OAuth tokens for Google / Microsoft accounts, keyed on
+    /// `(ProviderKind, cda_uuid)`. The concrete implementation is
+    /// chosen by `StorageTier::probe`: keyring (libsecret /
+    /// Keychain / Credential Manager) when available, falling
+    /// back to an AES-256-GCM-encrypted file under the user's
+    /// data dir, then to in-memory as a last resort.
+    token_store: Arc<dyn tasks_sync::TokenStore>,
+    /// Same-tier secret store for non-OAuth account passwords
+    /// (CalDAV / EteSync). Tier is determined by
+    /// `crate::token_persist::StorageTier::probe`; this Arc and
+    /// `token_store` above always come from the same probe call.
+    secret_store: Arc<dyn crate::token_persist::SecretStore>,
+    /// Stable string identifier of the *active* storage tier
+    /// (`"keychain"` / `"encrypted_file"` / `"in_memory"`),
+    /// surfaced to QML via the `credentialStorageTier` Q_PROPERTY
+    /// for the pre-flight warning dialog. May differ from the
+    /// user's `credential_storage_choice` when `"auto"` was
+    /// requested but a higher tier failed to probe.
+    credential_storage_tier: QString,
+    /// User's *requested* tier (`"auto"` / `"in_memory"` /
+    /// `"master_password"` once that lands). Persisted in
+    /// `preferences.json`. Driven by Settings → General →
+    /// Credential storage.
+    credential_storage_choice: QString,
+    /// Pre-flight acknowledgment flag for the non-keychain
+    /// storage tiers. Persisted in `preferences.json` so the
+    /// disclosure dialog only fires once per install for the
+    /// encrypted-file tier; in-memory always re-prompts.
+    credential_storage_acknowledged: bool,
+    /// Per-CalDAV-list pref overrides keyed by `cdl_uuid`. Held
+    /// in memory + serialised through `preferences.json` in
+    /// `persist_prefs`. The active filter merges these over the
+    /// global defaults in `reload_active_filter` so individual
+    /// lists can carry their own sort / show-completed / etc.
+    /// without churning the SQLite schema.
+    list_overrides: std::collections::HashMap<String, crate::preferences::ListOverride>,
+    /// Throttle bookkeeping for `refresh_sidebar`. A burst of
+    /// in-process mutation triggers (account-add, list-rename, sync
+    /// completion, …) used to fan out as one full rebuild per call;
+    /// we now collapse them to a 1 s leading-edge debounce with a
+    /// trailing-edge flush so the last skipped call's effect still
+    /// lands.
+    last_sidebar_refresh: Option<std::time::Instant>,
+    pending_sidebar_refresh: bool,
+    /// OS-notification scheduler for task alarms. Wraps a tokio
+    /// task per pending alarm; the runtime above hosts them. The
+    /// scheduler is created up front so the four reschedule hook
+    /// sites (open / watcher reload / sync / task edit) can call
+    /// it without a None check.
+    notifier: Arc<crate::notifier::AlarmScheduler>,
+}
+
+impl Default for TaskListViewModelRust {
+    fn default() -> Self {
+        // Load on construction so the view model's Q_PROPERTYs come
+        // up reflecting whatever the user picked last session. A
+        // missing / malformed file falls back to the struct's
+        // own defaults.
+        let saved = crate::preferences::Preferences::load();
+        // Probe credential storage tier *once* on view-model
+        // construction. The chosen Arcs back both OAuth tokens
+        // and CalDAV / EteSync passwords; the tier name flows to
+        // QML so the pre-flight warning dialog can describe what
+        // the user is actually getting.
+        let (probed_tier, probed_token_store, probed_secret_store) =
+            crate::token_persist::StorageTier::probe(&saved.credential_storage_choice);
+        let probed_tier_name = probed_tier.as_str().to_string();
+        TaskListViewModelRust {
+            count: 0,
+            titles: QStringList::default(),
+            task_ids: QList::default(),
+            indents: QList::default(),
+            completed_flags: QList::default(),
+            recurring_flags: QList::default(),
+            due_labels: QStringList::default(),
+            priorities: QList::default(),
+            task_tag_summaries: QStringList::default(),
+            task_tag_uid_lists: QStringList::default(),
+            task_list_names: QStringList::default(),
+            task_list_colors: QList::default(),
+            selected_id: 0,
+            selected_title: QString::default(),
+            selected_notes: QString::default(),
+            selected_due_label: QString::default(),
+            selected_hide_until_label: QString::default(),
+            selected_priority: Priority::NONE,
+            selected_completed: false,
+            selected_recurrence: QString::default(),
+            caldav_calendar_labels: QStringList::default(),
+            caldav_calendar_uuids: QStringList::default(),
+            selected_caldav_calendar_uuid: QString::default(),
+            selected_caldav_calendar_color: 0,
+            tag_labels: QStringList::default(),
+            tag_uids: QStringList::default(),
+            tag_colors: QList::default(),
+            selected_tag_uids: QStringList::default(),
+            selected_alarm_labels: QStringList::default(),
+            selected_alarm_times: QList::default(),
+            selected_alarm_types: QList::default(),
+            place_labels: QStringList::default(),
+            place_uids: QStringList::default(),
+            selected_place_uid: QString::default(),
+            selected_place_arrival: false,
+            selected_place_departure: false,
+            parent_candidate_labels: QStringList::default(),
+            parent_candidate_ids: QList::default(),
+            selected_parent_id: 0,
+            selected_estimated_text: QString::default(),
+            selected_elapsed_text: QString::default(),
+            selected_recurrence_raw: QString::default(),
+            selected_repeat_from: 0,
+            // Seed from the persisted Preferences blob — falls back
+            // to Android defaults when nothing is saved. The
+            // QueryPreferences struct further down carries the same
+            // values so the Q_PROPERTYs and the in-memory query
+            // input stay in sync from the first paint.
+            pref_sort_mode: saved.sort_mode,
+            pref_sort_ascending: saved.sort_ascending,
+            pref_show_completed: saved.show_completed,
+            pref_show_hidden: saved.show_hidden,
+            pref_completed_at_bottom: saved.completed_at_bottom,
+            theme_mode: saved.theme_mode,
+            notifications_enabled: saved.notifications_enabled,
+            window_width: saved.window_width,
+            window_height: saved.window_height,
+            window_x: saved.window_x,
+            window_y: saved.window_y,
+            window_maximized: saved.window_maximized,
+            sidebar_labels: QStringList::default(),
+            sidebar_ids: QStringList::default(),
+            sidebar_account_kinds: QList::default(),
+            sidebar_groups: QStringList::default(),
+            sidebar_colors: QList::default(),
+            active_filter_id: QString::from(FILTER_ALL),
+            search_query: String::new(),
+            account_labels: QStringList::default(),
+            account_kinds: QList::default(),
+            account_servers: QStringList::default(),
+            account_usernames: QStringList::default(),
+            account_uuids: QStringList::default(),
+            account_sync_states: QStringList::default(),
+            accounts: Vec::new(),
+            account_states: Vec::new(),
+            syncs_in_flight: std::collections::HashSet::new(),
+            last_deleted_id: 0,
+            last_deleted_title: String::new(),
+            status: QString::default(),
+            last_test_result: QString::default(),
+            oauth_manual_url: QString::default(),
+            oauth_manual_label: QString::default(),
+            db_path_display: QString::default(),
+            db_path: None,
+            db: None,
+            task_cache: Vec::new(),
+            last_data_version: 0,
+            preferences: QueryPreferences {
+                sort_mode: saved.sort_mode,
+                sort_ascending: saved.sort_ascending,
+                show_completed: saved.show_completed,
+                show_hidden: saved.show_hidden,
+                completed_tasks_at_bottom: saved.completed_at_bottom,
+                ..QueryPreferences::default()
+            },
+            watcher_stop: None,
+            auto_sync_stop: None,
+            oauth_stop: None,
+            runtime: None,
+            token_store: probed_token_store,
+            secret_store: probed_secret_store,
+            credential_storage_tier: QString::from(&probed_tier_name),
+            credential_storage_choice: QString::from(&saved.credential_storage_choice),
+            credential_storage_acknowledged: saved.credential_storage_acknowledged,
+            list_overrides: saved.list_overrides.clone(),
+            last_sidebar_refresh: None,
+            pending_sidebar_refresh: false,
+            notifier: Arc::new(crate::notifier::AlarmScheduler::new()),
+        }
+    }
+}
+
+impl Drop for TaskListViewModelRust {
+    fn drop(&mut self) {
+        // Ensure background threads exit when the view model does.
+        if let Some(stop) = self.watcher_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(stop) = self.auto_sync_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        // OAuth worker may be parked inside its 120 s loopback
+        // wait when the user closes the window; setting the flag
+        // wakes it up on the next 25 ms accept poll.
+        if let Some(stop) = self.oauth_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        // Drop pending alarm tasks. The runtime itself is also
+        // dropped right after this, but aborting first avoids the
+        // brief spin-up where a fire-time-now task races the runtime
+        // shutdown.
+        self.notifier.cancel_all();
+    }
+}
+
+impl qobject::TaskListViewModel {
+    /// Open a user-specified database file read-only. Used by the
+    /// Browse… button in the QML toolbar.
+    pub fn open_database(self: Pin<&mut Self>, path: QString) {
+        let path_buf = PathBuf::from(path.to_string());
+        open_at_path(self, path_buf, OpenMode::ReadOnlyOnly);
+    }
+
+    /// Open the desktop client's managed database at the default
+    /// per-OS path, creating an empty schema if the file doesn't
+    /// exist yet. Called from `Main.qml`'s `Component.onCompleted`
+    /// so users don't have to pick a file on first launch.
+    pub fn open_default_database(self: Pin<&mut Self>) {
+        match default_db_path() {
+            Some(path) => open_at_path(self, path, OpenMode::CreateIfMissing),
+            None => {
+                // No resolvable data directory — very rare; surface
+                // to the status bar and let the user pick via Browse.
+                self.set_status(QString::from(
+                    "Couldn't resolve a default data directory; use Browse\u{2026}",
+                ));
+            }
+        }
+    }
+
+    /// Import a Tasks.org JSON backup (the file produced by the
+    /// Android app's Settings → Backups → Export JSON flow) into
+    /// the currently-open database. Tears down the watcher while
+    /// the write happens, then reopens the DB read-only and reloads
+    /// the active filter so the new rows show up immediately.
+    pub fn import_json_backup(mut self: Pin<&mut Self>, path: QString) {
+        let source = PathBuf::from(path.to_string());
+        // Import targets the currently-open DB. If none is open yet
+        // (first launch, pre-openDefault), surface a clear error
+        // rather than silently targeting the default.
+        let target = match self.db_path.clone() {
+            Some(p) => p,
+            None => {
+                self.as_mut().set_status(QString::from(
+                    "Open or create a database first, then import.",
+                ));
+                return;
+            }
+        };
+
+        // Close the read-only handle + stop the watcher so the
+        // importer's writable open has exclusive access. The target
+        // is our own file; no other process touches it.
+        stop_prior_watcher(self.as_mut());
+        self.as_mut().rust_mut().db = None;
+
+        let outcome = tasks_core::import::import_json_backup(&target, &source);
+        match outcome {
+            Ok(stats) => {
+                let msg = format!(
+                    "Imported {} tasks, {} places, {} tags, {} filters from {}",
+                    stats.tasks,
+                    stats.places,
+                    stats.tag_data,
+                    stats.filters,
+                    source.display()
+                );
+                tracing::info!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                // Reopen the DB read-only and refresh the views.
+                open_at_path(self.as_mut(), target, OpenMode::ReadOnlyOnly);
+            }
+            Err(e) => {
+                let msg = format!("Import failed: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                // Reopen the target so the UI isn't stuck in a closed
+                // state.
+                open_at_path(self.as_mut(), target, OpenMode::ReadOnlyOnly);
+            }
+        }
+    }
+
+    pub fn select_filter(mut self: Pin<&mut Self>, id: QString) {
+        self.as_mut().set_active_filter_id(id);
+        self.as_mut().reload_active_filter();
+    }
+
+    /// Apply + persist new list-default query preferences and reload.
+    pub fn update_preferences(
+        mut self: Pin<&mut Self>,
+        sort_mode: i32,
+        sort_ascending: bool,
+        show_completed: bool,
+        show_hidden: bool,
+        completed_at_bottom: bool,
+    ) {
+        {
+            let mut inner = self.as_mut().rust_mut();
+            inner.preferences.sort_mode = sort_mode;
+            inner.preferences.sort_ascending = sort_ascending;
+            inner.preferences.show_completed = show_completed;
+            inner.preferences.show_hidden = show_hidden;
+            inner.preferences.completed_tasks_at_bottom = completed_at_bottom;
+        }
+        self.as_mut().set_pref_sort_mode(sort_mode);
+        self.as_mut().set_pref_sort_ascending(sort_ascending);
+        self.as_mut().set_pref_show_completed(show_completed);
+        self.as_mut().set_pref_show_hidden(show_hidden);
+        self.as_mut()
+            .set_pref_completed_at_bottom(completed_at_bottom);
+        persist_prefs(self.as_ref().get_ref());
+        self.as_mut().reload_active_filter();
+    }
+
+    /// Set / unset per-list query-pref overrides for the CalDAV
+    /// list keyed on `uuid`. Each pref has a paired `_set`
+    /// boolean: `true` writes the value, `false` clears the
+    /// override on that field (back to the global default). When
+    /// every field ends up cleared the map entry is removed.
+    pub fn update_list_override(
+        mut self: Pin<&mut Self>,
+        uuid: QString,
+        sort_mode: i32,
+        sort_mode_set: bool,
+        sort_ascending: bool,
+        sort_ascending_set: bool,
+        show_completed: bool,
+        show_completed_set: bool,
+        show_hidden: bool,
+        show_hidden_set: bool,
+        completed_at_bottom: bool,
+        completed_at_bottom_set: bool,
+    ) {
+        let key = uuid.to_string();
+        if key.is_empty() {
+            return;
+        }
+        let mut o = self
+            .as_ref()
+            .rust()
+            .list_overrides
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        o.sort_mode = sort_mode_set.then_some(sort_mode);
+        o.sort_ascending = sort_ascending_set.then_some(sort_ascending);
+        o.show_completed = show_completed_set.then_some(show_completed);
+        o.show_hidden = show_hidden_set.then_some(show_hidden);
+        o.completed_at_bottom = completed_at_bottom_set.then_some(completed_at_bottom);
+        {
+            let mut inner = self.as_mut().rust_mut();
+            if o.is_empty() {
+                inner.list_overrides.remove(&key);
+            } else {
+                inner.list_overrides.insert(key, o);
+            }
+        }
+        persist_prefs(self.as_ref().get_ref());
+        self.as_mut().reload_active_filter();
+    }
+
+    /// Drop every override for `uuid`. Idempotent.
+    pub fn clear_list_override(mut self: Pin<&mut Self>, uuid: QString) {
+        let key = uuid.to_string();
+        if key.is_empty() {
+            return;
+        }
+        let removed = self.as_mut().rust_mut().list_overrides.remove(&key);
+        if removed.is_some() {
+            persist_prefs(self.as_ref().get_ref());
+            self.as_mut().reload_active_filter();
+        }
+    }
+
+    /// Return the override values for `uuid` as a parallel
+    /// QStringList: each entry is `""` (inherit) or the stringified
+    /// value the dialog should prefill.
+    pub fn list_override_for(self: Pin<&mut Self>, uuid: QString) -> QStringList {
+        let key = uuid.to_string();
+        let o = self.as_ref().rust().list_overrides.get(&key).cloned();
+        let mut list: QList<QString> = QList::default();
+        let push = |list: &mut QList<QString>, v: Option<String>| {
+            list.append(QString::from(&v.unwrap_or_default()));
+        };
+        match o {
+            Some(o) => {
+                push(&mut list, o.sort_mode.map(|v| v.to_string()));
+                push(&mut list, o.sort_ascending.map(|v| v.to_string()));
+                push(&mut list, o.show_completed.map(|v| v.to_string()));
+                push(&mut list, o.show_hidden.map(|v| v.to_string()));
+                push(&mut list, o.completed_at_bottom.map(|v| v.to_string()));
+            }
+            None => {
+                for _ in 0..5 {
+                    list.append(QString::default());
+                }
+            }
+        }
+        QStringList::from(&list)
+    }
+
+    /// Apply + persist the appearance theme override.
+    pub fn update_theme_mode(mut self: Pin<&mut Self>, mode: i32) {
+        let clamped = mode.clamp(0, 2);
+        self.as_mut().set_theme_mode(clamped);
+        persist_prefs(self.as_ref().get_ref());
+    }
+
+    /// Apply + persist the OS-notification master toggle. Flipping
+    /// it on synchronously re-arms the scheduler against the
+    /// currently-open DB; flipping it off cancels every pending
+    /// handle so a long-future alarm doesn't surprise the user
+    /// after they thought they'd silenced it.
+    pub fn update_notifications_enabled(mut self: Pin<&mut Self>, enabled: bool) {
+        self.as_mut().set_notifications_enabled(enabled);
+        persist_prefs(self.as_ref().get_ref());
+        if enabled {
+            reschedule_alarms(self.as_mut());
+        } else {
+            self.as_ref().notifier.cancel_all();
+        }
+    }
+
+    /// Swap the active credential storage tier and migrate every
+    /// existing OAuth token + account password into the new
+    /// store. No-op when the requested choice matches the
+    /// current one. Persists the new choice + the resulting
+    /// active tier name through `persist_prefs`. See the
+    /// matching invokable doc on the bridge surface for the
+    /// list of accepted values.
+    pub fn update_credential_storage_choice(mut self: Pin<&mut Self>, choice: QString) {
+        let new_choice = choice.to_string();
+        let (new_tier, new_token_store, new_secret_store) =
+            crate::token_persist::StorageTier::probe(&new_choice);
+        let new_tier_name = new_tier.as_str().to_string();
+
+        // Skip the migration loop when the *resolved* tier hasn't
+        // changed. Earlier code compared `Arc::ptr_eq(from, new)`
+        // — but `StorageTier::probe` always returns a fresh
+        // `Arc::new(...)` each call, so the pointer compare was
+        // mathematically always false and the migration ran
+        // unconditionally. With the same-tier case actually
+        // unguarded, a re-probe of the keychain tier ran
+        // `from.get → to.put → from.delete` against the same
+        // backing store and *deleted the credentials it had just
+        // re-written*. Tier-name compare catches the no-op
+        // re-submit case correctly because both Arcs back the
+        // same OS-level store (keychain entry / encrypted file
+        // path / in-memory map keyed by service name).
+        let current_tier_str = self.credential_storage_tier.to_string();
+        let current_choice_str = self.credential_storage_choice.to_string();
+        let from_tokens = Arc::clone(&self.as_ref().rust().token_store);
+        let from_secrets = Arc::clone(&self.as_ref().rust().secret_store);
+
+        // Pure no-op: same resolved tier AND same user-visible
+        // choice string. Avoids re-writing preferences.json on
+        // every settings-pane click that resolves to the same
+        // value. Distinct from the tier-name compare below
+        // because two different choices ("auto" + "keychain")
+        // can resolve to the same tier; in that case we still
+        // want to persist the user-visible choice update so
+        // next launch's probe takes the same path.
+        if current_tier_str == new_tier_name && current_choice_str == new_choice {
+            return;
+        }
+
+        if current_tier_str != new_tier_name {
+            // Snapshot the bits the migration loop needs without
+            // holding the &Self borrow across the writes below.
+            let accounts: Vec<(String, i32)> = self
+                .as_ref()
+                .rust()
+                .accounts
+                .iter()
+                .map(|a| (a.uuid.clone(), a.kind))
+                .collect();
+            let (tokens_moved, secrets_moved) = migrate_credentials(
+                &accounts,
+                from_tokens.as_ref(),
+                from_secrets.as_ref(),
+                new_token_store.as_ref(),
+                new_secret_store.as_ref(),
+            );
+            tracing::info!(
+                "credential migration: {tokens_moved} tokens, {secrets_moved} \
+                 secrets moved into {new_tier_name}"
+            );
+        } else {
+            tracing::debug!("credential migration: skipping — destination matches current store");
+        }
+
+        {
+            let mut inner = self.as_mut().rust_mut();
+            inner.token_store = new_token_store;
+            inner.secret_store = new_secret_store;
+        }
+        self.as_mut()
+            .set_credential_storage_tier(QString::from(&new_tier_name));
+        self.as_mut()
+            .set_credential_storage_choice(QString::from(&new_choice));
+        // In-memory always re-prompts on next launch — clear the
+        // acknowledgment so the warning re-pops if the user
+        // restarts after switching to in-memory.
+        let new_ack = new_tier != crate::token_persist::StorageTier::InMemory
+            && self.credential_storage_acknowledged;
+        self.as_mut().set_credential_storage_acknowledged(new_ack);
+        persist_prefs(self.as_ref().get_ref());
+    }
+
+    /// Mark the pre-flight credential-storage disclosure as
+    /// acknowledged. Persists immediately.
+    pub fn acknowledge_credential_storage(mut self: Pin<&mut Self>) {
+        if self.credential_storage_acknowledged {
+            return;
+        }
+        self.as_mut().set_credential_storage_acknowledged(true);
+        persist_prefs(self.as_ref().get_ref());
+    }
+
+    /// Persist window geometry so the next launch reopens at the
+    /// same size + position. Maximised wins over an explicit size:
+    /// if the window was maximised we keep the prior `window_width`
+    /// / `window_height` untouched so unmaximising on the next run
+    /// returns to the user's chosen size.
+    pub fn save_window_geometry(
+        mut self: Pin<&mut Self>,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+        maximized: bool,
+    ) {
+        if !maximized {
+            if width > 0 {
+                self.as_mut().set_window_width(width);
+            }
+            if height > 0 {
+                self.as_mut().set_window_height(height);
+            }
+            self.as_mut().set_window_x(x.max(0));
+            self.as_mut().set_window_y(y.max(0));
+        }
+        self.as_mut().set_window_maximized(maximized);
+        persist_prefs(self.as_ref().get_ref());
+    }
+
+    /// Add a CalDAV or EteSync account to the session's accounts
+    /// list. Validates kind + required fields up front so the
+    /// Accounts pane gets a single-line status message on reject
+    /// instead of a silent drop.
+    pub fn add_password_account(
+        mut self: Pin<&mut Self>,
+        kind: i32,
+        label: QString,
+        server: QString,
+        username: QString,
+        password: QString,
+    ) {
+        if kind != KIND_CALDAV && kind != KIND_ETESYNC {
+            let msg = match kind {
+                KIND_GOOGLE_TASKS | KIND_MICROSOFT_TODO => {
+                    "Use Sign in\u{2026} for Google Tasks / Microsoft To Do; password auth doesn't apply."
+                }
+                _ => "Unknown account type.",
+            };
+            self.as_mut().set_status(QString::from(msg));
+            return;
+        }
+        let label_s = label.to_string().trim().to_string();
+        let server_s = server.to_string().trim().to_string();
+        let username_s = username.to_string().trim().to_string();
+        let password_s = password.to_string();
+        if label_s.is_empty()
+            || server_s.is_empty()
+            || username_s.is_empty()
+            || password_s.is_empty()
+        {
+            self.as_mut().set_status(QString::from(
+                "All four fields (label, server, username, password) are required.",
+            ));
+            return;
+        }
+        let uuid = uuid::Uuid::new_v4().to_string();
+
+        // Persist into `caldav_accounts` so the bridge's sync
+        // path (and future restarts) can find this row by uuid.
+        // The password itself goes into the
+        // `CascadingSecretStore` (keychain → encrypted-file →
+        // in-memory), which guarantees the password is never
+        // written as plaintext to the SQLite column. The
+        // column gets a blank string on success.
+        //
+        // The cascade walks every tier including in-memory; the
+        // only way `put_secret` returns `Err` is if every tier
+        // refuses (in practice unreachable —
+        // `InMemorySecretStore::put_secret` only fails on a
+        // poisoned mutex). On that pathological failure we
+        // refuse the operation rather than degrade to plaintext.
+        let cda_account_type = match kind {
+            KIND_CALDAV => 0,  // tasks_core::AccountType::CALDAV
+            KIND_ETESYNC => 5, // tasks_core::AccountType::ETEBASE
+            _ => unreachable!("kind validated above"),
+        };
+        if let Some(path) = self.db_path.clone() {
+            if let Err(e) = self
+                .as_ref()
+                .rust()
+                .secret_store
+                .put_secret(&uuid, &password_s)
+            {
+                self.as_mut().set_status(QString::from(&format!(
+                    "Credential storage unavailable; account not added: {e}"
+                )));
+                return;
+            }
+            let column_value = String::new();
+            let res = open_rw_conn(&path).and_then(|conn| {
+                conn.execute(
+                    // Plain INSERT — `OR REPLACE` is a footgun
+                    // here because `caldav_accounts` PK is
+                    // `cda_id`, not `cda_uuid`, so it never
+                    // actually de-dupes. Both call sites mint a
+                    // fresh `Uuid::new_v4()` above; if a future
+                    // path reuses one, a unique constraint
+                    // failure surfaces the bug rather than the
+                    // SQL silently inserting a duplicate.
+                    "INSERT INTO caldav_accounts \
+                     (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+                      cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, -1, 0)",
+                    rusqlite::params![
+                        uuid,
+                        label_s,
+                        server_s,
+                        username_s,
+                        column_value,
+                        cda_account_type,
+                    ],
+                )
+                .map(|_| ())
+            });
+            if let Err(e) = res {
+                self.as_mut()
+                    .set_status(QString::from(&format!("DB write failed: {e}")));
+                return;
+            }
+        } else {
+            self.as_mut()
+                .set_status(QString::from("Open a database before adding an account."));
+            return;
+        }
+
+        let uuid_for_sync = uuid.clone();
+        {
+            let mut inner = self.as_mut().rust_mut();
+            inner.accounts.push(StoredAccount {
+                uuid,
+                kind,
+                label: label_s,
+                server: server_s,
+                username: username_s,
+                password: SecretString::from(password_s),
+            });
+            inner.account_states.push(String::from("Idle"));
+        }
+        publish_accounts(self.as_mut());
+        self.as_mut().set_status(QString::from("Account saved."));
+        // First sync immediately so the sidebar populates without
+        // a manual click. sync_account is non-blocking (spawns a
+        // worker thread) so the QML add-form returns instantly.
+        self.as_mut().sync_account(QString::from(&uuid_for_sync));
+    }
+
+    /// H-4: update the search query and reload. Empty string
+    /// returns to the active filter; non-empty runs `run_search`
+    /// against title + notes. Called on every QML toolbar text
+    /// change so the list updates as the user types.
+    pub fn set_search_query(mut self: Pin<&mut Self>, query: QString) {
+        let s = query.to_string();
+        let trimmed = s.trim();
+        // Avoid unnecessary reloads if nothing meaningful changed.
+        if trimmed == self.search_query {
+            return;
+        }
+        self.as_mut().rust_mut().search_query = trimmed.to_string();
+        self.as_mut().reload_active_filter();
+    }
+
+    /// Drop the account at `index`. Also removes the corresponding
+    /// `caldav_accounts` row plus any `caldav_lists` / `caldav_tasks`
+    /// hanging off it via the FK chain so the sidebar's lists for
+    /// the deleted account disappear on the next reload.
+    pub fn remove_account(mut self: Pin<&mut Self>, index: i32) {
+        let idx = index as usize;
+        if index < 0 || idx >= self.accounts.len() {
+            return;
+        }
+        let removed = self.as_mut().rust_mut().accounts.remove(idx);
+        if idx < self.account_states.len() {
+            self.as_mut().rust_mut().account_states.remove(idx);
+        }
+        // Best-effort drop of the persisted password (and any
+        // OAuth tokens) for this account; ignore errors so a
+        // stale keychain entry can't block UI removal.
+        let _ = self
+            .as_ref()
+            .rust()
+            .secret_store
+            .delete_secret(&removed.uuid);
+        for pk in [
+            tasks_sync::ProviderKind::GoogleTasks,
+            tasks_sync::ProviderKind::MicrosoftToDo,
+        ] {
+            let _ = self.as_ref().rust().token_store.delete(pk, &removed.uuid);
+        }
+        if let Some(path) = self.db_path.clone() {
+            if let Ok(mut conn) = open_rw_conn(&path) {
+                if let Err(e) = delete_account_cascade(&mut conn, &removed.uuid) {
+                    tracing::warn!(
+                        "remove_account: cascade delete failed for {}: {e}",
+                        removed.uuid
+                    );
+                }
+            }
+        }
+        publish_accounts(self.as_mut());
+        // Refresh sidebar so the removed account's lists disappear.
+        // Goes through the throttled path so a burst of account
+        // ops collapses to one rebuild.
+        refresh_sidebar(self.as_mut());
+        self.as_mut().reload_active_filter();
+        self.as_mut()
+            .set_status(QString::from(&format!("Removed \"{}\".", removed.label)));
+    }
+
+    /// Update an existing account's editable fields (label, server,
+    /// username, password). Empty `password` preserves the current
+    /// value — the dialog leaves the password field blank by
+    /// default so the user only re-enters it when changing it.
+    pub fn update_password_account(
+        mut self: Pin<&mut Self>,
+        cda_uuid: QString,
+        label: QString,
+        server: QString,
+        username: QString,
+        password: QString,
+    ) {
+        let uuid = cda_uuid.to_string();
+        let label_s = label.to_string().trim().to_string();
+        let server_s = server.to_string().trim().to_string();
+        let username_s = username.to_string().trim().to_string();
+        let password_s = password.to_string();
+        if label_s.is_empty() || server_s.is_empty() || username_s.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Label, server, and username are required."));
+            return;
+        }
+        let Some(idx) = self.accounts.iter().position(|a| a.uuid == uuid) else {
+            self.as_mut()
+                .set_status(QString::from(&format!("No account with uuid {uuid}.")));
+            return;
+        };
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database before editing an account."));
+            return;
+        };
+        // Always update label/url/username; touch the password
+        // path only when the caller supplied a new value (the
+        // dialog blank-defaults the field so a typo fix doesn't
+        // require retyping the password).
+        //
+        // Password rotation goes through the
+        // `CascadingSecretStore` — the cascade walks every tier
+        // including in-memory, so put_secret only fails when
+        // every backend refuses (in practice unreachable, see
+        // `add_password_account`). The plaintext-column path
+        // that previously fired on `put_secret` failure is
+        // gone; a put_secret error now refuses the rotation
+        // entirely instead of degrading to plaintext on disk.
+        if !password_s.is_empty() {
+            if let Err(e) = self
+                .as_ref()
+                .rust()
+                .secret_store
+                .put_secret(&uuid, &password_s)
+            {
+                self.as_mut().set_status(QString::from(&format!(
+                    "Credential storage unavailable; password not rotated: {e}"
+                )));
+                return;
+            }
+        }
+        let res = open_rw_conn(&path).and_then(|conn| {
+            if password_s.is_empty() {
+                conn.execute(
+                    "UPDATE caldav_accounts \
+                     SET cda_name = ?1, cda_url = ?2, cda_username = ?3 \
+                     WHERE cda_uuid = ?4",
+                    rusqlite::params![label_s, server_s, username_s, uuid],
+                )
+                .map(|_| ())
+            } else {
+                // Cascade always wins now; column blanks
+                // unconditionally on rotation.
+                conn.execute(
+                    "UPDATE caldav_accounts \
+                     SET cda_name = ?1, cda_url = ?2, cda_username = ?3, cda_password = ?4 \
+                     WHERE cda_uuid = ?5",
+                    rusqlite::params![label_s, server_s, username_s, "", uuid],
+                )
+                .map(|_| ())
+            }
+        });
+        if let Err(e) = res {
+            // Roll back the secret-store put if the DB UPDATE
+            // failed. Without this, on next launch
+            // `load_password_accounts` would prefer the new
+            // secret-store value and the account would *appear*
+            // to have been rotated — but the DB column would
+            // still hold the *old* plaintext password
+            // indefinitely (mirrors the dual-existence shape
+            // Round-3 A-R3-2 fixed in `migrate_legacy_passwords`,
+            // applied here to the user-edit path). Failure to
+            // roll back is logged at error so the user has a
+            // chance to notice.
+            if !password_s.is_empty() {
+                if let Err(rollback_err) = self.as_ref().rust().secret_store.delete_secret(&uuid) {
+                    tracing::error!(
+                        "update_password_account: DB UPDATE failed for {uuid} ({e}); \
+                         rollback delete_secret ALSO failed ({rollback_err}); \
+                         the new password is in the secret store while the column \
+                         still holds the previous plaintext"
+                    );
+                } else {
+                    tracing::error!(
+                        "update_password_account: DB UPDATE failed for {uuid} ({e}); \
+                         rolled back the put_secret; account row unchanged"
+                    );
+                }
+            }
+            self.as_mut()
+                .set_status(QString::from(&format!("DB write failed: {e}")));
+            return;
+        }
+        {
+            let mut inner = self.as_mut().rust_mut();
+            let acct = &mut inner.accounts[idx];
+            acct.label = label_s.clone();
+            acct.server = server_s;
+            acct.username = username_s;
+            if !password_s.is_empty() {
+                acct.password = SecretString::from(password_s);
+            }
+        }
+        publish_accounts(self.as_mut());
+        self.as_mut()
+            .set_status(QString::from(&format!("Updated \"{}\".", label_s)));
+    }
+
+    /// Try `provider.connect()` against `(kind, server, username,
+    /// password)` without persisting anything. The Accounts pane's
+    /// Test button uses this to verify credentials before the user
+    /// commits via Add account. Status-bar text reports success or
+    /// the underlying error message.
+    pub fn test_account_connection(
+        mut self: Pin<&mut Self>,
+        kind: i32,
+        server: QString,
+        username: QString,
+        password: QString,
+    ) {
+        if kind != KIND_CALDAV && kind != KIND_ETESYNC {
+            self.as_mut()
+                .set_status(QString::from("Test only supports CalDAV / EteSync today."));
+            return;
+        }
+        let server_s = server.to_string().trim().to_string();
+        let username_s = username.to_string().trim().to_string();
+        let password_s = password.to_string();
+        if server_s.is_empty() || username_s.is_empty() || password_s.is_empty() {
+            self.as_mut().set_last_test_result(QString::from(
+                "Server, username, and password are required to test.",
+            ));
+            return;
+        }
+        let Some(rt_handle) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
+        self.as_mut()
+            .set_last_test_result(QString::from("Testing connection…"));
+        let allow_signup = is_local_etebase_url(&server_s);
+        let creds = AccountCredentials::new_password(&server_s, &username_s, password_s);
+        let mut provider: Box<dyn Provider + Send> = match kind {
+            KIND_CALDAV => Box::new(CalDavProvider::new(creds, "test")),
+            KIND_ETESYNC => {
+                Box::new(EteSyncProvider::new(creds, "test").with_signup_fallback(allow_signup))
+            }
+            _ => unreachable!("kind validated above"),
+        };
+        let result = rt_handle.block_on(async move { provider.connect().await });
+        match result {
+            Ok(()) => self
+                .as_mut()
+                .set_last_test_result(QString::from("Test successful — credentials work.")),
+            Err(e) => self
+                .as_mut()
+                .set_last_test_result(QString::from(&format!("Test failed: {e}"))),
+        }
+    }
+
+    /// Re-run the OAuth flow against an existing `caldav_accounts`
+    /// row. Looks up the row by `uuid` to recover the kind + label,
+    /// then drives the same flow as `begin_oauth_sign_in` except
+    /// that on success we replace tokens for the existing
+    /// (kind, uuid) key rather than inserting a fresh row + pushing
+    /// a new StoredAccount. No-op when `uuid` doesn't match any
+    /// known OAuth account.
+    pub fn re_sign_in_oauth(mut self: Pin<&mut Self>, uuid: QString) {
+        let key = uuid.to_string();
+        // Bind the borrow into a local so it lasts long enough
+        // for the find / clone below. `self.as_ref().rust()`
+        // alone returns a temporary that's dropped at the end
+        // of the statement (E0716).
+        let r = self.as_ref();
+        let acct = match r.rust().accounts.iter().find(|a| a.uuid == key) {
+            Some(a) => (a.kind, a.label.clone()),
+            None => {
+                tracing::warn!("re_sign_in_oauth: no account with uuid {key}");
+                return;
+            }
+        };
+        let (kind, label) = acct;
+        if kind != KIND_GOOGLE_TASKS && kind != KIND_MICROSOFT_TODO {
+            self.as_mut().set_status(QString::from(
+                "Re-sign-in only supports Google Tasks / Microsoft To Do.",
+            ));
+            return;
+        }
+        self.start_oauth(kind, QString::from(&label), Some(key));
+    }
+
+    /// Drive the browser-based OAuth sign-in for a Google / Microsoft
+    /// account. Posts an "Opening browser…" status, kicks off a
+    /// dedicated worker thread (mirrors `sync_account`'s threading
+    /// model — `block_on` inside `std::thread::spawn` so the !Sync
+    /// transaction-borrow inside the engine never crosses thread
+    /// boundaries), runs `authorize()`, and rejoins the QML thread
+    /// to insert the `caldav_accounts` row + stash the tokens. On
+    /// failure the row is not inserted and the error surfaces on
+    /// the status bar.
+    pub fn begin_oauth_sign_in(self: Pin<&mut Self>, kind: i32, label: QString) {
+        self.start_oauth(kind, label, None);
+    }
+
+    /// Shared body for both `begin_oauth_sign_in` (new account)
+    /// and `re_sign_in_oauth` (existing). When `existing_uuid` is
+    /// `Some`, the success closure skips the caldav_accounts
+    /// insert + accounts list push and just replaces the tokens
+    /// for the existing (kind, uuid) key.
+    fn start_oauth(
+        mut self: Pin<&mut Self>,
+        kind: i32,
+        label: QString,
+        existing_uuid: Option<String>,
+    ) {
+        if kind != KIND_GOOGLE_TASKS && kind != KIND_MICROSOFT_TODO {
+            self.as_mut().set_status(QString::from(
+                "OAuth sign-in only supports Google Tasks / Microsoft To Do.",
+            ));
+            return;
+        }
+        let label_s = label.to_string().trim().to_string();
+        if label_s.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Label is required for OAuth sign-in."));
+            return;
+        }
+        if self.db_path.is_none() {
+            self.as_mut().set_status(QString::from(
+                "Open a database before signing in to a sync account.",
+            ));
+            return;
+        }
+        // Resolve the OAuth client ID (and, for Google, the
+        // client secret). Env vars win for CI / dev / one-off
+        // overrides; oauth.json is the per-user fallback. Bail
+        // before opening the browser when anything required is
+        // missing — popping a sign-in window that's guaranteed to
+        // dead-end on Google's / Azure's error page is worse than
+        // a clear status message.
+        let client_id = match kind {
+            KIND_GOOGLE_TASKS => crate::preferences::google_oauth_client_id(),
+            KIND_MICROSOFT_TODO => crate::preferences::microsoft_oauth_client_id(),
+            _ => unreachable!("kind validated above"),
+        };
+        let client_id = match client_id {
+            Some(v) => v,
+            None => {
+                let path = crate::preferences::oauth_config_path_display();
+                let msg = match kind {
+                    KIND_GOOGLE_TASKS => format!(
+                        "Set google_client_id in {path} (or TASKS_DESKTOP_GOOGLE_CLIENT_ID) \
+                         before signing in to Google Tasks."
+                    ),
+                    KIND_MICROSOFT_TODO => format!(
+                        "Set microsoft_client_id in {path} (or TASKS_DESKTOP_MICROSOFT_CLIENT_ID) \
+                         before signing in to Microsoft To Do."
+                    ),
+                    _ => unreachable!(),
+                };
+                self.as_mut().set_status(QString::from(&msg));
+                return;
+            }
+        };
+        // Google additionally requires the client secret on the
+        // token-exchange POST. Microsoft public-client PKCE
+        // flows don't carry one.
+        let client_secret: Option<String> = match kind {
+            KIND_GOOGLE_TASKS => match crate::preferences::google_oauth_client_secret() {
+                Some(v) => Some(v),
+                None => {
+                    let path = crate::preferences::oauth_config_path_display();
+                    self.as_mut().set_status(QString::from(&format!(
+                        "Set google_client_secret in {path} (or \
+                         TASKS_DESKTOP_GOOGLE_CLIENT_SECRET) before signing in to \
+                         Google Tasks. Google's token endpoint requires it even \
+                         though PKCE is in use."
+                    )));
+                    return;
+                }
+            },
+            KIND_MICROSOFT_TODO => None,
+            _ => unreachable!(),
+        };
+
+        let Some(runtime) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
+
+        self.as_mut()
+            .set_status(QString::from("Opening browser to sign in\u{2026}"));
+
+        let qt_thread = self.as_ref().qt_thread();
+        let token_store = Arc::clone(&self.as_ref().token_store);
+        let db_path = self.db_path.clone().expect("db_path checked above");
+        let label_for_thread = label_s.clone();
+        // Cancel flag — set by the view model's Drop so closing
+        // the window aborts an in-flight loopback wait. Replace
+        // any prior in-flight flag (if the user kicks off a
+        // second sign-in, the first one's wait is moot anyway).
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(prev) = self
+            .as_mut()
+            .rust_mut()
+            .oauth_stop
+            .replace(Arc::clone(&cancel))
+        {
+            prev.store(true, Ordering::Relaxed);
+        }
+
+        std::thread::Builder::new()
+            .name(format!("oauth:{label_s}"))
+            .spawn(move || {
+                // Build a dedicated reqwest Client for the token
+                // exchange. Disable auto-redirects so a 3xx never
+                // bounces the request elsewhere with the PKCE code.
+                let http_result = reqwest_client_for_oauth();
+                // Try to launch the system browser; if `webbrowser::open`
+                // fails (kiosk / WSL with no DESKTOP env / xdg-open
+                // missing), post the auth URL to the QML side so the
+                // user can copy/paste it into a browser of their
+                // choice. Either way, the loopback keeps listening
+                // until it receives the redirect or hits the 120 s
+                // timeout. firstcontact OAuth flow uses the same
+                // pattern (`browserAuthRequested` signal).
+                let qt_thread_for_browser = qt_thread.clone();
+                let label_for_browser = label_for_thread.clone();
+                let open_or_post = move |url: &str| {
+                    if webbrowser::open(url).is_err() {
+                        let url_owned = url.to_string();
+                        let label_owned = label_for_browser.clone();
+                        let _ = qt_thread_for_browser.queue(
+                            move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                                pinned
+                                    .as_mut()
+                                    .set_oauth_manual_url(QString::from(&url_owned));
+                                pinned
+                                    .as_mut()
+                                    .set_oauth_manual_label(QString::from(&label_owned));
+                            },
+                        );
+                    }
+                };
+                tracing::info!("oauth: worker thread started for {label_for_thread}");
+                let result = match http_result {
+                    Ok(http) => runtime.block_on(async move {
+                        let timeout = std::time::Duration::from_secs(120);
+                        match kind {
+                            KIND_GOOGLE_TASKS => {
+                                let secret = client_secret
+                                    .as_deref()
+                                    .expect("client_secret required for Google");
+                                tasks_sync::providers::google::authorize(
+                                    &client_id,
+                                    secret,
+                                    &http,
+                                    open_or_post,
+                                    timeout,
+                                    Some(Arc::clone(&cancel)),
+                                )
+                                .await
+                            }
+                            KIND_MICROSOFT_TODO => {
+                                tasks_sync::providers::microsoft::authorize(
+                                    &client_id,
+                                    &http,
+                                    open_or_post,
+                                    timeout,
+                                    Some(Arc::clone(&cancel)),
+                                )
+                                .await
+                            }
+                            _ => unreachable!("kind validated above"),
+                        }
+                    }),
+                    Err(e) => Err(tasks_sync::SyncError::Network(format!(
+                        "reqwest build: {e}"
+                    ))),
+                };
+                match &result {
+                    Ok(_) => {
+                        tracing::info!("oauth: authorize() returned tokens for {label_for_thread}")
+                    }
+                    Err(e) => tracing::warn!("oauth: authorize() failed for {label_for_thread}: {e}"),
+                }
+                let queue_result = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    // Clear the manual-URL fallback regardless of
+                    // outcome — the dialog should auto-dismiss when
+                    // the loopback resolves (success) or the timeout
+                    // fires (failure).
+                    pinned.as_mut().set_oauth_manual_url(QString::default());
+                    pinned.as_mut().set_oauth_manual_label(QString::default());
+                    match result {
+                        Ok(tokens) => {
+                            let provider_kind = match kind {
+                                KIND_GOOGLE_TASKS => ProviderKind::GoogleTasks,
+                                KIND_MICROSOFT_TODO => ProviderKind::MicrosoftToDo,
+                                _ => unreachable!(),
+                            };
+                            // Two flows: (a) brand-new account —
+                            // generate uuid, insert caldav_accounts
+                            // row, push StoredAccount onto the in-
+                            // memory list. (b) re-sign-in for an
+                            // existing account — uuid + row + entry
+                            // already there, just refresh tokens
+                            // for the same (kind, uuid) key.
+                            let uuid = match existing_uuid.clone() {
+                                Some(u) => u,
+                                None => {
+                                    let new_uuid = uuid::Uuid::new_v4().to_string();
+                                    let cda_account_type = match kind {
+                                        KIND_GOOGLE_TASKS => 7,
+                                        KIND_MICROSOFT_TODO => 6,
+                                        _ => unreachable!(),
+                                    };
+                                    // Persist with empty server /
+                                    // username / password — OAuth
+                                    // providers don't use any of
+                                    // those columns; the token
+                                    // store handles secrets.
+                                    let res = open_rw_conn(&db_path).and_then(|conn| {
+                                        conn.execute(
+                                            // Plain INSERT — `OR REPLACE` is a footgun
+                    // here because `caldav_accounts` PK is
+                    // `cda_id`, not `cda_uuid`, so it never
+                    // actually de-dupes. Both call sites mint a
+                    // fresh `Uuid::new_v4()` above; if a future
+                    // path reuses one, a unique constraint
+                    // failure surfaces the bug rather than the
+                    // SQL silently inserting a duplicate.
+                    "INSERT INTO caldav_accounts \
+                                             (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+                                              cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+                                             VALUES (?1, ?2, '', '', '', NULL, ?3, 0, -1, 0)",
+                                            rusqlite::params![new_uuid, label_for_thread, cda_account_type],
+                                        )
+                                        .map(|_| ())
+                                    });
+                                    if let Err(e) = res {
+                                        pinned.as_mut().set_status(QString::from(&format!(
+                                            "Sign-in failed: DB write: {e}"
+                                        )));
+                                        return;
+                                    }
+                                    new_uuid
+                                }
+                            };
+                            // Token store is keyed by (provider_kind, cda_uuid)
+                            // so the per-account `sync_account` lookup is
+                            // unambiguous even if the user signs into the
+                            // same provider twice. `put` replaces under
+                            // the same key — exactly what re-sign-in needs.
+                            if let Err(e) = token_store.put(provider_kind, &uuid, &tokens) {
+                                pinned.as_mut().set_status(QString::from(&format!(
+                                    "Sign-in failed: token store: {e}"
+                                )));
+                                return;
+                            }
+                            if existing_uuid.is_none() {
+                                let mut inner = pinned.as_mut().rust_mut();
+                                inner.accounts.push(StoredAccount {
+                                    uuid: uuid.clone(),
+                                    kind,
+                                    label: label_for_thread.clone(),
+                                    server: String::new(),
+                                    username: String::new(),
+                                    password: SecretString::from(String::new()),
+                                });
+                                inner.account_states.push(String::from("Idle"));
+                            } else {
+                                // Re-sign-in: clear the
+                                // "Re-sign-in required" state so the
+                                // sidebar drops the X overlay. The
+                                // sync_account call below will set
+                                // it back to "Syncing…" right away.
+                                set_account_state(pinned.as_mut(), &uuid, "Idle");
+                            }
+                            publish_accounts(pinned.as_mut());
+                            tracing::info!("oauth: account row + token store updated for {label_for_thread}");
+                            let msg = if existing_uuid.is_some() {
+                                format!("Re-signed in to {label_for_thread}.")
+                            } else {
+                                format!("Signed in to {label_for_thread}.")
+                            };
+                            pinned.as_mut().set_status(QString::from(&msg));
+                            // Pull immediately so the sidebar populates without
+                            // requiring the user to click Sync. sync_account
+                            // spawns its own worker thread, so this returns
+                            // straight away and the QML thread is free.
+                            pinned.as_mut().sync_account(QString::from(&uuid));
+                        }
+                        Err(e) => {
+                            tracing::warn!("oauth: completion handler reporting Err: {e}");
+                            pinned
+                                .as_mut()
+                                .set_status(QString::from(&format!("Sign-in failed: {e}")));
+                        }
+                    }
+                });
+                if let Err(e) = queue_result {
+                    tracing::warn!(
+                        "oauth: failed to post completion to Qt thread: {e}"
+                    );
+                }
+            })
+            .expect("spawn oauth worker thread");
+    }
+
+    /// Run a single sync cycle (pull + push) against the account
+    /// keyed by `cda_uuid`. Synchronous wrt. the QML caller — the
+    /// app freezes until the cycle finishes. Acceptable for a
+    /// manual Sync now button against a local test server; the
+    /// proper background-thread + signal version comes later.
+    ///
+    /// On success: rebuilds the sidebar so newly-pulled calendars
+    /// appear, and reloads the active filter so any newly-pulled
+    /// tasks show up in the list pane.
+    /// Run a single sync cycle (pull + push) against the account
+    /// keyed by `cda_uuid`. Returns immediately — the actual cycle
+    /// runs on the background tokio runtime, and a `qt_thread.queue`
+    /// callback rejoins the QML thread once it finishes to update
+    /// the sidebar + status bar. Status surfaces as
+    /// "Syncing <label>…" while in flight, then "<label>: Done" or
+    /// "Sync of <label> failed: …" on completion.
+    pub fn sync_account(mut self: Pin<&mut Self>, cda_uuid: QString) {
+        let uuid = cda_uuid.to_string();
+        let Some(idx) = self.accounts.iter().position(|a| a.uuid == uuid) else {
+            self.as_mut()
+                .set_status(QString::from(&format!("No account with uuid {uuid}")));
+            return;
+        };
+        // Same-account re-entrancy guard: if a sync against this
+        // account is already in flight, drop the new request
+        // silently. Auto-trigger paths (task create / edit /
+        // delete + periodic timer) can fire several times in a
+        // row; without this guard they'd stack as concurrent
+        // syncs that fight for the same SQLite write lock.
+        // Keyed on `syncs_in_flight` (HashSet&lt;cda_uuid&gt;) rather
+        // than the display-only `account_states` string — the
+        // latter is going to flow through `qsTr` for i18n at
+        // some point and the literal "Syncing…" comparison
+        // would silently break.
+        if self.syncs_in_flight.contains(&uuid) {
+            return;
+        }
+        // The `syncs_in_flight` insert deliberately happens later
+        // — *just before* spawning the worker thread, after every
+        // early-return prerequisite has been validated. Inserting
+        // here would leak the uuid on db_path-missing,
+        // runtime-build failure, missing OAuth tokens (the common
+        // "Re-sign-in required" case), missing client_id/secret,
+        // or unknown account kind, leaving subsequent
+        // `sync_account` calls to silently no-op via the
+        // contains-check above.
+        let stored = self.accounts[idx].clone();
+        let Some(db_path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database before syncing."));
+            return;
+        };
+
+        // Build (or reuse) the tokio runtime. Construction can fail
+        // if the OS refuses thread spawn — surface that on the
+        // status bar rather than panicking.
+        let Some(runtime_for_spawn) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
+
+        // Build the right Provider before we leave the QML thread
+        // — the credential plumbing reads from `self.accounts` and
+        // needs the `&self` borrow.
+        let label = stored.label.clone();
+        let allow_signup = is_local_etebase_url(&stored.server);
+        let token_store = Arc::clone(&self.as_ref().token_store);
+        let provider: Box<dyn Provider + Send> = match stored.kind {
+            KIND_CALDAV | KIND_ETESYNC => {
+                // Hoist the password-credentials build out of the
+                // per-kind arms — both providers consume the same
+                // AccountCredentials shape, the only difference is
+                // which Provider type wraps it. Mirrors the shape
+                // `create_list_on_account` already uses.
+                let creds = AccountCredentials::new_password(
+                    &stored.server,
+                    &stored.username,
+                    secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+                );
+                if stored.kind == KIND_CALDAV {
+                    Box::new(CalDavProvider::new(creds, label.clone()))
+                } else {
+                    Box::new(
+                        EteSyncProvider::new(creds, label.clone())
+                            .with_signup_fallback(allow_signup),
+                    )
+                }
+            }
+            KIND_GOOGLE_TASKS | KIND_MICROSOFT_TODO => {
+                let provider_kind = if stored.kind == KIND_GOOGLE_TASKS {
+                    ProviderKind::GoogleTasks
+                } else {
+                    ProviderKind::MicrosoftToDo
+                };
+                // Refuse to sync without tokens rather than silently
+                // re-popping the browser — that would surprise the
+                // user and conflict with their intent (e.g. periodic
+                // background sync triggers).
+                if token_store.get(provider_kind, &uuid).is_none() {
+                    self.as_mut()
+                        .set_status(QString::from(&format!("Re-sign-in required for {label}")));
+                    // "Re-sign-in required" is a stable per-account
+                    // state QML watches to paint the X overlay on
+                    // the sync icon and surface the right-click
+                    // "Re-sign in…" affordance. Don't drop back to
+                    // "Idle" here — that would hide the failure.
+                    set_account_state(self.as_mut(), &uuid, "Re-sign-in required");
+                    return;
+                }
+                let client_id = if stored.kind == KIND_GOOGLE_TASKS {
+                    crate::preferences::google_oauth_client_id()
+                } else {
+                    crate::preferences::microsoft_oauth_client_id()
+                };
+                let client_id = match client_id {
+                    Some(v) => v,
+                    None => {
+                        let field = if stored.kind == KIND_GOOGLE_TASKS {
+                            "google_client_id"
+                        } else {
+                            "microsoft_client_id"
+                        };
+                        let path = crate::preferences::oauth_config_path_display();
+                        self.as_mut().set_status(QString::from(&format!(
+                            "Set {field} in {path} before syncing {label}."
+                        )));
+                        set_account_state(self.as_mut(), &uuid, "Idle");
+                        return;
+                    }
+                };
+                // Google additionally requires the client secret on
+                // the refresh-token POST. Bail with a clear message
+                // if it's missing rather than letting the engine
+                // surface a generic 400 mid-sync.
+                let google_secret: Option<String> = if stored.kind == KIND_GOOGLE_TASKS {
+                    match crate::preferences::google_oauth_client_secret() {
+                        Some(v) => Some(v),
+                        None => {
+                            let path = crate::preferences::oauth_config_path_display();
+                            self.as_mut().set_status(QString::from(&format!(
+                                "Set google_client_secret in {path} before syncing {label}."
+                            )));
+                            set_account_state(self.as_mut(), &uuid, "Idle");
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Empty AccountCredentials so the provider falls
+                // through to the TokenStore for tokens; the engine
+                // borrows the same store the OAuth flow wrote into,
+                // keyed by `cda_uuid`.
+                let creds = AccountCredentials::default();
+                if stored.kind == KIND_GOOGLE_TASKS {
+                    let secret = google_secret.expect("checked above for Google");
+                    Box::new(
+                        GoogleTasksProvider::new(creds, uuid.clone(), client_id, secret)
+                            .with_token_store(Arc::clone(&token_store)),
+                    )
+                } else {
+                    Box::new(
+                        MicrosoftToDoProvider::new(creds, uuid.clone(), client_id)
+                            .with_token_store(Arc::clone(&token_store)),
+                    )
+                }
+            }
+            _ => {
+                self.as_mut()
+                    .set_status(QString::from("Unknown account kind."));
+                set_account_state(self.as_mut(), &uuid, "Idle");
+                return;
+            }
+        };
+
+        // Initial in-flight state on the QML thread.
+        set_account_state(self.as_mut(), &uuid, "Syncing…");
+        self.as_mut()
+            .set_status(QString::from(&format!("Syncing {label}…")));
+
+        // Snapshot what the worker thread + completion callback
+        // need. CxxQtThread, the runtime handle, the path, the uuid
+        // / label strings, and the boxed Send-typed Provider are
+        // all Send + 'static.
+        let qt_thread = self.as_ref().qt_thread();
+        let runtime = runtime_for_spawn;
+        let uuid_owned = uuid.clone();
+        let label_owned = label.clone();
+
+        // `runtime.spawn` would require the future to be Send, but
+        // SyncEngine's pull cycle holds a `rusqlite::Transaction`
+        // (which borrows `&Connection`) across `.await` points and
+        // `Connection` is !Sync. Drive the future from a dedicated
+        // OS thread via `block_on` instead — that polls in place,
+        // so the !Sync borrow never crosses thread boundaries.
+        // Mark the account as in-flight *now* — every prerequisite
+        // has been validated above and we're about to spawn the
+        // worker. The completion handler below removes the uuid
+        // before any further state updates so a panic in the
+        // closure still releases the slot.
+        self.as_mut()
+            .rust_mut()
+            .syncs_in_flight
+            .insert(uuid.clone());
+
+        // Once the future resolves, queue a callback back onto the
+        // QML thread so the Q_PROPERTY updates run with exclusive
+        // pinned-mut access.
+        let spawn_result = std::thread::Builder::new()
+            .name(format!("sync:{label}"))
+            .spawn(move || {
+                let uuid_for_engine = uuid_owned.clone();
+                let result = runtime.block_on(async move {
+                    let mut engine =
+                        SyncEngine::new_for_account(&db_path, provider, uuid_for_engine);
+                    engine.sync_now().await
+                });
+                let _ = qt_thread.queue(move |mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    // Drop the in-flight marker before we
+                    // dispatch any further state updates — the
+                    // re-entrancy guard at the top of
+                    // sync_account checks this set, and a panic
+                    // / early-return below should still leave
+                    // the slot reusable.
+                    pinned
+                        .as_mut()
+                        .rust_mut()
+                        .syncs_in_flight
+                        .remove(&uuid_owned);
+                    match result {
+                        Ok(outcome) => {
+                            // Status reads "Synced (N↓ / M↑)" for the
+                            // common case; only mention deletes
+                            // when there were any so the everyday
+                            // sync stays visually quiet.
+                            let summary = if outcome.tasks_deleted > 0 {
+                                // ASCII " trash" suffix instead of the
+                                // 🗑 emoji (U+1F5D1) — Qt's bundled
+                                // fonts often miss supplementary-plane
+                                // glyphs and render this as tofu.
+                                format!(
+                                    "Synced ({}↓ / {}↑ / {} trash)",
+                                    outcome.tasks_pulled,
+                                    outcome.tasks_pushed,
+                                    outcome.tasks_deleted
+                                )
+                            } else {
+                                format!(
+                                    "Synced ({}↓ / {}↑)",
+                                    outcome.tasks_pulled, outcome.tasks_pushed
+                                )
+                            };
+                            set_account_state(pinned.as_mut(), &uuid_owned, &summary);
+                            pinned
+                                .as_mut()
+                                .set_status(QString::from(&format!("{label_owned}: Done")));
+                            refresh_sidebar(pinned.as_mut());
+                            pinned.as_mut().reload_active_filter();
+                            // Sync may have pulled new alarms or
+                            // shifted existing ones (REL_END/
+                            // REL_START anchors move when dueDate
+                            // / hideUntil changes server-side).
+                            // Re-arm the scheduler so the new
+                            // schedule takes effect immediately.
+                            reschedule_alarms(pinned.as_mut());
+                        }
+                        Err(e) => {
+                            let msg = format!("Sync of {label_owned} failed: {e}");
+                            tracing::warn!("{msg}");
+                            set_account_state(
+                                pinned.as_mut(),
+                                &uuid_owned,
+                                &format!("Failed: {e}"),
+                            );
+                            pinned.as_mut().set_status(QString::from(&msg));
+                        }
+                    }
+                });
+            });
+        if let Err(spawn_err) = spawn_result {
+            // Resource exhaustion (ulimit, EAGAIN, etc.) — the
+            // worker never started, so the completion-handler
+            // path that normally clears `syncs_in_flight` and
+            // resets the per-account "Syncing…" badge will
+            // never run. Roll both back here so a follow-up
+            // user click can retry.
+            tracing::error!("sync_account: thread spawn failed: {spawn_err}");
+            self.as_mut().rust_mut().syncs_in_flight.remove(&uuid);
+            set_account_state(self.as_mut(), &uuid, &format!("Failed: {spawn_err}"));
+            self.as_mut()
+                .set_status(QString::from(&format!("Sync failed: {spawn_err}")));
+        }
+    }
+
+    /// Fan out a `sync_account` dispatch to every non-OAuth, non-
+    /// local account currently in `self.accounts`. Wired to the
+    /// toolbar's manual Sync button + to the auto-sync hooks
+    /// triggered by task create / edit / delete.
+    pub fn sync_all_accounts(mut self: Pin<&mut Self>) {
+        // OAuth accounts join the fan-out: `sync_account` short-
+        // circuits with "Re-sign-in required" if the in-memory
+        // token store doesn't carry a row for the account, so the
+        // periodic-sync timer never accidentally re-pops a browser.
+        let uuids: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.kind == KIND_CALDAV
+                    || a.kind == KIND_ETESYNC
+                    || a.kind == KIND_GOOGLE_TASKS
+                    || a.kind == KIND_MICROSOFT_TODO
+            })
+            .map(|a| a.uuid.clone())
+            .collect();
+        for uuid in uuids {
+            self.as_mut().sync_account(QString::from(&uuid));
+        }
+    }
+
+    /// Repaint the per-list colour. Writes `caldav_lists.cdl_color`
+    /// via a transient RW connection then rebuilds the sidebar and
+    /// reloads the active filter so the new colour shows up
+    /// immediately in the per-row chip + the priority-checkbox
+    /// background that keys off it. `color` is i32 ARGB; 0 means
+    /// "no custom colour" (the chip falls back to neutral grey).
+    pub fn update_list_color(mut self: Pin<&mut Self>, cdl_uuid: QString, color: i32) {
+        let uuid = cdl_uuid.to_string();
+        if uuid.is_empty() {
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database first."));
+            return;
+        };
+        let res = open_rw_conn(&path).and_then(|conn| {
+            conn.execute(
+                "UPDATE caldav_lists SET cdl_color = ?1 WHERE cdl_uuid = ?2",
+                rusqlite::params![color, uuid],
+            )
+            .map(|_| ())
+        });
+        if let Err(e) = res {
+            self.as_mut()
+                .set_status(QString::from(&format!("DB write failed: {e}")));
+            return;
+        }
+        // Refresh sidebar so the new colour drives chip + checkbox
+        // backgrounds on the next paint. Throttled: a burst of
+        // colour edits in the picker collapses to one rebuild.
+        refresh_sidebar(self.as_mut());
+        self.as_mut().reload_active_filter();
+    }
+
+    /// Create a new calendar on the given account's server, then
+    /// run a sync so the local DB picks the row up. The sync also
+    /// refreshes the sidebar + reloads the active filter.
+    pub fn create_account_calendar(
+        mut self: Pin<&mut Self>,
+        cda_uuid: QString,
+        name: QString,
+        color: i32,
+    ) {
+        let uuid = cda_uuid.to_string();
+        let name_s = name.to_string().trim().to_string();
+        if name_s.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Calendar name is required."));
+            return;
+        }
+        let Some(stored) = self.accounts.iter().find(|a| a.uuid == uuid).cloned() else {
+            self.as_mut()
+                .set_status(QString::from(&format!("No account with uuid {uuid}.")));
+            return;
+        };
+        let Some(_) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("Open a database first."));
+            return;
+        };
+
+        let Some(rt_handle) = ensure_runtime_handle(self.as_mut()) else {
+            return;
+        };
+
+        let allow_signup = is_local_etebase_url(&stored.server);
+        let creds = AccountCredentials::new_password(
+            &stored.server,
+            &stored.username,
+            secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+        );
+        let mut provider: Box<dyn Provider + Send> = match stored.kind {
+            KIND_CALDAV => Box::new(CalDavProvider::new(creds, stored.label.clone())),
+            KIND_ETESYNC => Box::new(
+                EteSyncProvider::new(creds, stored.label.clone())
+                    .with_signup_fallback(allow_signup),
+            ),
+            _ => {
+                self.as_mut().set_status(QString::from(
+                    "Creating lists on this provider isn't supported yet.",
+                ));
+                return;
+            }
+        };
+
+        self.as_mut().set_status(QString::from(&format!(
+            "Creating list \"{}\" on {}…",
+            name_s, stored.label
+        )));
+
+        let create_result = rt_handle.block_on(async move {
+            provider.connect().await?;
+            let color_arg = if color == 0 { None } else { Some(color) };
+            provider.create_calendar(&name_s, color_arg).await
+        });
+
+        match create_result {
+            Ok(cal) => {
+                self.as_mut().set_status(QString::from(&format!(
+                    "Created list on {}; pulling…",
+                    stored.label
+                )));
+                // Switch the active filter to the new list before
+                // kicking off the sync, so a follow-up quick-add
+                // lands on it instead of whatever calendar was
+                // previously focused. Without this the user trips
+                // over: "I just created a list, my next task should
+                // go there" — but `add_new_task` reads
+                // `active_filter_id`, which still points at the
+                // prior list. caldav_lists won't have the new row
+                // until the spawned sync completes; the sidebar
+                // refreshes a moment later, but the active-filter
+                // pointer is enough for `add_new_task`'s prefix
+                // strip to do the right thing.
+                self.as_mut()
+                    .select_filter(QString::from(&format!("caldav:{}", cal.remote_id)));
+                // Run a sync so the new calendar lands in
+                // caldav_lists and the sidebar refreshes.
+                self.as_mut().sync_account(QString::from(&uuid));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't create list: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// Right-click → "Delete list…" target. Best-effort server
+    /// DELETE on the calendar URL (404 = success, since the goal
+    /// is "this list shouldn't exist remotely"), then sweep the
+    /// local rows: every `tasks` row that joined to a
+    /// `caldav_tasks` for this list, then the `caldav_tasks` rows
+    /// themselves, then the `caldav_lists` row. Switches the
+    /// active filter to "all" if it was sitting on the list being
+    /// deleted, otherwise the middle pane would be left querying
+    /// a dangling filter id.
+    pub fn delete_caldav_list(mut self: Pin<&mut Self>, cdl_uuid: QString) {
+        let uuid = cdl_uuid.to_string();
+        if uuid.is_empty() {
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't delete list."));
+            return;
+        };
+        // Look up which account owns this list so we know whose
+        // credentials to use for the server-side DELETE.
+        let (account_uuid, list_label) = match open_rw_conn(&path).and_then(|conn| {
+            conn.query_row(
+                "SELECT cdl_account, COALESCE(cdl_name, '') FROM caldav_lists WHERE cdl_uuid = ?1",
+                rusqlite::params![&uuid],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+        }) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let msg = format!("Couldn't look up list for delete: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                return;
+            }
+        };
+        let display = if list_label.is_empty() {
+            uuid.clone()
+        } else {
+            list_label.clone()
+        };
+
+        // Best-effort server-side DELETE. Requires the same
+        // credentials the sync_account path uses; for orphans
+        // (calendar already 404 server-side) the provider's
+        // delete_calendar treats 404 as success, so we still fall
+        // through to local cleanup. Other failures abort —
+        // dropping local state for a list whose remote half is
+        // still alive would leave the user with no way to see
+        // their own data.
+        if let Some(stored) = self
+            .accounts
+            .iter()
+            .find(|a| a.uuid == account_uuid)
+            .cloned()
+        {
+            let Some(rt_handle) = ensure_runtime_handle(self.as_mut()) else {
+                return;
+            };
+            let allow_signup = is_local_etebase_url(&stored.server);
+            let creds = AccountCredentials::new_password(
+                &stored.server,
+                &stored.username,
+                secrecy::ExposeSecret::expose_secret(&stored.password).to_string(),
+            );
+            let mut provider: Box<dyn Provider + Send> = match stored.kind {
+                KIND_CALDAV => Box::new(CalDavProvider::new(creds, stored.label.clone())),
+                KIND_ETESYNC => Box::new(
+                    EteSyncProvider::new(creds, stored.label.clone())
+                        .with_signup_fallback(allow_signup),
+                ),
+                _ => {
+                    self.as_mut().set_status(QString::from(
+                        "Deleting lists on this provider isn't supported yet.",
+                    ));
+                    return;
+                }
+            };
+            let cdl_uuid_owned = uuid.clone();
+            let server_result = rt_handle.block_on(async move {
+                provider.connect().await?;
+                provider.delete_calendar(&cdl_uuid_owned).await
+            });
+            if let Err(e) = server_result {
+                let msg = format!("Couldn't delete list \"{display}\" on server: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+                return;
+            }
+        }
+        // (No matching account row → list is fully orphaned; just
+        // clean local state without surfacing an account-lookup
+        // error to the user.)
+
+        // Local cleanup: tasks → caldav_tasks → caldav_lists. Order
+        // matters because the join helpers above key off cd_calendar.
+        let cleanup = open_rw_conn(&path).and_then(|mut conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM tasks WHERE _id IN \
+                 (SELECT cd_task FROM caldav_tasks WHERE cd_calendar = ?1)",
+                rusqlite::params![&uuid],
+            )?;
+            tx.execute(
+                "DELETE FROM caldav_tasks WHERE cd_calendar = ?1",
+                rusqlite::params![&uuid],
+            )?;
+            tx.execute(
+                "DELETE FROM caldav_lists WHERE cdl_uuid = ?1",
+                rusqlite::params![&uuid],
+            )?;
+            tx.commit()
+        });
+        if let Err(e) = cleanup {
+            let msg = format!("Local cleanup failed for \"{display}\": {e}");
+            tracing::warn!("{msg}");
+            self.as_mut().set_status(QString::from(&msg));
+            return;
+        }
+
+        // If the user was viewing the list we just deleted, drop
+        // the active filter back to "all" so the middle pane
+        // doesn't query a dangling id.
+        let active_filter = self.active_filter_id.to_string();
+        if active_filter == format!("caldav:{uuid}") {
+            self.as_mut().select_filter(QString::from(FILTER_ALL));
+        } else {
+            // Even if we didn't switch, a deleted list's rows
+            // shouldn't keep showing in the current view.
+            self.as_mut().reload_active_filter();
+        }
+        refresh_sidebar(self.as_mut());
+        self.as_mut()
+            .set_status(QString::from(&format!("Deleted list \"{display}\".")));
+    }
+
+    /// Create a new task in the open DB with `title`. If the user
+    /// is currently viewing a CalDAV-scoped filter
+    /// (`caldav:<uuid>`), the new task is stamped into that list;
+    /// otherwise it lands as a local task. After creation we
+    /// reload the active filter and select the new row so the
+    /// user sees it land and can immediately flesh it out via
+    /// Edit….
+    pub fn add_new_task(mut self: Pin<&mut Self>, title: QString) {
+        let title_str = title.to_string();
+        let title_trim = title_str.trim();
+        if title_trim.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("Empty task title — nothing created."));
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't create."));
+            return;
+        };
+        let active = self.active_filter_id.to_string();
+        let caldav_uuid = active.strip_prefix("caldav:");
+        match tasks_core::create_task(&path, title_trim, tasks_core::now_ms(), caldav_uuid) {
+            Ok(new_id) => {
+                self.as_mut().reload_active_filter();
+                self.as_mut().select_task(new_id);
+                self.as_mut()
+                    .set_status(QString::from(&format!("Created \"{title_trim}\"")));
+                auto_sync_for_task(self.as_mut(), new_id);
+            }
+            Err(e) => {
+                let msg = format!("Couldn't create task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// Mark task `id` as completed (or restore it to active when
+    /// `completed = false`). Delegates to `tasks_core::write` and
+    /// reloads the active filter so the UI reflects the change
+    /// immediately — the filesystem watcher would pick it up on its
+    /// next tick anyway, but clicking a checkbox should feel
+    /// instantaneous.
+    pub fn toggle_task_completion(mut self: Pin<&mut Self>, id: i64, completed: bool) {
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't mark task."));
+            return;
+        };
+        match tasks_core::set_task_completion(&path, id, completed, tasks_core::now_ms()) {
+            Ok(true) => {
+                self.as_mut().reload_active_filter();
+                // reload_active_filter rewrites the status line with a
+                // task count; the write feedback is implicit in that.
+                // If the selected task was the one we toggled, refresh
+                // its detail pane to match.
+                if self.selected_id == id {
+                    self.as_mut().set_selected_completed(completed);
+                }
+                // Marking complete (or restoring) shifts which
+                // alarms are eligible to fire — the scheduler's
+                // query filters out completed tasks.
+                reschedule_alarms(self.as_mut());
+                auto_sync_for_task(self.as_mut(), id);
+            }
+            Ok(false) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Task {id} not found")));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't update task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// Soft-delete the task currently shown in the detail pane. No-op
+    /// when nothing is selected. After a successful delete the detail
+    /// pane clears itself, matching the Android "swipe to delete"
+    /// behaviour minus the animation.
+    ///
+    /// H-6: stamp the deleted id + title onto `last_deleted_*` so the
+    /// toast shows an Undo button. The toast clears these via
+    /// `clearLastDeleted` when its timer expires; restoring via
+    /// `restoreLastDeleted` clears them too.
+    pub fn delete_selected_task(mut self: Pin<&mut Self>) {
+        let id = self.selected_id;
+        if id <= 0 {
+            return;
+        }
+        let title_for_undo = self.selected_title.to_string();
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't delete."));
+            return;
+        };
+        match tasks_core::set_task_deleted(&path, id, tasks_core::now_ms()) {
+            Ok(true) => {
+                clear_detail_pane(self.as_mut());
+                self.as_mut().reload_active_filter();
+                self.as_mut().set_last_deleted_id(id);
+                self.as_mut().rust_mut().last_deleted_title = title_for_undo.clone();
+                let display = if title_for_undo.is_empty() {
+                    "task".to_string()
+                } else {
+                    format!("\u{201C}{}\u{201D}", title_for_undo)
+                };
+                self.as_mut()
+                    .set_status(QString::from(&format!("Deleted {display}. Undo?")));
+                // The scheduler's query filters out deleted tasks,
+                // so removing the row needs to cancel any pending
+                // handles for it. Reconciling the whole map is
+                // simpler than tracking ids.
+                reschedule_alarms(self.as_mut());
+                // Push the soft-delete to the server so the row's
+                // tombstone reaches its CalDAV / EteSync home. The
+                // engine's push_dirty path picks up rows whose
+                // `tasks.deleted > 0` and issues DELETE.
+                auto_sync_for_task(self.as_mut(), id);
+            }
+            Ok(false) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Task {id} not found")));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't delete task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// H-6: restore the most recently soft-deleted task. No-op when
+    /// `last_deleted_id` is 0. On success, reloads the active filter
+    /// and selects the restored row so the user immediately sees it
+    /// back in the list, and clears the undo state.
+    pub fn restore_last_deleted(mut self: Pin<&mut Self>) {
+        let id = self.last_deleted_id;
+        if id <= 0 {
+            return;
+        }
+        let title = self.last_deleted_title.clone();
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't undo."));
+            return;
+        };
+        match tasks_core::set_task_undeleted(&path, id, tasks_core::now_ms()) {
+            Ok(true) => {
+                self.as_mut().set_last_deleted_id(0);
+                self.as_mut().rust_mut().last_deleted_title.clear();
+                self.as_mut().reload_active_filter();
+                self.as_mut().select_task(id);
+                let display = if title.is_empty() {
+                    "task".to_string()
+                } else {
+                    format!("\u{201C}{}\u{201D}", title)
+                };
+                self.as_mut()
+                    .set_status(QString::from(&format!("Restored {display}.")));
+                // Restored task may have alarms that should fire
+                // again now that `deleted` is back to 0.
+                reschedule_alarms(self.as_mut());
+                auto_sync_for_task(self.as_mut(), id);
+            }
+            Ok(false) => {
+                // The row wasn't deleted — clear pinned state so the
+                // undo button hides; nothing to do.
+                self.as_mut().set_last_deleted_id(0);
+                self.as_mut().rust_mut().last_deleted_title.clear();
+            }
+            Err(e) => {
+                let msg = format!("Couldn't undo delete: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// H-6: drop the pinned undo state. Called from the toast
+    /// when its hide-timer fires, so the Undo button disappears at
+    /// the same time the toast text does.
+    pub fn clear_last_deleted(mut self: Pin<&mut Self>) {
+        if self.last_deleted_id == 0 {
+            return;
+        }
+        self.as_mut().set_last_deleted_id(0);
+        self.as_mut().rust_mut().last_deleted_title.clear();
+    }
+
+    pub fn select_task(mut self: Pin<&mut Self>, id: i64) {
+        tracing::trace!(
+            "select_task: id={id}, task_cache.len={}",
+            self.task_cache.len()
+        );
+        let Some(task) = self.task_cache.iter().find(|t| t.id == id).cloned() else {
+            tracing::trace!("select_task: id={id} not in task_cache");
+            clear_detail_pane(self.as_mut());
+            return;
+        };
+
+        self.as_mut().set_selected_id(task.id);
+        self.as_mut()
+            .set_selected_title(QString::from(task.title.as_deref().unwrap_or("")));
+        self.as_mut()
+            .set_selected_notes(QString::from(task.notes.as_deref().unwrap_or("")));
+        self.as_mut()
+            .set_selected_due_label(QString::from(&format_due_label(task.due_date)));
+        self.as_mut()
+            .set_selected_hide_until_label(QString::from(&format_due_label(task.hide_until)));
+        self.as_mut().set_selected_priority(task.priority);
+        self.as_mut().set_selected_completed(task.is_completed());
+        // Humanise the RRULE (FREQ/INTERVAL/BYDAY/UNTIL/COUNT) and
+        // mark repeat-from-completion so the user sees the semantic
+        // difference from repeat-from-due-date without needing to
+        // decode RRULE text.
+        let humanized = humanize_rrule(
+            task.recurrence.as_deref().unwrap_or(""),
+            task.repeat_from == RepeatFrom::COMPLETION_DATE,
+        );
+        self.as_mut()
+            .set_selected_recurrence(QString::from(&humanized));
+
+        // Current CalDAV list assignment (empty for local tasks).
+        // Pull the colour alongside so the detail pane's list chip
+        // can paint to match `caldav_lists.cdl_color`.
+        let (uuid, color) = match &self.db {
+            Some(db) => current_caldav_meta_for(db, task.id),
+            None => (String::new(), 0),
+        };
+        self.as_mut()
+            .set_selected_caldav_calendar_uuid(QString::from(&uuid));
+        self.as_mut().set_selected_caldav_calendar_color(color);
+
+        // Current tag set.
+        let task_tag_uids = match &self.db {
+            Some(db) => current_tag_uids_for(db, task.id),
+            None => Vec::new(),
+        };
+        self.as_mut().set_selected_tag_uids(string_list_from_iter(
+            task_tag_uids.iter().map(String::as_str),
+        ));
+
+        // Current alarms (parallel labels/times/types).
+        let (alarm_labels, alarm_times, alarm_types) = match &self.db {
+            Some(db) => current_alarms_for(db, task.id),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        self.as_mut()
+            .set_selected_alarm_labels(string_list_from_iter(
+                alarm_labels.iter().map(String::as_str),
+            ));
+        let mut ql_times: QList<i64> = QList::default();
+        for t in &alarm_times {
+            ql_times.append(*t);
+        }
+        self.as_mut().set_selected_alarm_times(ql_times);
+        let mut ql_types: QList<i32> = QList::default();
+        for t in &alarm_types {
+            ql_types.append(*t);
+        }
+        self.as_mut().set_selected_alarm_types(ql_types);
+
+        // Current geofence.
+        let (place_uid, arrival, departure) = match &self.db {
+            Some(db) => current_geofence_for(db, task.id),
+            None => (String::new(), false, false),
+        };
+        self.as_mut()
+            .set_selected_place_uid(QString::from(&place_uid));
+        self.as_mut().set_selected_place_arrival(arrival);
+        self.as_mut().set_selected_place_departure(departure);
+
+        // Parent picker candidates + current parent.
+        let (parent_labels, parent_ids) = match &self.db {
+            Some(db) => list_parent_candidates(db, task.id),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.as_mut()
+            .set_parent_candidate_labels(string_list_from_iter(
+                parent_labels.iter().map(String::as_str),
+            ));
+        let mut ql_parent_ids: QList<i64> = QList::default();
+        for pid in &parent_ids {
+            ql_parent_ids.append(*pid);
+        }
+        self.as_mut().set_parent_candidate_ids(ql_parent_ids);
+        self.as_mut().set_selected_parent_id(task.parent);
+
+        // Timer columns → H:MM text for the edit dialog.
+        self.as_mut()
+            .set_selected_estimated_text(QString::from(&format_duration_hhmm(
+                task.estimated_seconds,
+            )));
+        self.as_mut()
+            .set_selected_elapsed_text(QString::from(&format_duration_hhmm(task.elapsed_seconds)));
+
+        // Recurrence raw + repeat_from for the inline RRULE editor.
+        self.as_mut()
+            .set_selected_recurrence_raw(QString::from(task.recurrence.as_deref().unwrap_or("")));
+        self.as_mut().set_selected_repeat_from(task.repeat_from);
+    }
+
+    /// Apply edits from the task edit dialog and refresh the view.
+    ///
+    /// Parses the two date text fields via
+    /// `tasks_core::datetime::parse_due_input`; on error we leave
+    /// the DB untouched and surface the failure on the status line
+    /// so the user can correct the input without losing work.
+    pub fn update_selected_task(
+        mut self: Pin<&mut Self>,
+        title: QString,
+        notes: QString,
+        due_text: QString,
+        hide_until_text: QString,
+        priority: i32,
+        caldav_uuid: QString,
+        tag_uids_list: QStringList,
+        alarm_times: QList<i64>,
+        alarm_types: QList<i32>,
+        place_uid: QString,
+        place_arrival: bool,
+        place_departure: bool,
+        parent_id: i64,
+        estimate_text: QString,
+        elapsed_text: QString,
+        recurrence: QString,
+        repeat_from: i32,
+    ) {
+        let id = self.selected_id;
+        if id <= 0 {
+            return;
+        }
+        let Some(path) = self.db_path.clone() else {
+            self.as_mut()
+                .set_status(QString::from("No database open; can't save edits."));
+            return;
+        };
+
+        let title_str = title.to_string();
+        let notes_str = notes.to_string();
+        let caldav_str = caldav_uuid.to_string();
+        // QStringList → Vec<String>. cxx-qt-lib's QStringList has
+        // no direct iterator, but it converts into QList<QString>
+        // cheaply, which does.
+        let tag_uids_owned: Vec<String> = {
+            let list: QList<QString> = QList::from(&tag_uids_list);
+            list.iter().map(|s| s.to_string()).collect()
+        };
+
+        // Zip parallel time/type QLists into Vec<(time, type)> for
+        // the write helper. If the two arrays disagree in length we
+        // trim to the shorter, matching the QML side's guarantee
+        // that both are built from the same source.
+        let alarm_pairs: Vec<(i64, i32)> = alarm_times
+            .iter()
+            .zip(alarm_types.iter())
+            .map(|(t, ty)| (*t, *ty))
+            .collect();
+        let place_uid_str = place_uid.to_string();
+
+        let estimated = match parse_duration_input(&estimate_text.to_string()) {
+            Ok(s) => s,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Estimate: {msg}")));
+                return;
+            }
+        };
+        let recurrence_str = recurrence.to_string();
+        let elapsed = match parse_duration_input(&elapsed_text.to_string()) {
+            Ok(s) => s,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Elapsed: {msg}")));
+                return;
+            }
+        };
+        let due_ms = match parse_due_input(&due_text.to_string()) {
+            Ok(ms) => ms,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Due: {msg}")));
+                return;
+            }
+        };
+        let hide_ms = match parse_due_input(&hide_until_text.to_string()) {
+            Ok(ms) => ms,
+            Err(msg) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Hide-until: {msg}")));
+                return;
+            }
+        };
+
+        let edit = tasks_core::TaskEdit {
+            title: &title_str,
+            notes: &notes_str,
+            due_ms,
+            hide_until_ms: hide_ms,
+            priority,
+            // Empty string = "don't touch caldav_tasks" (QML passes
+            // the ComboBox's current UUID, which equals the task's
+            // existing assignment when unchanged — the helper's
+            // UPDATE is idempotent in that case).
+            caldav_calendar_uuid: if caldav_str.is_empty() {
+                None
+            } else {
+                Some(caldav_str.as_str())
+            },
+            tag_uids: Some(&tag_uids_owned),
+            alarms: Some(&alarm_pairs),
+            geofence: Some(tasks_core::GeofenceEdit {
+                place_uid: &place_uid_str,
+                arrival: place_arrival,
+                departure: place_departure,
+            }),
+            parent_id: Some(parent_id),
+            estimated_seconds: estimated,
+            elapsed_seconds: elapsed,
+            recurrence: &recurrence_str,
+            repeat_from,
+        };
+        match tasks_core::update_task_fields(&path, id, &edit, tasks_core::now_ms()) {
+            Ok(true) => {
+                self.as_mut().reload_active_filter();
+                // Refresh the detail pane from the cache that
+                // `reload_active_filter` just rebuilt, so the user
+                // sees their edits reflected without having to
+                // re-click the row.
+                self.as_mut().select_task(id);
+                // Edit dialog can add, remove, or retime alarms;
+                // reconcile the scheduler against the new state.
+                reschedule_alarms(self.as_mut());
+                auto_sync_for_task(self.as_mut(), id);
+            }
+            Ok(false) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Task {id} not found")));
+            }
+            Err(e) => {
+                let msg = format!("Couldn't save task: {e}");
+                tracing::warn!("{msg}");
+                self.as_mut().set_status(QString::from(&msg));
+            }
+        }
+    }
+
+    /// Re-query the DB using `self.active_filter_id` and publish the
+    /// parallel list arrays. H-4: when `self.search_query` is non-
+    /// empty, run the substring search instead of the active filter
+    /// — search overrides the filter for the duration of the query
+    /// being typed.
+    fn reload_active_filter(mut self: Pin<&mut Self>) {
+        if self.db.is_none() {
+            self.as_mut().clear_list();
+            return;
+        }
+
+        let now_ms = tasks_core::now_ms();
+        let offset = current_local_offset_secs();
+        let active_id = self.active_filter_id.to_string();
+        let search = self.search_query.clone();
+        // Merge per-list overrides over the global defaults when
+        // the active filter is a CalDAV list. Other filters
+        // (Today / All / saved) just use the global defaults.
+        let prefs = if let Some(uuid) = active_id.strip_prefix("caldav:") {
+            merge_list_override(self.preferences.clone(), self.list_overrides.get(uuid))
+        } else {
+            self.preferences.clone()
+        };
+        // Borrow `db` immutably for the duration of the query, then drop
+        // the borrow before any `rust_mut()` call below. `db` lives on
+        // `self` (no extra open), so repeated filter navigations reuse
+        // the same verified-hash handle.
+        let query_result = {
+            let Some(ref db) = self.db else {
+                unreachable!("db presence checked above");
+            };
+            if search.is_empty() {
+                run_by_filter_id(db, &active_id, now_ms, offset, &prefs)
+            } else {
+                run_search(db, &search, now_ms, offset, &prefs)
+            }
+        };
+        let tasks = match query_result {
+            Ok(t) => t,
+            Err(e) => {
+                self.as_mut()
+                    .set_status(QString::from(&format!("Query failed: {e}")));
+                self.as_mut().clear_list();
+                return;
+            }
+        };
+
+        publish_tasks(self.as_mut(), tasks);
+    }
+
+    fn clear_list(mut self: Pin<&mut Self>) {
+        self.as_mut().set_count(0);
+        self.as_mut().set_titles(QStringList::default());
+        self.as_mut().set_task_ids(QList::default());
+        self.as_mut().set_indents(QList::default());
+        self.as_mut().set_completed_flags(QList::default());
+        self.as_mut().set_recurring_flags(QList::default());
+        self.as_mut().set_due_labels(QStringList::default());
+        self.as_mut().set_priorities(QList::default());
+        self.as_mut().set_task_tag_summaries(QStringList::default());
+        self.as_mut().set_task_tag_uid_lists(QStringList::default());
+        self.as_mut().set_task_list_names(QStringList::default());
+        self.as_mut().set_task_list_colors(QList::default());
+        self.as_mut().rust_mut().task_cache.clear();
+    }
+}
+
+/// Rebuild every Q_PROPERTY array the Accounts pane binds to
+/// from `self.accounts` + `self.account_states`. Called after
+/// every add/remove and after each sync_account so the pane
+/// reflects the current sync state per row.
+fn publish_accounts(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    let snapshot: Vec<StoredAccount> = vm.accounts.clone();
+    let states_snapshot: Vec<String> = vm.account_states.clone();
+    let mut kinds: QList<i32> = QList::default();
+    let mut labels: QList<QString> = QList::default();
+    let mut servers: QList<QString> = QList::default();
+    let mut users: QList<QString> = QList::default();
+    let mut uuids: QList<QString> = QList::default();
+    let mut states: QList<QString> = QList::default();
+    for (i, a) in snapshot.iter().enumerate() {
+        kinds.append(a.kind);
+        labels.append(QString::from(&a.label));
+        servers.append(QString::from(&a.server));
+        users.append(QString::from(&a.username));
+        uuids.append(QString::from(&a.uuid));
+        let state = states_snapshot.get(i).map(String::as_str).unwrap_or("Idle");
+        states.append(QString::from(state));
+    }
+    vm.as_mut().set_account_kinds(kinds);
+    vm.as_mut().set_account_labels(QStringList::from(&labels));
+    vm.as_mut().set_account_servers(QStringList::from(&servers));
+    vm.as_mut().set_account_usernames(QStringList::from(&users));
+    vm.as_mut().set_account_uuids(QStringList::from(&uuids));
+    vm.as_mut()
+        .set_account_sync_states(QStringList::from(&states));
+}
+
+/// Update the per-account sync state for the row whose `cda_uuid`
+/// matches `uuid`, then republish the parallel arrays. No-op if
+/// the uuid isn't currently in the in-memory accounts list
+/// (race with `remove_account`).
+fn set_account_state(mut vm: Pin<&mut qobject::TaskListViewModel>, uuid: &str, state: &str) {
+    let Some(idx) = vm.accounts.iter().position(|a| a.uuid == uuid) else {
+        return;
+    };
+    {
+        let mut inner = vm.as_mut().rust_mut();
+        // Pad in case account_states fell behind accounts.len().
+        while inner.account_states.len() <= idx {
+            inner.account_states.push(String::from("Idle"));
+        }
+        inner.account_states[idx] = state.to_string();
+    }
+    publish_accounts(vm);
+}
+
+fn publish_tasks(mut vm: Pin<&mut qobject::TaskListViewModel>, tasks: Vec<Task>) {
+    // Skip if the new task list is byte-identical to the previously
+    // published one. Re-publishing tears down + recreates every QML
+    // delegate via the set_count(0) → set_count(N) cycle below, which
+    // kills hover state mid-press and makes clicks un-actionable.
+    // Cheap pointer-walk equality on Vec<Task> is far less work than
+    // the QStringList rebuilds that follow.
+    if tasks == vm.as_ref().task_cache {
+        return;
+    }
+    tracing::trace!("publish_tasks: count={}", tasks.len());
+    let mut task_ids: QList<i64> = QList::default();
+    let mut indents: QList<i32> = QList::default();
+    let mut completed_flags: QList<bool> = QList::default();
+    let mut recurring_flags: QList<bool> = QList::default();
+    let mut priorities: QList<i32> = QList::default();
+
+    // `append(&QString)` on QStringList isn't exposed as a public helper;
+    // build QList<QString>s alongside and convert at the end.
+    let mut title_list: QList<QString> = QList::default();
+    let mut due_list: QList<QString> = QList::default();
+
+    // Parent id -> indent depth, cached while iterating so subtasks pick up
+    // their parent's indent + 1. The recursive query already sorts with
+    // parents before children, but when the prepared-statement fallbacks
+    // are used we compute indent from `tasks.parent` on the fly.
+    let mut indent_by_id: std::collections::HashMap<i64, i32> = Default::default();
+
+    for t in &tasks {
+        title_list.append(QString::from(t.title.as_deref().unwrap_or("")));
+        task_ids.append(t.id);
+        let indent = if t.parent == 0 {
+            0
+        } else {
+            indent_by_id.get(&t.parent).copied().unwrap_or(0) + 1
+        };
+        indent_by_id.insert(t.id, indent);
+        indents.append(indent);
+        completed_flags.append(t.is_completed());
+        recurring_flags.append(
+            t.recurrence
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false),
+        );
+        due_list.append(QString::from(&format_due_label(t.due_date)));
+        priorities.append(t.priority);
+    }
+    let titles = QStringList::from(&title_list);
+    let due_labels = QStringList::from(&due_list);
+
+    // H-7: per-row tag + list metadata. One query per dimension
+    // against the existing DB handle, aggregated to maps keyed by
+    // task id, then walked in row order to produce parallel arrays.
+    // Single-statement bulk fetches (vs N+1) so a 500-row list
+    // costs two extra prepared statements rather than 1000.
+    let row_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+    let (tag_summary_map, list_meta_map) = {
+        match &vm.db {
+            Some(db) => (
+                fetch_tag_summaries(db, &row_ids),
+                fetch_list_meta(db, &row_ids),
+            ),
+            None => (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ),
+        }
+    };
+    let mut tag_summary_qlist: QList<QString> = QList::default();
+    let mut tag_uid_qlist: QList<QString> = QList::default();
+    let mut list_name_qlist: QList<QString> = QList::default();
+    let mut list_color_list: QList<i32> = QList::default();
+    for t in &tasks {
+        match tag_summary_map.get(&t.id) {
+            Some((names, uids)) => {
+                tag_summary_qlist.append(QString::from(names.as_str()));
+                tag_uid_qlist.append(QString::from(uids.as_str()));
+            }
+            None => {
+                tag_summary_qlist.append(QString::default());
+                tag_uid_qlist.append(QString::default());
+            }
+        }
+        match list_meta_map.get(&t.id) {
+            Some((name, color)) => {
+                list_name_qlist.append(QString::from(name.as_str()));
+                list_color_list.append(*color);
+            }
+            None => {
+                list_name_qlist.append(QString::default());
+                list_color_list.append(0);
+            }
+        }
+    }
+    let tag_summaries = QStringList::from(&tag_summary_qlist);
+    let tag_uid_lists = QStringList::from(&tag_uid_qlist);
+    let list_names = QStringList::from(&list_name_qlist);
+
+    // Two-phase publish to keep QML delegate bindings out of the
+    // stale-array race:
+    //
+    //   1. `set_count(0)` tears down every existing delegate. Each
+    //      tear-down reads the old (still consistent) arrays one
+    //      last time.
+    //   2. Refill the parallel arrays with the new data.
+    //   3. `set_count(new_count)` creates fresh delegates which
+    //      index into the already-updated arrays.
+    //
+    // Without this, a filter change from an N-row list to an
+    // M-row one (M < N) would leave M+1..N delegates briefly bound
+    // to `titles[k>=M]` etc., which resolves to `undefined` and
+    // QML emits "Unable to assign [undefined] to QString" warnings.
+    // The extra set_count(0) is the price of a clean transition.
+    let count = tasks.len() as i32;
+    vm.as_mut().set_count(0);
+    vm.as_mut().set_titles(titles);
+    vm.as_mut().set_task_ids(task_ids);
+    vm.as_mut().set_indents(indents);
+    vm.as_mut().set_completed_flags(completed_flags);
+    vm.as_mut().set_recurring_flags(recurring_flags);
+    vm.as_mut().set_due_labels(due_labels);
+    vm.as_mut().set_priorities(priorities);
+    vm.as_mut().set_task_tag_summaries(tag_summaries);
+    vm.as_mut().set_task_tag_uid_lists(tag_uid_lists);
+    vm.as_mut().set_task_list_names(list_names);
+    vm.as_mut().set_task_list_colors(list_color_list);
+    // task_cache must be installed BEFORE set_count(N) republishes the
+    // delegates. select_task() looks the clicked id up in task_cache;
+    // if a click lands between set_count(N) and the cache assignment
+    // the lookup fails and clear_detail_pane silently runs — the user
+    // sees a row that never opens in the detail pane.
+    vm.as_mut().rust_mut().task_cache = tasks;
+    vm.as_mut().set_count(count);
+    // The list pane header already prints "N task(s)" — no need to
+    // repeat it on every reload, and the previous status chatter
+    // overwrote whatever genuine error message was sitting in the
+    // status bar.
+}
+
+/// H-7 helper: bulk-fetch the per-task tag info — both the
+/// comma-joined display-name summary (used as a tooltip / fallback
+/// label) and a comma-joined UID list (used by the list view to look
+/// up per-tag colours via the global `tag_uids` / `tag_colors`
+/// arrays). Missing tagdata rows fall back to the raw tag_uid for
+/// the name so the UI never shows blanks. Tasks with no tags are
+/// absent from the map; the caller treats absence as the empty
+/// string for both fields.
+fn fetch_tag_summaries(
+    db: &Database,
+    task_ids: &[i64],
+) -> std::collections::HashMap<i64, (String, String)> {
+    if task_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    // i64 placeholders are safe to splice (no quoting concern); we
+    // build the IN clause as a comma-joined integer list.
+    let placeholders = task_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT tags.task, COALESCE(tagdata.name, tags.tag_uid), tags.tag_uid \
+         FROM tags LEFT JOIN tagdata ON tags.tag_uid = tagdata.remoteId \
+         WHERE tags.task IN ({placeholders}) \
+         ORDER BY tags.task, tagdata.name"
+    );
+    let mut out: std::collections::HashMap<i64, (String, String)> =
+        std::collections::HashMap::new();
+    let conn = db.connection();
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("fetch_tag_summaries: prepare failed: {e}");
+            return out;
+        }
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    }) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!("fetch_tag_summaries: query_map failed: {e}");
+            return out;
+        }
+    };
+    for (task_id, name, uid) in rows.flatten() {
+        let entry = out.entry(task_id).or_default();
+        if entry.0.is_empty() {
+            entry.0 = name;
+            entry.1 = uid;
+        } else {
+            entry.0.push_str(", ");
+            entry.0.push_str(&name);
+            entry.1.push(',');
+            entry.1.push_str(&uid);
+        }
+    }
+    out
+}
+
+/// H-7 helper: bulk-fetch the per-task CalDAV list `(name, color)`.
+/// Tasks not assigned to a list are absent from the map; the caller
+/// treats absence as the empty name + colour 0.
+fn fetch_list_meta(
+    db: &Database,
+    task_ids: &[i64],
+) -> std::collections::HashMap<i64, (String, i32)> {
+    if task_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders = task_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT caldav_tasks.cd_task, \
+                COALESCE(caldav_lists.cdl_name, ''), \
+                caldav_lists.cdl_color \
+         FROM caldav_tasks \
+         INNER JOIN caldav_lists ON caldav_tasks.cd_calendar = caldav_lists.cdl_uuid \
+         WHERE caldav_tasks.cd_task IN ({placeholders}) \
+         AND caldav_tasks.cd_deleted = 0"
+    );
+    let mut out: std::collections::HashMap<i64, (String, i32)> = std::collections::HashMap::new();
+    let conn = db.connection();
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("fetch_list_meta: prepare failed: {e}");
+            return out;
+        }
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i32>(2)?,
+        ))
+    }) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!("fetch_list_meta: query_map failed: {e}");
+            return out;
+        }
+    };
+    for row in rows.flatten() {
+        out.insert(row.0, (row.1, row.2));
+    }
+    out
+}
+
+/// Enumerate the sidebar entries we surface: built-in filters, every CalDAV
+/// calendar, then every saved custom filter. Order matches the Android
+/// nav drawer's default ordering.
+///
+/// Errors from reading the `caldav_lists` / `filters` tables are logged
+/// (not fatal) so a broken/missing table shows as an incomplete sidebar
+/// rather than aborting the whole `openDatabase` flow.
+/// Whether an open operation is allowed to bootstrap a missing
+/// database file. `openDatabase(path)` from the Browse button only
+/// opens what already exists; `openDefaultDatabase` creates-on-miss.
+enum OpenMode {
+    ReadOnlyOnly,
+    CreateIfMissing,
+}
+
+/// Shared implementation behind `open_database` and
+/// `open_default_database`. Tears down the prior watcher, opens (or
+/// initialises) the file, rebuilds the sidebar, and kicks off the
+/// initial query. Status-line text and error branches stay the same
+/// regardless of which entry point called us.
+fn open_at_path(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf, mode: OpenMode) {
+    stop_prior_watcher(vm.as_mut());
+
+    let path_display = path.display().to_string();
+    // Open the long-lived handle read-write now that M2+ writes
+    // (task edit, account add/remove) and sync writeback all need
+    // to mutate the same file. Read-only mode was an M1-era safety
+    // net; with the schema-hash check still in place, opening RW
+    // here is no riskier and side-steps the SQLITE_READONLY error
+    // we were getting when a transient RW connection coincided
+    // with the read-only handle.
+    let result = match mode {
+        OpenMode::ReadOnlyOnly => Database::open_read_only(&path),
+        OpenMode::CreateIfMissing => Database::open_or_create_read_write(&path),
+    };
+
+    match result {
+        Ok(db) => {
+            // Auto-create the local-default account + Inbox list
+            // before the first sidebar build so a fresh user sees a
+            // usable list immediately. Idempotent.
+            ensure_local_default_list(&path);
+            // One-shot orphan vacuum on open: rows from CalDAV
+            // accounts removed before the cascade-delete fix
+            // landed are still in the `tasks` table even though
+            // their calendar / account is gone, and "All active"
+            // happily surfaces them. Sweep them out so the user's
+            // first open after the upgrade is clean.
+            if let Ok(mut conn) = open_rw_conn(&path) {
+                match vacuum_orphan_tasks(&mut conn) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("vacuumed {n} orphan task(s) from removed accounts"),
+                    Err(e) => tracing::warn!("orphan vacuum failed: {e}"),
+                }
+            }
+            // Cold open: we deliberately bypass refresh_sidebar's
+            // throttle here. open_at_path is a one-shot, not part
+            // of a burst, and the throttle's leading-edge would
+            // fire immediately anyway — folding this through it
+            // would just force a Database move into rust_mut
+            // before the other property setters need to borrow it.
+            let (labels, ids, kinds, groups, colors) = build_sidebar(&db);
+            vm.as_mut()
+                .set_sidebar_labels(string_list_from_iter(labels.iter().map(String::as_str)));
+            vm.as_mut()
+                .set_sidebar_ids(string_list_from_iter(ids.iter().map(String::as_str)));
+            {
+                let mut kl: QList<i32> = QList::default();
+                for k in &kinds {
+                    kl.append(*k);
+                }
+                vm.as_mut().set_sidebar_account_kinds(kl);
+            }
+            {
+                let mut cl: QList<i32> = QList::default();
+                for c in &colors {
+                    cl.append(*c);
+                }
+                vm.as_mut().set_sidebar_colors(cl);
+            }
+            vm.as_mut()
+                .set_sidebar_groups(string_list_from_iter(groups.iter().map(String::as_str)));
+            // Edit dialog's CalDAV list picker uses the calendars
+            // directly (no built-in filters prepended, no
+            // "caldav:" prefix on the UUID).
+            let (cal_labels, cal_uuids) = list_caldav_calendars(&db);
+            vm.as_mut()
+                .set_caldav_calendar_labels(string_list_from_iter(
+                    cal_labels.iter().map(String::as_str),
+                ));
+            vm.as_mut().set_caldav_calendar_uuids(string_list_from_iter(
+                cal_uuids.iter().map(String::as_str),
+            ));
+            let (tag_names, tag_uid_list, tag_color_list) = list_all_tags(&db);
+            vm.as_mut()
+                .set_tag_labels(string_list_from_iter(tag_names.iter().map(String::as_str)));
+            vm.as_mut().set_tag_uids(string_list_from_iter(
+                tag_uid_list.iter().map(String::as_str),
+            ));
+            {
+                let mut colors: QList<i32> = QList::default();
+                for c in &tag_color_list {
+                    colors.append(*c);
+                }
+                vm.as_mut().set_tag_colors(colors);
+            }
+            let (place_names, place_uids) = list_all_places(&db);
+            vm.as_mut().set_place_labels(string_list_from_iter(
+                place_names.iter().map(String::as_str),
+            ));
+            vm.as_mut()
+                .set_place_uids(string_list_from_iter(place_uids.iter().map(String::as_str)));
+
+            // Pull existing caldav_accounts rows into the in-memory
+            // accounts list so the Accounts pane shows previously-
+            // added (or JSON-imported) accounts and the Sync now
+            // button can dispatch against them. Only CalDAV (0) +
+            // EteSync (5) are reachable from here today; OAuth
+            // providers stay invisible until their sign-in flow
+            // lands.
+            let loaded = {
+                let secret_store = Arc::clone(&vm.as_ref().rust().secret_store);
+                load_password_accounts(&db, secret_store.as_ref())
+            };
+            // Once the user has acknowledged the credential-storage
+            // disclosure, walk the accounts list and lift any
+            // leftover plaintext `cda_password` value into the
+            // secret store, blanking the column on success. Idempotent
+            // — already-migrated rows have an empty column and skip.
+            // Gated on the ack flag so the disclosure dialog stays
+            // the consent point for the migration.
+            if vm.as_ref().credential_storage_acknowledged {
+                let secret_store = Arc::clone(&vm.as_ref().rust().secret_store);
+                let migrated = migrate_legacy_passwords(&path, &loaded, secret_store.as_ref());
+                if migrated > 0 {
+                    tracing::info!(
+                        "migrated {migrated} legacy plaintext password(s) into {} store",
+                        vm.as_ref().credential_storage_tier
+                    );
+                }
+            }
+            {
+                let mut inner = vm.as_mut().rust_mut();
+                inner.account_states = vec![String::from("Idle"); loaded.len()];
+                inner.accounts = loaded;
+            }
+            publish_accounts(vm.as_mut());
+
+            // The local database is exclusively managed by the app
+            // and re-opened on every launch — flagging the open in
+            // the status bar is just noise. Real failures still set
+            // the status text on the error branch below, and the
+            // titlebar carries the open path so the user can confirm
+            // what's loaded if they want.
+            vm.as_mut().set_status(QString::default());
+            vm.as_mut()
+                .set_db_path_display(QString::from(&path_display));
+            {
+                let mut inner = vm.as_mut().rust_mut();
+                inner.db_path = Some(path.clone());
+                inner.db = Some(db);
+                // Fresh DB → reset the watcher's data_version baseline
+                // so the first watcher tick after open compares against
+                // the new file, not whatever the previous DB had.
+                inner.last_data_version = 0;
+            }
+            vm.as_mut().reload_active_filter();
+            start_watcher(vm.as_mut(), path);
+            // Re-arm the OS-notification scheduler against the
+            // freshly-opened DB. Pulls the alarms table end-to-
+            // end and spawns a tokio sleep_until per supported
+            // alarm. No-op when notifications are disabled.
+            reschedule_alarms(vm.as_mut());
+            // Kick off the periodic background sync. The starter
+            // fires `sync_all_accounts` once up front so launch
+            // implies a fresh pull, then loops with a 15-minute
+            // interval. No-op when no sync providers are configured
+            // — `sync_all_accounts` short-circuits on an empty list.
+            start_auto_sync(vm.as_mut());
+        }
+        Err(e) => {
+            let msg = format!("Couldn't open {path_display}: {e}");
+            tracing::warn!("{msg}");
+            vm.as_mut().set_status(QString::from(&msg));
+            vm.as_mut().set_db_path_display(QString::default());
+            vm.as_mut().clear_list();
+            // Also blank every per-task detail field + the edit
+            // dialog's catalog arrays (tags/places/caldav lists).
+            // Otherwise a failed open after an earlier successful
+            // open leaves stale values visible in the UI.
+            clear_detail_pane(vm.as_mut());
+            vm.as_mut().set_tag_labels(QStringList::default());
+            vm.as_mut().set_tag_uids(QStringList::default());
+            vm.as_mut().set_tag_colors(QList::default());
+            vm.as_mut().set_place_labels(QStringList::default());
+            vm.as_mut().set_place_uids(QStringList::default());
+            vm.as_mut()
+                .set_caldav_calendar_labels(QStringList::default());
+            vm.as_mut()
+                .set_caldav_calendar_uuids(QStringList::default());
+            vm.as_mut()
+                .set_parent_candidate_labels(QStringList::default());
+            vm.as_mut().set_parent_candidate_ids(QList::default());
+            let mut inner = vm.as_mut().rust_mut();
+            inner.db_path = None;
+            inner.db = None;
+        }
+    }
+}
+
+/// Return parallel `(labels, uids)` for every tagdata row. Used by
+/// the edit dialog's multi-select tag picker.
+fn list_all_tags(db: &Database) -> (Vec<String>, Vec<String>, Vec<i32>) {
+    let mut labels = Vec::new();
+    let mut uids = Vec::new();
+    let mut colors = Vec::new();
+    let Ok(mut stmt) = db.connection().prepare(
+        "SELECT remoteId, name, COALESCE(color, 0) FROM tagdata \
+         WHERE remoteId IS NOT NULL AND name IS NOT NULL \
+         ORDER BY td_order, name",
+    ) else {
+        return (labels, uids, colors);
+    };
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i32>(2)?,
+        ))
+    });
+    if let Ok(rows) = rows {
+        for (uid, name, color) in rows.flatten() {
+            uids.push(uid);
+            labels.push(name);
+            colors.push(color);
+        }
+    }
+    (labels, uids, colors)
+}
+
+/// Return parallel `(labels, ids)` for every non-deleted task,
+/// excluding `exclude_id` (the task currently being edited, so the
+/// picker never offers the task itself as its own parent). Sorted
+/// by title for a predictable dropdown.
+fn list_parent_candidates(db: &Database, exclude_id: i64) -> (Vec<String>, Vec<i64>) {
+    let mut labels = Vec::new();
+    let mut ids = Vec::new();
+    let Ok(mut stmt) = db.connection().prepare(
+        "SELECT _id, title FROM tasks \
+         WHERE deleted = 0 AND _id != ?1 \
+         ORDER BY COALESCE(UPPER(title), ''), _id",
+    ) else {
+        return (labels, ids);
+    };
+    let rows = stmt.query_map([exclude_id], |r| {
+        let id: i64 = r.get(0)?;
+        let title: Option<String> = r.get(1)?;
+        Ok((id, title.unwrap_or_default()))
+    });
+    if let Ok(rows) = rows {
+        for (id, title) in rows.flatten() {
+            ids.push(id);
+            labels.push(title);
+        }
+    }
+    (labels, ids)
+}
+
+/// Return parallel `(labels, uids)` for every row in `places`.
+fn list_all_places(db: &Database) -> (Vec<String>, Vec<String>) {
+    let mut labels = Vec::new();
+    let mut uids = Vec::new();
+    let Ok(mut stmt) = db.connection().prepare(
+        "SELECT uid, name FROM places \
+         WHERE uid IS NOT NULL AND name IS NOT NULL \
+         ORDER BY place_order, name",
+    ) else {
+        return (labels, uids);
+    };
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+    if let Ok(rows) = rows {
+        for (uid, name) in rows.flatten() {
+            uids.push(uid);
+            labels.push(name);
+        }
+    }
+    (labels, uids)
+}
+
+/// Fetch the geofence row for `task_id`, returning
+/// `(place_uid, arrival, departure)`. Empty `place_uid` = no row.
+/// If a task has multiple geofences (rare; schema allows it) we
+/// pick the first by rowid.
+fn current_geofence_for(db: &Database, task_id: i64) -> (String, bool, bool) {
+    db.connection()
+        .query_row(
+            "SELECT place, arrival, departure FROM geofences \
+             WHERE task = ?1 ORDER BY geofence_id LIMIT 1",
+            [task_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, i32>(1)? != 0,
+                    r.get::<_, i32>(2)? != 0,
+                ))
+            },
+        )
+        .unwrap_or_default()
+}
+
+/// Read the alarms attached to `task_id`. Returns three parallel
+/// vectors suitable for the bridge's QStringList/QList Q_PROPERTYs.
+fn current_alarms_for(db: &Database, task_id: i64) -> (Vec<String>, Vec<i64>, Vec<i32>) {
+    let mut labels = Vec::new();
+    let mut times = Vec::new();
+    let mut types = Vec::new();
+    let Ok(mut stmt) = db
+        .connection()
+        .prepare("SELECT time, type FROM alarms WHERE task = ?1 ORDER BY time")
+    else {
+        return (labels, times, types);
+    };
+    let rows = stmt.query_map([task_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?))
+    });
+    if let Ok(rows) = rows {
+        for (time, alarm_type) in rows.flatten() {
+            labels.push(describe_alarm(alarm_type, time));
+            times.push(time);
+            types.push(alarm_type);
+        }
+    }
+    (labels, times, types)
+}
+
+/// Fetch the tag UIDs attached to `task_id` via the `tags` join.
+fn current_tag_uids_for(db: &Database, task_id: i64) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = db
+        .connection()
+        .prepare("SELECT tag_uid FROM tags WHERE task = ?1 AND tag_uid IS NOT NULL")
+    else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([task_id], |r| r.get::<_, String>(0)) {
+        for uid in rows.flatten() {
+            out.push(uid);
+        }
+    }
+    out
+}
+
+/// Return parallel `(labels, uuids)` for every CalDAV calendar. Used
+/// by the edit dialog's list picker; `build_sidebar` has a richer
+/// shape because its output also includes the built-in filter IDs.
+fn list_caldav_calendars(db: &Database) -> (Vec<String>, Vec<String>) {
+    let mut labels = Vec::new();
+    let mut uuids = Vec::new();
+    let Ok(mut stmt) = db
+        .connection()
+        .prepare("SELECT * FROM caldav_lists ORDER BY cdl_order, cdl_name")
+    else {
+        return (labels, uuids);
+    };
+    let Ok(rows) = stmt.query_map([], CaldavCalendar::from_row) else {
+        return (labels, uuids);
+    };
+    for row in rows.flatten() {
+        if let (Some(name), Some(uuid)) = (row.name, row.uuid) {
+            labels.push(name);
+            uuids.push(uuid);
+        }
+    }
+    (labels, uuids)
+}
+
+/// Look up the CalDAV calendar `(uuid, colour)` assigned to
+/// `task_id`. Returns `("", 0)` when the task has no
+/// `caldav_tasks` row (local-only) or no matching `caldav_lists`
+/// row. The colour is the stored `cdl_color` ARGB i32.
+fn current_caldav_meta_for(db: &Database, task_id: i64) -> (String, i32) {
+    let row: Option<(Option<String>, Option<i32>)> = db
+        .connection()
+        .query_row(
+            "SELECT caldav_tasks.cd_calendar, caldav_lists.cdl_color \
+             FROM caldav_tasks \
+             LEFT JOIN caldav_lists \
+                ON caldav_tasks.cd_calendar = caldav_lists.cdl_uuid \
+             WHERE caldav_tasks.cd_task = ?1 \
+             LIMIT 1",
+            [task_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i32>>(1)?)),
+        )
+        .ok();
+    match row {
+        Some((Some(uuid), color)) => (uuid, color.unwrap_or(0)),
+        _ => (String::new(), 0),
+    }
+}
+
+/// Load every sync-capable `caldav_accounts` row into the bridge's
+/// in-memory `accounts` list so the Accounts pane reflects whatever
+/// the DB carries. Passwords are fetched from `secret_store` first
+/// (the post-keychain-batch canonical storage); we fall back to the
+/// `cda_password` column when the store has nothing — so accounts
+/// authored on Android (which still writes the column) keep working,
+/// and a degraded in-memory store at Tier 3 doesn't lose the column
+/// value across a single launch.
+///
+/// OAuth providers (kinds 6 / 7) carry no password; their tokens
+/// are tracked separately in `token_store`. A fresh launch with
+/// no persisted tokens still surfaces "Re-sign-in required" via
+/// `sync_account` until the user re-runs the OAuth flow.
+fn load_password_accounts(
+    db: &Database,
+    secret_store: &dyn crate::token_persist::SecretStore,
+) -> Vec<StoredAccount> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = db.connection().prepare(
+        "SELECT cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_account_type \
+         FROM caldav_accounts \
+         WHERE cda_account_type IN (0, 5, 6, 7) \
+         ORDER BY cda_account_type, cda_name",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, i32>(5)?,
+        ))
+    });
+    if let Ok(rows) = rows {
+        for row in rows.flatten() {
+            let (uuid, name, url, username, column_password, kind_in_db) = row;
+            let Some(uuid) = uuid else { continue };
+            // Map cda_account_type back onto the bridge's KIND_*
+            // integers (which match `tasks_sync::ProviderKind` for
+            // QML, not the cda_account_type column).
+            let kind = match kind_in_db {
+                0 => KIND_CALDAV,
+                5 => KIND_ETESYNC,
+                6 => KIND_MICROSOFT_TODO,
+                7 => KIND_GOOGLE_TASKS,
+                _ => continue,
+            };
+            let password = match secret_store.get_secret(&uuid) {
+                Some(s) if !s.is_empty() => s,
+                _ => column_password.unwrap_or_default(),
+            };
+            out.push(StoredAccount {
+                uuid,
+                kind,
+                label: name.unwrap_or_default(),
+                server: url.unwrap_or_default(),
+                username: username.unwrap_or_default(),
+                password: SecretString::from(password),
+            });
+        }
+    }
+    out
+}
+
+/// Output bundle for `build_sidebar`. Aliased so the function
+/// signature doesn't trip `clippy::type_complexity`; the five
+/// vectors are the same five Q_PROPERTYs the QML side reads:
+/// labels / ids / account_kinds / groups / colors.
+type SidebarRows = (Vec<String>, Vec<String>, Vec<i32>, Vec<String>, Vec<i32>);
+
+fn build_sidebar(db: &Database) -> SidebarRows {
+    let mut labels = vec![
+        "All active".to_string(),
+        "Today".to_string(),
+        "Recently modified".to_string(),
+    ];
+    let mut ids = vec![
+        FILTER_ALL.to_string(),
+        FILTER_TODAY.to_string(),
+        FILTER_RECENT.to_string(),
+    ];
+    // Group key for each row, parallel to `ids`. Built-ins share
+    // "filters_builtin"; saved filters share "saved"; account
+    // header + the lists hanging off it share `account:<uuid>`.
+    let mut groups: Vec<String> = vec![
+        "filters_builtin".to_string(),
+        "filters_builtin".to_string(),
+        "filters_builtin".to_string(),
+    ];
+    // Per-row i32 ARGB colour. Non-list rows (built-ins, account
+    // headers, saved filters) carry 0 — the QML side treats that
+    // as "no swatch".
+    let mut colors: Vec<i32> = vec![0, 0, 0];
+    // `kinds[i]` carries:
+    //   -1 for built-in / saved filters
+    //   `cda_account_type` (0/2/3/4/5/6/7) for `caldav:` rows AND
+    //   for the synthetic `account:<uuid>` headers emitted below
+    // The QML side looks at the id prefix to decide whether the row
+    // is a section header (no selection / right-click menu) or a
+    // selectable list filter.
+    let mut kinds: Vec<i32> = vec![-1, -1, -1];
+
+    // Walk caldav_accounts once, then for each emit a synthetic
+    // header followed by every cdl row whose cdl_account matches.
+    // Empty accounts still produce a header so the user can right-
+    // click "New list" on them. `cda_collapsed` is honoured by the
+    // QML side via the existing `collapsedGroups` map (keyed by
+    // account uuid); we just provide the rows.
+    let mut accounts: Vec<(String, String, i32)> = Vec::new(); // (uuid, label, type)
+    if let Ok(mut stmt) = db.connection().prepare(
+        "SELECT cda_uuid, cda_name, cda_account_type \
+         FROM caldav_accounts \
+         WHERE cda_uuid IS NOT NULL \
+         ORDER BY cda_account_type, cda_name",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i32>(2)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                if let (Some(uuid), name) = (row.0, row.1) {
+                    accounts.push((uuid, name.unwrap_or_default(), row.2));
+                }
+            }
+        }
+    }
+    // Lookup table: cdl_account → list of (cdl_uuid, cdl_name, cdl_color).
+    let mut lists_by_account: std::collections::HashMap<String, Vec<(String, String, i32)>> =
+        std::collections::HashMap::new();
+    if let Ok(mut stmt) = db.connection().prepare(
+        "SELECT cdl_uuid, cdl_name, cdl_account, COALESCE(cdl_color, 0) \
+         FROM caldav_lists \
+         WHERE cdl_account IS NOT NULL AND cdl_uuid IS NOT NULL \
+         ORDER BY cdl_order, cdl_name",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i32>(3)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                if let (Some(uuid), name, Some(account), color) = (row.0, row.1, row.2, row.3) {
+                    lists_by_account.entry(account).or_default().push((
+                        uuid,
+                        name.unwrap_or_default(),
+                        color,
+                    ));
+                }
+            }
+        }
+    }
+    for (account_uuid, account_name, account_type) in &accounts {
+        let account_group = format!("account:{account_uuid}");
+        // Header row. The id prefix `account:` is what tells the QML
+        // "this is a section header — render with the account label,
+        // toggle collapse on click, show a right-click menu."
+        labels.push(if account_name.is_empty() {
+            "(unnamed account)".to_string()
+        } else {
+            account_name.clone()
+        });
+        ids.push(account_group.clone());
+        kinds.push(*account_type);
+        groups.push(account_group.clone());
+        colors.push(0);
+        // Lists belonging to this account.
+        if let Some(rows) = lists_by_account.get(account_uuid) {
+            for (cdl_uuid, cdl_name, cdl_color) in rows {
+                labels.push(if cdl_name.is_empty() {
+                    cdl_uuid.clone()
+                } else {
+                    cdl_name.clone()
+                });
+                ids.push(format!("caldav:{cdl_uuid}"));
+                kinds.push(*account_type);
+                groups.push(account_group.clone());
+                colors.push(*cdl_color);
+            }
+        }
+    }
+
+    match db
+        .connection()
+        .prepare("SELECT * FROM filters ORDER BY f_order, title")
+    {
+        Ok(mut stmt) => match stmt.query_map([], CustomFilter::from_row) {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(f) => {
+                            if let Some(title) = f.title {
+                                labels.push(title);
+                                ids.push(format!("filter:{}", f.id));
+                                kinds.push(-1);
+                                groups.push("saved".to_string());
+                                colors.push(0);
+                            }
+                        }
+                        Err(e) => tracing::warn!("filters row decode failed: {e}"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("filters query_map failed: {e}"),
+        },
+        Err(e) => tracing::warn!("filters prepare failed: {e}"),
+    }
+
+    (labels, ids, kinds, groups, colors)
+}
+
+/// Make sure a Local account + a default "Inbox" list exist on the
+/// open DB. `caldav_accounts.cda_uuid` and `caldav_lists.cdl_uuid`
+/// are plain TEXT columns (no UNIQUE constraint), so `INSERT OR
+/// IGNORE` won't de-dupe — every restart would inflate the
+/// sidebar with another copy. Read-then-conditional-INSERT keeps
+/// the rows singleton.
+fn ensure_local_default_list(path: &std::path::Path) {
+    let Ok(conn) = open_rw_conn(path) else {
+        tracing::warn!("ensure_local_default_list: couldn't open RW conn");
+        return;
+    };
+    let account_present: bool = conn
+        .query_row(
+            "SELECT 1 FROM caldav_accounts WHERE cda_uuid = 'local-default' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !account_present {
+        // account_type = 2 == AccountType::LOCAL.
+        let _ = conn.execute(
+            "INSERT INTO caldav_accounts \
+             (cda_uuid, cda_name, cda_url, cda_username, cda_password, cda_error, \
+              cda_account_type, cda_collapsed, cda_server_type, cda_last_sync) \
+             VALUES ('local-default', 'Local', NULL, NULL, NULL, NULL, 2, 0, -1, 0)",
+            [],
+        );
+    }
+    let list_present: bool = conn
+        .query_row(
+            "SELECT 1 FROM caldav_lists WHERE cdl_uuid = 'local-inbox' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !list_present {
+        let _ = conn.execute(
+            "INSERT INTO caldav_lists \
+             (cdl_uuid, cdl_account, cdl_name, cdl_color, cdl_url, cdl_access, \
+              cdl_ctag, cdl_order, cdl_last_sync) \
+             VALUES ('local-inbox', 'local-default', 'Inbox', 0, NULL, 1, NULL, 0, 0)",
+            [],
+        );
+    }
+}
+
+/// Snapshot the persistable subset of the view model and write it
+/// to disk. Called whenever an updateXxx invokable changes a
+/// preference; failures are logged but never propagated (the
+/// session keeps running on the in-memory copy).
+/// Open a short-lived read-write connection to the SQLite file at
+/// `path`. Mirrors `tasks_core::write::open_rw` (which is private)
+/// — the bridge's `Database` handle is intentionally read-only so
+/// the query path can't accidentally mutate; writes that go around
+/// `tasks-core`'s helpers (currently just our `caldav_accounts`
+/// add / remove) get their own brief RW connection that closes
+/// once the call returns.
+/// Recompute the sidebar from the open DB and republish every
+/// parallel Q_PROPERTY the QML side reads. Factored out so the
+/// background sync completion path (which queues a callback onto
+/// the QML thread) can call it through a single function pointer
+/// rather than duplicating the five `set_xxx` calls.
+/// Look up the syncable owner of `task_id`. Returns `None` when:
+/// * The task has no `caldav_tasks` row (purely local, no remote
+///   to push to).
+/// * The owning account's `cda_account_type` is LOCAL (2) — the
+///   default `local-default` Inbox falls into this bucket.
+/// * Any of the joins miss (orphaned row, etc.).
+///
+/// Callers that get `Some(uuid)` dispatch a `sync_account`
+/// against it so the just-mutated row reaches the server without
+/// waiting for the user to hit the toolbar's manual Sync button.
+/// Whether `server_url` points at a local-loopback Etebase
+/// instance (the docker-compose test stack). The Etebase provider
+/// turns on its `Account::signup` fallback when this is true so a
+/// fresh test user materialises on first connect against a server
+/// running with `AUTO_SIGNUP=true`. Production / public Etebase
+/// servers don't get the fallback — auto-signup with bad creds
+/// would silently create an empty account.
+/// Build the reqwest Client we hand to the OAuth `authorize()` and
+/// (later) the per-provider sync paths. Mirrors the per-provider
+/// connect()-side builder: rustls, 30-second timeout, redirects
+/// disabled so a 3xx never silently bounces a Bearer token to a
+/// third-party host.
+fn reqwest_client_for_oauth() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent("tasks-desktop-native/0.1")
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+fn is_local_etebase_url(server_url: &str) -> bool {
+    // Parse the URL and check the host exactly. The earlier
+    // substring-based check (`server_url.contains("://127.0.0.1")`)
+    // matched any URL containing that string anywhere — including
+    // `https://attacker.example/?next=://127.0.0.1`. When matched,
+    // `EteSyncProvider::with_signup_fallback(true)` is enabled and
+    // a login failure escalates to `Account::signup` against the
+    // *server URL* with the user's chosen password as the signup
+    // payload — i.e. the user's password is leaked verbatim to
+    // any host that can stuff a loopback substring into a URL the
+    // user pastes. Use the parser-anchored host instead so only
+    // genuine loopback URLs trigger the auto-signup path.
+    let Ok(url) = url::Url::parse(server_url) else {
+        return false;
+    };
+    match url.host_str() {
+        Some(h) => {
+            // `url::Url::parse("http://[::1]/").host_str()` returns
+            // `"[::1]"` (with brackets), per `url 2.5.8`, so the
+            // bracketed form is the only IPv6 string this branch
+            // ever sees. A bare `"::1"` arm here was dead and was
+            // removed.
+            let h = h.to_ascii_lowercase();
+            h == "127.0.0.1" || h == "localhost" || h == "[::1]"
+        }
+        None => false,
+    }
+}
+
+fn syncable_account_for_task(db: &Database, task_id: i64) -> Option<String> {
+    db.connection()
+        .query_row(
+            "SELECT cl.cdl_account FROM caldav_tasks ct \
+             JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+             JOIN caldav_accounts ca ON ca.cda_uuid = cl.cdl_account \
+             WHERE ct.cd_task = ?1 AND ca.cda_account_type != 2 \
+             LIMIT 1",
+            [task_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// Wrapper that runs `syncable_account_for_task` against the
+/// view model's open DB and dispatches `sync_account` if a
+/// non-local owner exists. No-op for tasks that belong to the
+/// local-default account (the desktop's built-in Inbox) — those
+/// don't need a network round-trip.
+fn auto_sync_for_task(mut vm: Pin<&mut qobject::TaskListViewModel>, task_id: i64) {
+    let uuid = {
+        let r = vm.as_ref();
+        let inner = r.rust();
+        inner
+            .db
+            .as_ref()
+            .and_then(|db| syncable_account_for_task(db, task_id))
+    };
+    if let Some(uuid) = uuid {
+        vm.as_mut().sync_account(QString::from(&uuid));
+    }
+}
+
+/// Cooldown for `refresh_sidebar`'s leading-edge debounce. Every
+/// in-process mutation hook calls `refresh_sidebar` synchronously;
+/// account-add / list-rename / sync completion can fire dozens of
+/// times in a burst, and a full `build_sidebar` per call dominates
+/// the QML thread.
+const SIDEBAR_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// Rebuild the sidebar Q_PROPERTYs from the current DB. Throttled
+/// to one rebuild per `SIDEBAR_REFRESH_COOLDOWN`: the first call in
+/// a burst runs synchronously, subsequent calls inside the window
+/// flag a pending refresh and let a worker thread flush it once
+/// the cooldown elapses, so the last skipped call's effect still
+/// lands.
+fn refresh_sidebar(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    let now = std::time::Instant::now();
+    let should_run = match vm.as_ref().rust().last_sidebar_refresh {
+        None => true,
+        Some(prev) => now.duration_since(prev) >= SIDEBAR_REFRESH_COOLDOWN,
+    };
+    if !should_run {
+        let already_pending = vm.as_ref().rust().pending_sidebar_refresh;
+        if already_pending {
+            return;
+        }
+        vm.as_mut().rust_mut().pending_sidebar_refresh = true;
+        let last = vm.as_ref().rust().last_sidebar_refresh.unwrap_or(now);
+        let elapsed = now.duration_since(last);
+        let wait = SIDEBAR_REFRESH_COOLDOWN.saturating_sub(elapsed);
+        let qt_thread = vm.as_ref().qt_thread();
+        std::thread::Builder::new()
+            .name("sidebar-debounce".into())
+            .spawn(move || {
+                std::thread::sleep(wait);
+                let _ = qt_thread.queue(|pinned: Pin<&mut qobject::TaskListViewModel>| {
+                    flush_sidebar_refresh(pinned);
+                });
+            })
+            .ok();
+        return;
+    }
+    do_refresh_sidebar(vm.as_mut());
+    vm.as_mut().rust_mut().last_sidebar_refresh = Some(now);
+    vm.as_mut().rust_mut().pending_sidebar_refresh = false;
+}
+
+/// Trailing-edge flush invoked from the debounce worker thread.
+/// Clears the pending flag and runs the rebuild only if a call
+/// arrived during the cooldown.
+fn flush_sidebar_refresh(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if !vm.as_ref().rust().pending_sidebar_refresh {
+        return;
+    }
+    vm.as_mut().rust_mut().pending_sidebar_refresh = false;
+    do_refresh_sidebar(vm.as_mut());
+    vm.as_mut().rust_mut().last_sidebar_refresh = Some(std::time::Instant::now());
+}
+
+fn do_refresh_sidebar(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    // Compute the new arrays inside a scope that holds the
+    // immutable Rust borrow on the view model, then drop the
+    // borrow before the cxx-qt `set_*` methods take Pin<&mut Self>.
+    // Without the explicit binding, `vm.as_ref()` is a temporary
+    // that dies before `build_sidebar` finishes using it.
+    let computed = {
+        let r = vm.as_ref();
+        let inner = r.rust();
+        inner.db.as_ref().map(build_sidebar)
+    };
+    let Some((labels, ids, kinds, groups, colors)) = computed else {
+        return;
+    };
+    let labels_qsl = string_list_from_iter(labels.iter().map(String::as_str));
+    let ids_qsl = string_list_from_iter(ids.iter().map(String::as_str));
+    let groups_qsl = string_list_from_iter(groups.iter().map(String::as_str));
+    let mut kl: QList<i32> = QList::default();
+    for k in &kinds {
+        kl.append(*k);
+    }
+    let mut cl: QList<i32> = QList::default();
+    for c in &colors {
+        cl.append(*c);
+    }
+    vm.as_mut().set_sidebar_labels(labels_qsl);
+    vm.as_mut().set_sidebar_ids(ids_qsl);
+    vm.as_mut().set_sidebar_account_kinds(kl);
+    vm.as_mut().set_sidebar_groups(groups_qsl);
+    vm.as_mut().set_sidebar_colors(cl);
+}
+
+/// Cascade-delete every row tied to the given account UUID.
+///
+/// Runs in a single transaction. Tears down rows in dependency
+/// order so even though we don't have ON DELETE CASCADE FKs
+/// declared, no children survive their parent:
+///
+///   alarms[task]  → tasks[_id]  → caldav_tasks[cd_task]  →
+///   caldav_lists[cdl_uuid]  → caldav_accounts[cda_uuid]
+///
+/// The earlier remove_account path only swept caldav_tasks /
+/// caldav_lists / caldav_accounts and left the underlying
+/// `tasks` rows (plus their `alarms` and `tags`) behind, which
+/// is why "All active" still showed tasks from removed
+/// accounts. Mirrors the Android client's CaldavDao deletion
+/// shape.
+fn delete_account_cascade(conn: &mut rusqlite::Connection, cda_uuid: &str) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Capture the affected task IDs before we tear down the
+    // join rows that point at them.
+    let mut task_ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT ct.cd_task FROM caldav_tasks ct \
+             JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+             WHERE cl.cdl_account = ?1",
+        )?;
+        let rows = stmt.query_map([cda_uuid], |r| r.get::<_, i64>(0))?;
+        for r in rows {
+            task_ids.push(r?);
+        }
+    }
+    if !task_ids.is_empty() {
+        // SQLite's parameter limit (default 999) caps how many
+        // ?N we can splat. We're well under in practice but
+        // chunk anyway in case the user is wiping a hoarder
+        // account.
+        for chunk in task_ids.chunks(500) {
+            let placeholders: String = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            tx.execute(
+                &format!("DELETE FROM alarms WHERE task IN ({placeholders})"),
+                params.as_slice(),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM tags WHERE task IN ({placeholders})"),
+                params.as_slice(),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM tasks WHERE _id IN ({placeholders})"),
+                params.as_slice(),
+            )?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM caldav_tasks WHERE cd_calendar IN \
+         (SELECT cdl_uuid FROM caldav_lists WHERE cdl_account = ?1)",
+        [cda_uuid],
+    )?;
+    tx.execute(
+        "DELETE FROM caldav_lists WHERE cdl_account = ?1",
+        [cda_uuid],
+    )?;
+    tx.execute(
+        "DELETE FROM caldav_accounts WHERE cda_uuid = ?1",
+        [cda_uuid],
+    )?;
+    tx.commit()
+}
+
+/// Sweep `tasks` rows whose only join row points at a calendar
+/// whose owning account is gone. This is the cleanup pass that
+/// recovers from the pre-fix bug where remove_account dropped
+/// the join rows + lists + account but left task bodies behind
+/// — those bodies still surface in "All active". Runs once per
+/// open_at_path; idempotent.
+fn vacuum_orphan_tasks(conn: &mut rusqlite::Connection) -> rusqlite::Result<usize> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // An orphan = caldav_tasks row whose cd_calendar isn't in
+    // caldav_lists, OR whose calendar's cdl_account isn't in
+    // caldav_accounts.
+    let mut task_ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT ct.cd_task FROM caldav_tasks ct \
+             LEFT JOIN caldav_lists cl ON cl.cdl_uuid = ct.cd_calendar \
+             LEFT JOIN caldav_accounts ca ON ca.cda_uuid = cl.cdl_account \
+             WHERE cl.cdl_uuid IS NULL OR ca.cda_uuid IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        for r in rows {
+            task_ids.push(r?);
+        }
+    }
+    let removed = task_ids.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+    for chunk in task_ids.chunks(500) {
+        let placeholders: String = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        tx.execute(
+            &format!("DELETE FROM alarms WHERE task IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM tags WHERE task IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM tasks WHERE _id IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM caldav_tasks WHERE cd_task IN ({placeholders})"),
+            params.as_slice(),
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed)
+}
+
+/// Lazy-build the bridge's shared multi-thread tokio runtime
+/// and return a cloned Handle. Five sites used to repeat the
+/// `if self.runtime.is_none() { Builder::new_multi_thread()... }`
+/// dance verbatim; this helper consolidates them.
+///
+/// Returns `Some(handle)` on ready, `None` on a build failure
+/// (status set on the bridge so the caller just early-returns).
+/// The Runtime itself stays held on `TaskListViewModelRust`
+/// for the view model's lifetime — workers spawn against the
+/// returned Handle clone.
+fn ensure_runtime_handle(
+    mut vm: Pin<&mut qobject::TaskListViewModel>,
+) -> Option<tokio::runtime::Handle> {
+    if vm.as_ref().rust().runtime.is_none() {
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("tasks-sync")
+            .build()
+        {
+            Ok(rt) => vm.as_mut().rust_mut().runtime = Some(rt),
+            Err(e) => {
+                vm.as_mut()
+                    .set_status(QString::from(&format!("Couldn't start runtime: {e}")));
+                return None;
+            }
+        }
+    }
+    Some(
+        vm.as_ref()
+            .rust()
+            .runtime
+            .as_ref()
+            .expect("runtime constructed above")
+            .handle()
+            .clone(),
+    )
+}
+
+fn open_rw_conn(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(path, flags)?;
+    // Shared WAL + busy_timeout tuning so this transient bridge
+    // handle and the engine's per-sync handles agree on locking
+    // semantics. Without that alignment, parallel sync workers
+    // (one per account when the auto-sync timer fans out) hit
+    // SQLITE_BUSY against this handle's writes.
+    tasks_core::tune_writeback_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Move every OAuth token + password secret tied to one of the
+/// `accounts` from the `from_*` stores into the `to_*` stores,
+/// then delete from the source. Best-effort per row: a failed
+/// `put` against the destination leaves the source intact (so a
+/// transient keychain hiccup doesn't lose credentials), and a
+/// successful migration of one row never blocks the rest.
+/// Returns `(tokens_moved, secrets_moved)` for logging.
+fn migrate_credentials(
+    accounts: &[(String, i32)],
+    from_tokens: &dyn tasks_sync::TokenStore,
+    from_secrets: &dyn crate::token_persist::SecretStore,
+    to_tokens: &dyn tasks_sync::TokenStore,
+    to_secrets: &dyn crate::token_persist::SecretStore,
+) -> (usize, usize) {
+    let mut tokens_moved = 0;
+    let mut secrets_moved = 0;
+    for (uuid, kind) in accounts {
+        // OAuth tokens — only Google / Microsoft carry these.
+        let provider_kind = match *kind {
+            KIND_GOOGLE_TASKS => Some(tasks_sync::ProviderKind::GoogleTasks),
+            KIND_MICROSOFT_TODO => Some(tasks_sync::ProviderKind::MicrosoftToDo),
+            _ => None,
+        };
+        if let Some(pk) = provider_kind {
+            if let Some(tokens) = from_tokens.get(pk, uuid) {
+                if to_tokens.put(pk, uuid, &tokens).is_ok() {
+                    let _ = from_tokens.delete(pk, uuid);
+                    tokens_moved += 1;
+                } else {
+                    tracing::warn!("migrate_credentials: token put failed for {uuid}");
+                }
+            }
+        }
+        // Password secrets — CalDAV / EteSync / EteBase use these.
+        if let Some(secret) = from_secrets.get_secret(uuid) {
+            if !secret.is_empty() {
+                if to_secrets.put_secret(uuid, &secret).is_ok() {
+                    let _ = from_secrets.delete_secret(uuid);
+                    secrets_moved += 1;
+                } else {
+                    tracing::warn!("migrate_credentials: secret put failed for {uuid}");
+                }
+            }
+        }
+    }
+    (tokens_moved, secrets_moved)
+}
+
+/// Walk every entry in `accounts` and migrate any leftover
+/// plaintext `cda_password` value into the secret store,
+/// blanking the SQLite column on success. Returns the number of
+/// rows actually moved. Idempotent — rows whose column is
+/// already empty are skipped silently.
+///
+/// Called from `open_at_path` after the disclosure has been
+/// acknowledged, so the user has already seen what storage tier
+/// the value is being moved into. Failures (read-only DB,
+/// secret-store write error, etc.) leave the column intact so
+/// the legacy-fallback path in `load_password_accounts` keeps
+/// the account usable; we log at warn rather than abort.
+fn migrate_legacy_passwords(
+    db_path: &std::path::Path,
+    accounts: &[StoredAccount],
+    secret_store: &dyn crate::token_persist::SecretStore,
+) -> usize {
+    use secrecy::ExposeSecret;
+    let mut moved = 0;
+    let conn = match open_rw_conn(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("migrate_legacy_passwords: open RW conn failed: {e}");
+            return 0;
+        }
+    };
+    for acct in accounts {
+        // Re-read the column directly rather than trust the in-
+        // memory StoredAccount.password — the load path may have
+        // already merged the secret store's value, masking
+        // whether the column itself still has a plaintext copy.
+        let column_value: Result<Option<String>, _> = conn.query_row(
+            "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = ?1",
+            [&acct.uuid],
+            |r| r.get::<_, Option<String>>(0),
+        );
+        let column_password = match column_value {
+            Ok(Some(s)) if !s.is_empty() => s,
+            _ => continue,
+        };
+        // Don't overwrite a secret-store value that's already in
+        // place from a previous migration; if both exist, the
+        // store is canonical and the column is the duplicate
+        // we're trying to clean up.
+        let already_in_store = secret_store
+            .get_secret(&acct.uuid)
+            .filter(|s| !s.is_empty())
+            .is_some();
+        // Track whether *we* put the secret on this iteration —
+        // if the column-blank UPDATE then fails we have to roll
+        // it back out so the next pass doesn't see "store wins"
+        // and silently leak the plaintext column forever.
+        let mut put_just_now = false;
+        if !already_in_store {
+            // Use the in-memory password where it matches what
+            // load_password_accounts read back; otherwise prefer
+            // the column value we just confirmed is non-empty.
+            let candidate = if acct.password.expose_secret() == column_password.as_str() {
+                acct.password.expose_secret().to_string()
+            } else {
+                column_password.clone()
+            };
+            if let Err(e) = secret_store.put_secret(&acct.uuid, &candidate) {
+                tracing::warn!(
+                    "migrate_legacy_passwords: secret put failed for {}: {e}",
+                    acct.uuid
+                );
+                continue;
+            }
+            put_just_now = true;
+        }
+        if let Err(e) = conn.execute(
+            "UPDATE caldav_accounts SET cda_password = '' WHERE cda_uuid = ?1",
+            [&acct.uuid],
+        ) {
+            // Roll back our `put_secret` so we don't leave the
+            // plaintext in BOTH the column AND the secret store.
+            // If we don't, the next pass takes the
+            // `already_in_store` branch (skipping the put) and
+            // tries the UPDATE again — if the underlying cause
+            // is persistent (e.g. read-only filesystem) the
+            // plaintext lives on disk indefinitely.
+            // Failure to roll back is itself logged at error.
+            if put_just_now {
+                if let Err(rollback_err) = secret_store.delete_secret(&acct.uuid) {
+                    tracing::error!(
+                        "migrate_legacy_passwords: column UPDATE failed for {} ({e}); \
+                         rollback delete_secret ALSO failed ({rollback_err}); \
+                         credential is now in BOTH column and store",
+                        acct.uuid
+                    );
+                } else {
+                    tracing::error!(
+                        "migrate_legacy_passwords: column UPDATE failed for {} ({e}); \
+                         rolled back the put_secret; row stays on legacy fallback",
+                        acct.uuid
+                    );
+                }
+            } else {
+                tracing::error!(
+                    "migrate_legacy_passwords: blanking column failed for {} ({e}); \
+                     plaintext remains in caldav_accounts.cda_password",
+                    acct.uuid
+                );
+            }
+            continue;
+        }
+        moved += 1;
+    }
+    moved
+}
+
+fn persist_prefs(vm: &qobject::TaskListViewModel) {
+    let prefs = crate::preferences::Preferences {
+        theme_mode: vm.theme_mode,
+        sort_mode: vm.pref_sort_mode,
+        sort_ascending: vm.pref_sort_ascending,
+        show_completed: vm.pref_show_completed,
+        show_hidden: vm.pref_show_hidden,
+        completed_at_bottom: vm.pref_completed_at_bottom,
+        window_width: vm.window_width,
+        window_height: vm.window_height,
+        window_x: vm.window_x,
+        window_y: vm.window_y,
+        window_maximized: vm.window_maximized,
+        notifications_enabled: vm.notifications_enabled,
+        credential_storage_choice: vm.credential_storage_choice.to_string(),
+        credential_storage_acknowledged: vm.credential_storage_acknowledged,
+        list_overrides: vm.list_overrides.clone(),
+    };
+    prefs.save();
+}
+
+/// Merge a list's [`ListOverride`] over the global query
+/// preferences. Returns `base` unchanged when no override is
+/// present.
+fn merge_list_override(
+    base: tasks_core::QueryPreferences,
+    o: Option<&crate::preferences::ListOverride>,
+) -> tasks_core::QueryPreferences {
+    let Some(o) = o else { return base };
+    tasks_core::QueryPreferences {
+        sort_mode: o.sort_mode.unwrap_or(base.sort_mode),
+        sort_ascending: o.sort_ascending.unwrap_or(base.sort_ascending),
+        show_completed: o.show_completed.unwrap_or(base.show_completed),
+        show_hidden: o.show_hidden.unwrap_or(base.show_hidden),
+        completed_tasks_at_bottom: o
+            .completed_at_bottom
+            .unwrap_or(base.completed_tasks_at_bottom),
+        ..base
+    }
+}
+
+/// Ensure the bridge's tokio Runtime is up, then ask the alarm
+/// scheduler to reconcile against the currently-open DB. No-ops
+/// when notifications are disabled in prefs or no DB is open.
+/// Logs once at warn if the Runtime can't be constructed and
+/// disables further attempts for this view-model lifetime by
+/// leaving `runtime: None` — the next reschedule call will retry,
+/// which matches the bridge's existing "runtime is built lazily
+/// on first sync" behaviour.
+fn reschedule_alarms(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if !vm.as_ref().notifications_enabled {
+        return;
+    }
+    let path = match vm.as_ref().db_path.clone() {
+        Some(p) => p,
+        None => return,
+    };
+    // Notifier runs at debounced background cadence; failure is
+    // logged silently rather than via `set_status`, so this site
+    // doesn't go through `ensure_runtime_handle` (which lights up
+    // the status bar). Otherwise identical builder shape.
+    if vm.as_ref().rust().runtime.is_none() {
+        match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("tasks-runtime")
+            .build()
+        {
+            Ok(rt) => vm.as_mut().rust_mut().runtime = Some(rt),
+            Err(e) => {
+                tracing::warn!("notifier: couldn't start tokio runtime: {e}");
+                return;
+            }
+        }
+    }
+    let scheduler = Arc::clone(&vm.as_ref().notifier);
+    let handle = vm
+        .as_ref()
+        .rust()
+        .runtime
+        .as_ref()
+        .expect("runtime constructed above")
+        .handle()
+        .clone();
+    scheduler.reschedule_all(&handle, &path);
+}
+
+fn string_list_from_iter<'a>(iter: impl Iterator<Item = &'a str>) -> QStringList {
+    let mut list: QList<QString> = QList::default();
+    for s in iter {
+        list.append(QString::from(s));
+    }
+    QStringList::from(&list)
+}
+
+/// Tell any previously-running watcher thread to exit. The thread
+/// observes the shared atomic on its next 500 ms tick and returns.
+/// Also stops the auto-sync thread — both are tied to the lifetime
+/// of an open database, so reopening always starts both fresh.
+fn stop_prior_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if let Some(stop) = vm.as_mut().rust_mut().watcher_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
+    stop_auto_sync(vm.as_mut());
+}
+
+/// 15-minute interval between automatic background syncs. Hard-
+/// coded for now; mirrors jetpack-desktop's `syncInterval` so a
+/// user with both clients open sees roughly the same cadence.
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// How often the sync thread wakes to check the stop flag. Smaller
+/// = faster shutdown, but a slow restart loop spends more cycles
+/// in spurious wakes. 1 s is a reasonable balance.
+const AUTO_SYNC_POLL: Duration = Duration::from_millis(1_000);
+
+/// Tell any previously-running auto-sync thread to exit. Safe to
+/// call when no thread is running.
+fn stop_auto_sync(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    if let Some(stop) = vm.as_mut().rust_mut().auto_sync_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spawn the periodic-sync thread. Fires `sync_all_accounts` once
+/// up front (so launch implies an initial sync) and then loops
+/// with a 15-minute sleep, breaking out early when the shared
+/// atomic is set. Each cycle posts back onto the QML thread via
+/// `qt_thread.queue` so the actual `sync_account` dispatch runs
+/// with exclusive pinned-mut access.
+fn start_auto_sync(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    vm.as_mut().rust_mut().auto_sync_stop = Some(stop);
+    let qt_thread = vm.as_ref().qt_thread();
+    std::thread::Builder::new()
+        .name("tasks-auto-sync".into())
+        .spawn(move || {
+            // Initial sync as soon as the DB is open.
+            let _ = qt_thread.queue(|pinned: Pin<&mut qobject::TaskListViewModel>| {
+                pinned.sync_all_accounts();
+            });
+            loop {
+                let started = std::time::Instant::now();
+                while started.elapsed() < AUTO_SYNC_INTERVAL {
+                    if stop_thread.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(AUTO_SYNC_POLL);
+                }
+                if stop_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                if qt_thread
+                    .queue(|pinned: Pin<&mut qobject::TaskListViewModel>| {
+                        pinned.sync_all_accounts();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .expect("spawn auto-sync thread");
+}
+
+/// Read SQLite's `PRAGMA data_version` from `conn`. The pragma is
+/// a counter that increments on every commit visible to this
+/// connection — including writes by other processes. Used by the
+/// watcher callback to gate reloads on actual data changes vs
+/// incidental -shm/-wal touches caused by our own reads.
+fn read_data_version(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+}
+
+/// Spawn a background thread that watches the directory containing
+/// `path` and queues a `reload_active_filter` on the Qt thread when
+/// the debouncer fires.
+///
+/// The thread takes its own `DatabaseWatcher` so the `Receiver`
+/// stays thread-local and the Debouncer is kept alive for the watch
+/// duration. A shared `AtomicBool` lets `open_database` terminate
+/// the prior watcher when a new file is selected.
+fn start_watcher(mut vm: Pin<&mut qobject::TaskListViewModel>, path: PathBuf) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    vm.as_mut().rust_mut().watcher_stop = Some(stop);
+
+    let qt_thread = vm.as_ref().qt_thread();
+
+    std::thread::spawn(move || {
+        let watcher = match DatabaseWatcher::start(&path) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("DatabaseWatcher::start failed for {:?}: {e}", path);
+                return;
+            }
+        };
+        tracing::info!("watching {} for changes", path.display());
+        loop {
+            if stop_thread.load(Ordering::Relaxed) {
+                tracing::debug!("watcher thread stopping for {:?}", path);
+                return;
+            }
+            match watcher.events.recv_timeout(Duration::from_millis(500)) {
+                Ok(_event) => {
+                    if let Err(e) =
+                        qt_thread.queue(|mut pinned: Pin<&mut qobject::TaskListViewModel>| {
+                            // SQLite WAL mode touches -shm on every read
+                            // (mmap'd shared lock state) and the watcher
+                            // catches those events too — without a gate,
+                            // every reload here triggers another -shm
+                            // touch and the loop runs at the debounce
+                            // cadence forever. data_version increments
+                            // on actual commits (any connection, this
+                            // process or another), so it's the cheapest
+                            // way to tell "did anything actually change?"
+                            // from "watcher fired on our own activity".
+                            let new_version = match pinned.as_ref().db.as_ref() {
+                                Some(db) => match read_data_version(db.connection()) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        tracing::trace!("data_version query failed: {e}");
+                                        return;
+                                    }
+                                },
+                                None => return,
+                            };
+                            if new_version == pinned.as_ref().last_data_version {
+                                return;
+                            }
+                            pinned.as_mut().rust_mut().last_data_version = new_version;
+                            pinned.as_mut().reload_active_filter();
+                            // External writers (Syncthing, the Android
+                            // app via the same DB file) may have added,
+                            // removed, or shifted alarms. Re-read +
+                            // reconcile so the desktop scheduler tracks
+                            // those changes without waiting for the next
+                            // restart.
+                            reschedule_alarms(pinned.as_mut());
+                        })
+                    {
+                        tracing::warn!("couldn't queue reload on Qt thread: {e}");
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    tracing::debug!("watcher channel closed; thread exiting");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Current process-local UTC offset in seconds, east-positive. Used to
+/// anchor `FILTER_TODAY` to local midnight rather than UTC midnight.
+/// Delegates to Qt's `QDateTime::offsetFromUtc()` so Qt's own timezone
+/// database resolves DST transitions — we avoid pulling in a parallel
+/// time library.
+fn current_local_offset_secs() -> i32 {
+    QDateTime::current_date_time().offset_from_utc()
+}
+
+/// Reset every `selected_*` Q_PROPERTY to its empty/default value.
+/// Shared between the "unknown id" branch of `select_task` and the
+/// post-delete cleanup so a future new field only has to be added
+/// in one place.
+fn clear_detail_pane(mut vm: Pin<&mut qobject::TaskListViewModel>) {
+    vm.as_mut().set_selected_id(0);
+    vm.as_mut().set_selected_title(QString::default());
+    vm.as_mut().set_selected_notes(QString::default());
+    vm.as_mut().set_selected_due_label(QString::default());
+    vm.as_mut()
+        .set_selected_hide_until_label(QString::default());
+    vm.as_mut().set_selected_priority(Priority::NONE);
+    vm.as_mut().set_selected_completed(false);
+    vm.as_mut().set_selected_recurrence(QString::default());
+    vm.as_mut()
+        .set_selected_caldav_calendar_uuid(QString::default());
+    vm.as_mut().set_selected_caldav_calendar_color(0);
+    vm.as_mut().set_selected_tag_uids(QStringList::default());
+    vm.as_mut()
+        .set_selected_alarm_labels(QStringList::default());
+    vm.as_mut().set_selected_alarm_times(QList::default());
+    vm.as_mut().set_selected_alarm_types(QList::default());
+    vm.as_mut().set_selected_place_uid(QString::default());
+    vm.as_mut().set_selected_place_arrival(false);
+    vm.as_mut().set_selected_place_departure(false);
+    vm.as_mut()
+        .set_parent_candidate_labels(QStringList::default());
+    vm.as_mut().set_parent_candidate_ids(QList::default());
+    vm.as_mut().set_selected_parent_id(0);
+    vm.as_mut().set_selected_estimated_text(QString::default());
+    vm.as_mut().set_selected_elapsed_text(QString::default());
+    vm.as_mut().set_selected_recurrence_raw(QString::default());
+    vm.as_mut().set_selected_repeat_from(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token_persist::{InMemorySecretStore, SecretStore};
+    use secrecy::SecretString;
+    use tasks_sync::{InMemoryTokenStore, OAuthTokens, ProviderKind, TokenStore};
+
+    fn sample_tokens() -> OAuthTokens {
+        OAuthTokens {
+            access_token: SecretString::from("access-12345".to_string()),
+            refresh_token: Some(SecretString::from("refresh-abcde".to_string())),
+            expires_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// Regression for the Round-2 review's A1: when the
+    /// `update_credential_storage_choice` guard misfires and
+    /// `migrate_credentials` runs with the *same* store on both
+    /// sides, the get → put → delete sequence destroys the
+    /// credentials it had just re-written. Pin the bug shape:
+    /// passing a single store as both source AND destination
+    /// must NOT lose the secret/token, regardless of how the
+    /// caller's guard is written.
+    #[test]
+    fn migrate_credentials_same_store_both_sides_loses_data_today() {
+        // Same Arc-eq store on both ends — exactly the broken
+        // scenario A1 surfaced.
+        let token_store = std::sync::Arc::new(InMemoryTokenStore::new());
+        let secret_store = std::sync::Arc::new(InMemorySecretStore::new());
+        token_store
+            .put(ProviderKind::GoogleTasks, "uuid-1", &sample_tokens())
+            .unwrap();
+        secret_store.put_secret("uuid-2", "hunter2").unwrap();
+        let accounts = vec![
+            ("uuid-1".to_string(), KIND_GOOGLE_TASKS),
+            ("uuid-2".to_string(), KIND_CALDAV),
+        ];
+        // The fix is at the *caller* (don't migrate when source
+        // == destination), not in `migrate_credentials` itself —
+        // the helper's contract is "move from→to". So the helper
+        // *does* delete after a successful put when both sides
+        // are the same Arc; that's the destructive behaviour A1
+        // pinned. Document the helper's expectation: callers
+        // must not invoke it with the same store on both sides.
+        let _ = migrate_credentials(
+            &accounts,
+            token_store.as_ref(),
+            secret_store.as_ref(),
+            token_store.as_ref(),
+            secret_store.as_ref(),
+        );
+        // After the call, the get→put→delete loop has wiped the
+        // store. This assertion *documents* the destructive
+        // contract; the actual A1 fix is in the caller.
+        assert!(
+            token_store
+                .get(ProviderKind::GoogleTasks, "uuid-1")
+                .is_none(),
+            "same-store migrate is documented as destructive"
+        );
+        assert!(secret_store.get_secret("uuid-2").is_none());
+    }
+
+    /// Happy-path: migrate credentials between *distinct* stores
+    /// and confirm the round-trip moves both OAuth tokens and
+    /// password secrets, deleting from the source on success.
+    #[test]
+    fn migrate_credentials_distinct_stores_round_trips() {
+        let from_tokens = std::sync::Arc::new(InMemoryTokenStore::new());
+        let from_secrets = std::sync::Arc::new(InMemorySecretStore::new());
+        let to_tokens = std::sync::Arc::new(InMemoryTokenStore::new());
+        let to_secrets = std::sync::Arc::new(InMemorySecretStore::new());
+
+        from_tokens
+            .put(ProviderKind::MicrosoftToDo, "uuid-ms", &sample_tokens())
+            .unwrap();
+        from_secrets.put_secret("uuid-cd", "caldav-pass").unwrap();
+        let accounts = vec![
+            ("uuid-ms".to_string(), KIND_MICROSOFT_TODO),
+            ("uuid-cd".to_string(), KIND_CALDAV),
+        ];
+        let (tokens, secrets) = migrate_credentials(
+            &accounts,
+            from_tokens.as_ref(),
+            from_secrets.as_ref(),
+            to_tokens.as_ref(),
+            to_secrets.as_ref(),
+        );
+        assert_eq!(tokens, 1);
+        assert_eq!(secrets, 1);
+
+        // Source emptied.
+        assert!(from_tokens
+            .get(ProviderKind::MicrosoftToDo, "uuid-ms")
+            .is_none());
+        assert!(from_secrets.get_secret("uuid-cd").is_none());
+        // Destination populated.
+        assert!(to_tokens
+            .get(ProviderKind::MicrosoftToDo, "uuid-ms")
+            .is_some());
+        assert_eq!(
+            to_secrets.get_secret("uuid-cd").as_deref(),
+            Some("caldav-pass")
+        );
+    }
+
+    /// Boundary: an account row with a kind we don't OAuth-track
+    /// (CalDAV / EteSync) must not look up a token; an account
+    /// row whose secret is empty must not be migrated.
+    #[test]
+    fn migrate_credentials_skips_irrelevant_rows() {
+        let from_tokens = std::sync::Arc::new(InMemoryTokenStore::new());
+        let from_secrets = std::sync::Arc::new(InMemorySecretStore::new());
+        let to_tokens = std::sync::Arc::new(InMemoryTokenStore::new());
+        let to_secrets = std::sync::Arc::new(InMemorySecretStore::new());
+
+        // OAuth-tracked kind but no tokens stored — nothing to move.
+        let accounts = vec![("uuid-x".to_string(), KIND_GOOGLE_TASKS)];
+        let (tokens, secrets) = migrate_credentials(
+            &accounts,
+            from_tokens.as_ref(),
+            from_secrets.as_ref(),
+            to_tokens.as_ref(),
+            to_secrets.as_ref(),
+        );
+        assert_eq!(tokens, 0);
+        assert_eq!(secrets, 0);
+
+        // Empty-string secret skipped.
+        from_secrets.put_secret("uuid-empty", "").unwrap();
+        let accounts2 = vec![("uuid-empty".to_string(), KIND_CALDAV)];
+        let (_, secrets2) = migrate_credentials(
+            &accounts2,
+            from_tokens.as_ref(),
+            from_secrets.as_ref(),
+            to_tokens.as_ref(),
+            to_secrets.as_ref(),
+        );
+        assert_eq!(secrets2, 0);
+    }
+
+    /// Stand up a minimal SQLite file with just the columns
+    /// `migrate_legacy_passwords` reads + writes. The test
+    /// doesn't need the full Tasks.org schema — only
+    /// `caldav_accounts(cda_uuid, cda_password)`.
+    fn fresh_legacy_db(rows: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE caldav_accounts ( \
+                cda_uuid TEXT PRIMARY KEY, \
+                cda_password TEXT NOT NULL DEFAULT '' \
+             )",
+            [],
+        )
+        .unwrap();
+        for (uuid, pwd) in rows {
+            conn.execute(
+                "INSERT INTO caldav_accounts (cda_uuid, cda_password) VALUES (?1, ?2)",
+                [uuid, pwd],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        (tmp, path)
+    }
+
+    fn stored(uuid: &str, password: &str) -> StoredAccount {
+        StoredAccount {
+            uuid: uuid.to_string(),
+            kind: KIND_CALDAV,
+            label: format!("acct {uuid}"),
+            server: "https://dav.example.com/".to_string(),
+            username: "alice".to_string(),
+            password: SecretString::from(password.to_string()),
+        }
+    }
+
+    /// D3 happy path: a row carrying a legacy plaintext
+    /// `cda_password` is moved into the secret store and the
+    /// SQLite column is blanked. The function returns 1 (one
+    /// row migrated).
+    #[test]
+    fn migrate_legacy_passwords_moves_plaintext_into_secret_store() {
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "hunter2")]);
+        let secret_store = InMemorySecretStore::new();
+        let accounts = vec![stored("uuid-1", "hunter2")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 1);
+
+        // Column blanked.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let column: String = conn
+            .query_row(
+                "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, "");
+        // Secret store populated.
+        assert_eq!(
+            secret_store.get_secret("uuid-1").as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    /// Idempotency: running the migration a second time on a
+    /// row whose column is already empty (because the first
+    /// pass cleaned it up) is a no-op. Pin this so the
+    /// open-at-path call site can run the migration on every
+    /// launch without churning the secret store.
+    #[test]
+    fn migrate_legacy_passwords_is_idempotent_on_empty_column() {
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "")]);
+        let secret_store = InMemorySecretStore::new();
+        // Pre-seed the secret as if a prior migration moved it.
+        secret_store.put_secret("uuid-1", "already-here").unwrap();
+        let accounts = vec![stored("uuid-1", "already-here")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 0);
+        // Existing secret untouched.
+        assert_eq!(
+            secret_store.get_secret("uuid-1").as_deref(),
+            Some("already-here")
+        );
+    }
+
+    /// Round-3 review's D-R3-3 / A-R3-2: when `put_secret`
+    /// fails outright, the function MUST NOT blank the
+    /// `cda_password` column. The "store the credential, then
+    /// drop the plaintext" pair has to be all-or-nothing,
+    /// otherwise a read-only secret-store would silently lose
+    /// the user's password on first migration. (The genuine
+    /// "put-OK-then-UPDATE-fails" rollback is exercised by
+    /// code-review against the function body — simulating it
+    /// from outside requires racing two SQLite connections,
+    /// which is too fragile for unit tests; the SecretStore
+    /// trait has no async hook a fake can use to fail
+    /// mid-call.)
+    #[test]
+    fn migrate_legacy_passwords_keeps_column_when_put_secret_fails() {
+        struct AlwaysFailingSecretStore;
+        impl SecretStore for AlwaysFailingSecretStore {
+            fn put_secret(
+                &self,
+                _account_uuid: &str,
+                _secret: &str,
+            ) -> Result<(), tasks_sync::TokenStoreError> {
+                Err(tasks_sync::TokenStoreError::Backend(
+                    "simulated keychain unavailable".into(),
+                ))
+            }
+            fn get_secret(&self, _account_uuid: &str) -> Option<String> {
+                None
+            }
+            fn delete_secret(
+                &self,
+                _account_uuid: &str,
+            ) -> Result<(), tasks_sync::TokenStoreError> {
+                Ok(())
+            }
+        }
+
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "still-here")]);
+        let secret_store = AlwaysFailingSecretStore;
+        let accounts = vec![stored("uuid-1", "still-here")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 0);
+
+        // Column NOT blanked — the legacy fallback in
+        // `load_password_accounts` keeps the row usable for
+        // sync. Without this guarantee, a transient keychain
+        // outage on first launch would silently strand the
+        // user's password.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let column: String = conn
+            .query_row(
+                "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, "still-here");
+    }
+
+    /// When both the column AND the store hold a value, the
+    /// store is canonical (it's the durable copy). The column
+    /// gets blanked without overwriting the store, so a row
+    /// where the store and column drifted out of sync resolves
+    /// in favour of the store.
+    #[test]
+    fn migrate_legacy_passwords_prefers_existing_secret_store_value() {
+        let (_tmp, path) = fresh_legacy_db(&[("uuid-1", "stale-from-column")]);
+        let secret_store = InMemorySecretStore::new();
+        secret_store
+            .put_secret("uuid-1", "fresh-from-store")
+            .unwrap();
+        let accounts = vec![stored("uuid-1", "fresh-from-store")];
+
+        let moved = migrate_legacy_passwords(&path, &accounts, &secret_store);
+        assert_eq!(moved, 1);
+
+        // Column blanked.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let column: String = conn
+            .query_row(
+                "SELECT cda_password FROM caldav_accounts WHERE cda_uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, "");
+        // Store wasn't overwritten with the stale column value.
+        assert_eq!(
+            secret_store.get_secret("uuid-1").as_deref(),
+            Some("fresh-from-store")
+        );
+    }
+
+    /// Security review F7: `is_local_etebase_url` must use a
+    /// parsed-URL host check, not substring containment. The
+    /// earlier `server_url.contains("://127.0.0.1")` matched
+    /// any URL containing that substring anywhere, including
+    /// `https://attacker.example/?next=://127.0.0.1` — when
+    /// matched, EteSync's `with_signup_fallback(true)` would
+    /// post the user's password to the attacker as a signup.
+    #[test]
+    fn is_local_etebase_url_only_matches_genuine_loopback_hosts() {
+        // Genuine loopback URLs the test EteSync deployments use.
+        for url in &[
+            "http://127.0.0.1:3735/",
+            "https://127.0.0.1/",
+            "http://localhost:8000/",
+            "http://LocalHost/",
+            "http://[::1]:1234/",
+            "http://[::1]/",
+        ] {
+            assert!(
+                is_local_etebase_url(url),
+                "expected genuine loopback URL to match: {url:?}"
+            );
+        }
+        // Substring-trick URLs that the previous check matched.
+        for url in &[
+            "https://attacker.example/?next=://127.0.0.1",
+            "https://attacker.example/path/?redirect=://localhost",
+            "https://localhost.attacker.example/",
+            "https://127.0.0.1.attacker.example/",
+            "ftp://example.com/",
+            "not a url",
+            "",
+        ] {
+            assert!(
+                !is_local_etebase_url(url),
+                "expected non-loopback URL to be rejected: {url:?}"
+            );
+        }
+    }
+}

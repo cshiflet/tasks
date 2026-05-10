@@ -1,0 +1,102 @@
+# Local test servers for the sync providers we care about today.
+# Brings up an Etebase (EteSync 2.0) server + a Radicale CalDAV
+# server on dedicated localhost ports. Both ship with seeded
+# default credentials so you can hit them straight from the
+# desktop client's Accounts pane without a setup dance.
+#
+# The Etebase service is built from upstream source on first
+# `up` (no public Docker Hub image exists for the 2.x server).
+# Subsequent `up` invocations reuse the cached image.
+#
+# Run from this directory:
+#
+#     docker compose -f docker-compose.test-servers.yml up -d --build
+#
+# Tear down (and wipe persistent volumes):
+#
+#     docker compose -f docker-compose.test-servers.yml down -v
+#
+# Defaults, intentionally weak — never expose either container
+# to the public internet:
+#
+#   Etebase    http://127.0.0.1:3735
+#              admin (Django)        : admin / changeme
+#              EteSync test user     : alice / alicepw
+#              (created on first sync by the desktop client's
+#               with_signup_fallback path, gated on AUTO_SIGNUP=true)
+#   Radicale   http://127.0.0.1:5232
+#              user:     test / test
+#              calendar: http://127.0.0.1:5232/test/test-calendar/
+
+services:
+  etebase:
+    # Built locally from `etebase/` (vendored copy of
+    # github.com/victor-rds/docker-etebase). See etebase/UPSTREAM.md
+    # for the pinned source commit + bump procedure.
+    build:
+      context: ./etebase
+    image: tasks-test-etebase:local
+    container_name: etebase
+    environment:
+      DEBUG: true
+      REGEN_INI: "yes"
+      DEBUG_DJANGO: "true"
+      SERVER: http-socket
+      SUPER_USER: admin
+      SUPER_PASS: "changeme"
+      ETEBASE_TEST_USER: alice
+      ETEBASE_TEST_EMAIL: alice@example.com
+      ETEBASE_TEST_PASSWORD: alicepw
+      # Allow the loopback hosts the desktop client and curl
+      # actually use. With just "localhost" the dev server
+      # returns 400 "Invalid host header" for any request whose
+      # Host: header is `127.0.0.1:3735` (which is what every
+      # http://127.0.0.1:3735 client sends), and the etebase
+      # Rust crate surfaces that as `Code: null Detail: null`.
+      # Listing both names keeps either form working.
+      ALLOWED_HOSTS: "localhost,127.0.0.1"
+      TIME_ZONE: "America/Denver"
+      AUTO_SIGNUP: "true"
+    ports:
+      - "127.0.0.1:3735:3735"
+    restart: unless-stopped
+    healthcheck:
+      # Any HTTP response is good enough to know the Django dev
+      # server is up. The earlier `is_etebase` probe returned a
+      # 404 on v0.13.0 (the endpoint moved across releases) and
+      # tripped the healthcheck even though sync requests worked
+      # fine. Drop `-f` so 4xx isn't fatal here; the test is
+      # liveness only.
+      test: ["CMD", "curl", "-sS", "--max-time", "3", "-o", "/dev/null", "http://localhost:3735/"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 20s
+    volumes:
+      - etebase_data:/data:rw
+
+  radicale:
+    image: tomsquest/docker-radicale:latest
+    container_name: tasks-test-radicale
+    restart: unless-stopped
+    init: true
+    # Hardening flags (read_only / cap_drop / cap_add) intentionally
+    # left off — the upstream image's startup script chowns /data
+    # to the radicale user, and a tightly-locked container couldn't
+    # do that against a Docker-managed named volume, leaving the
+    # service in a chown-fail crashloop. The compose stack is for
+    # local-only iteration anyway, so the defaults are fine.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--retry", "1", "--max-time", "3", "http://[::1]:5232/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "127.0.0.1:5232:5232"
+    volumes:
+      - radicale_data:/data
+      - ./radicale-config:/config:ro
+
+volumes:
+  etebase_data:
+  radicale_data:

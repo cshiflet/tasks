@@ -1,0 +1,272 @@
+name: desktop-native-release
+
+# Produces downloadable release builds of tasks-desktop for
+# Linux, macOS, and Windows. Not signed/notarized — packaging with
+# signing identities is a later milestone (see
+# desktop-native/README.md roadmap).
+#
+# Triggers:
+#   * push of a tag matching `desktop-native-v*` (e.g.
+#     `desktop-native-v0.1.0`) — full release.
+#   * `workflow_dispatch` — manual run from the Actions tab, useful
+#     for producing a one-off build of the current branch tip.
+#
+# Artefacts are attached to the workflow run and (for tag runs) to a
+# draft GitHub Release. Download them from the "Summary" page of the
+# Actions run, or from Releases once the tag is published.
+
+on:
+  push:
+    tags:
+      - 'desktop-native-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or tag to build from (defaults to the workflow ref)'
+        required: false
+        type: string
+
+permissions:
+  contents: write   # needed to attach assets to a draft release
+
+env:
+  # Qt version pinned to keep Windows/macOS reproducible across
+  # install-qt-action releases. Linux uses the distro Qt (6.4.2 on
+  # Ubuntu 24.04) because that's what `apt-get` resolves and matches
+  # the CI workflow.
+  QT_VERSION: '6.6.3'
+  # Opt every JavaScript-based action into Node 24. Our own pins
+  # (actions/checkout@v6, actions/upload-artifact@v5,
+  # actions/download-artifact@v5) are already Node-24-native; this env
+  # var guards the remaining third-party actions (Swatinem/rust-cache,
+  # jurplel/install-qt-action, softprops/action-gh-release) whose
+  # current majors still ship on Node 20. GitHub forces the switch
+  # on 2026-06-02 regardless; enabling now flushes any issues early.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Qt 6 + tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qt6-base-dev qt6-declarative-dev qt6-tools-dev \
+            qml6-module-qtquick qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts qml6-module-qtquick-window \
+            qml6-module-qtquick-templates qml6-module-qtquick-dialogs \
+            qml6-module-qt-labs-platform qml6-module-qtqml-workerscript \
+            libqt6svg6-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      - name: Assemble tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#desktop-native-v}"
+          if [[ "$VERSION" == "$GITHUB_REF_NAME" ]]; then
+            VERSION="0.0.0-$(git rev-parse --short HEAD)"
+          fi
+          OUT="tasks-desktop-${VERSION}-linux-x86_64"
+          mkdir -p "dist/${OUT}/bin"
+          cp target/release/tasks-desktop "dist/${OUT}/bin/"
+          cp ../README.md BUILD.md DECISIONS.md "dist/${OUT}/"
+          # Record the Qt version the binary was linked against so
+          # users on older distros can diagnose runtime failures.
+          dpkg -l libqt6core6t64 libqt6qml6 > "dist/${OUT}/QT_VERSIONS.txt" || true
+          tar -C dist -czf "dist/${OUT}.tar.gz" "${OUT}"
+          echo "archive=desktop-native/dist/${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+
+  build-macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+          # `modules:` is for add-on packages (qtwebengine / qtmultimedia /
+          # qtpositioning / …). qtbase + qtdeclarative + qtsvg + qttools
+          # are part of the default Qt install and must NOT be listed
+          # here — aqtinstall errors with "packages [...] were not found
+          # while parsing XML".
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      - name: Assemble .app + DMG
+        id: pkg
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#desktop-native-v}"
+          if [[ "$VERSION" == "$GITHUB_REF_NAME" ]]; then
+            VERSION="0.0.0-$(git rev-parse --short HEAD)"
+          fi
+          APP_DIR="dist/tasks-desktop.app/Contents/MacOS"
+          mkdir -p "${APP_DIR}"
+          mkdir -p "dist/tasks-desktop.app/Contents/Resources"
+          cp target/release/tasks-desktop "${APP_DIR}/"
+          # Minimal Info.plist — sufficient for `open` + macdeployqt.
+          cat > dist/tasks-desktop.app/Contents/Info.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>tasks-desktop</string>
+            <key>CFBundleExecutable</key><string>tasks-desktop</string>
+            <key>CFBundleIdentifier</key><string>org.tasks.desktop</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+          # Bundle Qt into the .app so it runs on machines without
+          # brew's qt@6 installed.
+          "$(brew --prefix qt@6 2>/dev/null || dirname "$(which macdeployqt)")/../bin/macdeployqt" \
+            dist/tasks-desktop.app \
+            -qmldir=crates/tasks-ui/qml \
+            -dmg \
+            -verbose=1 || \
+            macdeployqt dist/tasks-desktop.app -qmldir=crates/tasks-ui/qml -dmg -verbose=1
+          OUT="tasks-desktop-${VERSION}-macos-universal"
+          mv dist/tasks-desktop.dmg "dist/${OUT}.dmg"
+          echo "archive=desktop-native/dist/${OUT}.dmg" >> "$GITHUB_OUTPUT"
+          echo "name=${OUT}.dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-native
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730  # v4.3.1
+        with:
+          version: ${{ env.QT_VERSION }}
+          cache: true
+          # See build-macos: no `modules:` — qtdeclarative / qtsvg /
+          # qttools are part of the default base install.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (branch tip 2026-04-23)
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: desktop-native -> target
+
+      - name: cargo build --release
+        run: cargo build --workspace --release
+
+      - name: Assemble ZIP with windeployqt
+        id: pkg
+        run: |
+          $Version = $env:GITHUB_REF_NAME -replace '^desktop-native-v',''
+          if ($Version -eq $env:GITHUB_REF_NAME) {
+            $Sha = (git rev-parse --short HEAD).Trim()
+            $Version = "0.0.0-$Sha"
+          }
+          $Out = "tasks-desktop-$Version-windows-x86_64"
+          $StageDir = "dist/$Out"
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          Copy-Item target/release/tasks-desktop.exe $StageDir/
+          # windeployqt walks the .exe's Qt imports and copies every
+          # required DLL + QML runtime module next to it.
+          windeployqt --qmldir crates/tasks-ui/qml $StageDir/tasks-desktop.exe
+          $Archive = "dist/$Out.zip"
+          Compress-Archive -Path "$StageDir/*" -DestinationPath $Archive -Force
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "archive=desktop-native/$Archive"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$Out.zip"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+
+  # When a `desktop-native-v*` tag is pushed, attach the three
+  # platform artefacts to a draft GitHub Release so maintainers can
+  # review / edit release notes / publish with one click.
+  publish-draft-release:
+    needs: [build-linux, build-macos, build-windows]
+    if: startsWith(github.ref, 'refs/tags/desktop-native-v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artefacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5.0.0
+        with:
+          path: dist
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body: |
+            Desktop-native client build ${{ github.ref_name }}.
+
+            **Not signed or notarized.** On macOS, expect a Gatekeeper
+            warning; use `xattr -d com.apple.quarantine tasks-desktop.app`
+            to clear it. On Windows, SmartScreen may warn about an
+            unrecognized publisher.
+
+            See `desktop-native/BUILD.md` for platform prerequisites
+            and `desktop-native/DECISIONS.md` for the architecture
+            rationale.
+          files: |
+            dist/**/tasks-desktop-*.tar.gz
+            dist/**/tasks-desktop-*.dmg
+            dist/**/tasks-desktop-*.zip

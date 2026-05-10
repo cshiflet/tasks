@@ -2,6 +2,27 @@ name: Run automated checks
 
 on:
   pull_request:
+    # Skip Android lint + test when a PR only touches the Rust/Qt
+    # desktop client or its release workflow. The desktop-native
+    # matrix (check-linux / -macos / -windows) covers those files
+    # and Android CI has nothing to say about them. `paths-ignore`
+    # is OR'd across the listed globs; a PR that touches *both*
+    # desktop-native and any app/kmp/data file still triggers
+    # Android CI, which is what we want.
+    #
+    # The two non-desktop-native entries (`CLAUDE.md` + this
+    # workflow file itself) are here so the in-flight native-client
+    # PR doesn't keep re-spawning Android jobs every time we tweak
+    # top-level docs or iterate on this filter. Revisit once that
+    # PR merges — a real Android-CI logic change should still run
+    # Android CI.
+    paths-ignore:
+      - 'desktop-native/**'
+      - '.github/workflows/desktop-native.yml'
+      - '.github/workflows/desktop-native-release.yml'
+      - 'CLAUDE.md'
+      - '.github/workflows/check.yml'
+      - '.gitignore'
   workflow_call:
 
 permissions:

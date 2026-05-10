@@ -1,0 +1,154 @@
+// "List defaults" tab of the Settings window.
+//
+// Hosts the query preferences applied by default to every list
+// view: sort mode + direction, show completed / hidden, completed
+// at the bottom. Persisted via the bridge — `updatePreferences`
+// writes them to the JSON blob in `<config_dir>/tasks-desktop/`
+// and reloads the active filter so the change is visible
+// immediately.
+//
+// Per-list overrides (e.g. "this CalDAV list always sorts by due,
+// regardless of the global default") will land behind a right-
+// click context menu on each sidebar entry; not implemented yet.
+//
+// The app-wide Appearance toggle lives on the General tab, not
+// here — it doesn't belong with list-shape preferences.
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+import QtQuick.Layouts
+
+ColumnLayout {
+    id: pane
+    spacing: 16
+
+    required property QtObject vm
+
+    // Called by SettingsWindow.loadFromVm() right before show(), so
+    // every re-open starts from the bridge's current preferences
+    // rather than the widget's stale local state.
+    function loadFromVm() {
+        if (!vm) {
+            return;
+        }
+        // Map the sort_mode integer → ComboBox index. Matches the
+        // original PreferencesDialog mapping:
+        //   0=AUTO, 1=ALPHA, 2=DUE, 3=IMPORTANCE, 4=MODIFIED,
+        //   5=CREATED, 8=START.
+        const mapping = [0, 1, 2, 3, 4, 5, 8];
+        const idx = mapping.indexOf(vm.prefSortMode);
+        sortBox.currentIndex = idx >= 0 ? idx : 0;
+        directionBox.currentIndex = vm.prefSortAscending ? 0 : 1;
+        showCompletedBox.checked = vm.prefShowCompleted;
+        showHiddenBox.checked = vm.prefShowHidden;
+        completedAtBottomBox.checked = vm.prefCompletedAtBottom;
+    }
+
+    Component.onCompleted: loadFromVm()
+
+    Label {
+        Layout.fillWidth: true
+        wrapMode: Text.Wrap
+        opacity: 0.6
+        font.pointSize: Qt.application.font.pointSize - 1
+        text: qsTr("Defaults applied to every list view. Right-click a list " +
+                   "in the sidebar → List settings… to override these for that list.")
+    }
+
+    GridLayout {
+        columns: 2
+        columnSpacing: 12
+        rowSpacing: 8
+        Layout.fillWidth: true
+
+        Label {
+            text: qsTr("Sort by")
+            opacity: 0.7
+        }
+        CompactComboBox {
+            id: sortBox
+            Layout.fillWidth: true
+            model: [
+                qsTr("Automatic (due + importance)"),
+                qsTr("Alphabetical"),
+                qsTr("Due date"),
+                qsTr("Priority"),
+                qsTr("Modified"),
+                qsTr("Created"),
+                qsTr("Start date"),
+            ]
+        }
+
+        Label {
+            text: qsTr("Direction")
+            opacity: 0.7
+        }
+        CompactComboBox {
+            id: directionBox
+            Layout.fillWidth: true
+            model: [qsTr("Ascending"), qsTr("Descending")]
+        }
+    }
+
+    CheckBox {
+        id: showCompletedBox
+        text: qsTr("Show completed tasks")
+        // Uncheck the dependent toggle too so a subsequent re-open
+        // doesn't surface a disabled-but-checked control.
+        onCheckedChanged: if (!checked) { completedAtBottomBox.checked = false; }
+    }
+    CheckBox {
+        id: completedAtBottomBox
+        text: qsTr("Completed tasks at the bottom")
+        enabled: showCompletedBox.checked
+    }
+    CheckBox {
+        id: showHiddenBox
+        text: qsTr("Show hidden (future hide-until) tasks")
+    }
+
+    // Push the Save button to the bottom of the pane regardless of
+    // the pane's full height — the outer StackLayout stretches us.
+    Item { Layout.fillHeight: true }
+
+    RowLayout {
+        Layout.fillWidth: true
+        // Inline confirmation. Fades out after 3s; an explicit
+        // toast / snackbar would be heavier than this needs to be
+        // since the pane already owns the relevant real estate.
+        Label {
+            id: savedFeedback
+            text: qsTr("Defaults saved.")
+            color: "#2e7d32"   // success green, matches Test successful in AccountsPane
+            font.pointSize: Qt.application.font.pointSize - 1
+            opacity: 0
+            Behavior on opacity { NumberAnimation { duration: 200 } }
+            Timer {
+                id: savedFeedbackHide
+                interval: 3000
+                onTriggered: savedFeedback.opacity = 0
+            }
+            function flash() {
+                opacity = 1;
+                savedFeedbackHide.restart();
+            }
+        }
+        Item { Layout.fillWidth: true }
+        Button {
+            text: qsTr("Save defaults")
+            highlighted: true
+            onClicked: {
+                if (!pane.vm) { return; }
+                const mapping = [0, 1, 2, 3, 4, 5, 8];
+                const sortMode = mapping[sortBox.currentIndex] ?? 0;
+                pane.vm.updatePreferences(
+                    sortMode,
+                    directionBox.currentIndex === 0,
+                    showCompletedBox.checked,
+                    showHiddenBox.checked,
+                    completedAtBottomBox.checked);
+                savedFeedback.flash();
+            }
+        }
+    }
+}

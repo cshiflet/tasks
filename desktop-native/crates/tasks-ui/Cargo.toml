@@ -1,0 +1,104 @@
+[package]
+name = "tasks-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Qt 6 (cxx-qt) front-end for the Tasks.org native desktop client."
+
+[[bin]]
+name = "tasks-desktop"
+path = "src/main.rs"
+
+[dependencies]
+tasks-core = { path = "../tasks-core" }
+tasks-sync = { path = "../tasks-sync" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+cxx = { workspace = true }
+cxx-qt = { workspace = true }
+cxx-qt-lib = { workspace = true }
+# Secret-wrapped password on `StoredAccount` so the ViewModel can't
+# stringify / log the raw bytes, and the value zeroes on drop.
+secrecy = { workspace = true }
+# Async runtime hosting `tasks-sync::SyncEngine` calls. We pin the
+# `rt-multi-thread` feature so providers can spawn their own
+# fan-out work without blocking the UI thread; the bridge owns
+# exactly one Runtime instance shared across every Sync now click.
+# `time` powers the alarm scheduler's `sleep_until` calls; `sync`
+# is needed for the `oneshot::channel` the smoke test uses to
+# observe a fired notification without depending on a desktop
+# notification daemon.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
+# Generate cda_uuid values for accounts created via the
+# Accounts pane. Mirrors the `uuid` dep pattern used by tasks-core.
+uuid = { version = "1", features = ["v4"] }
+# Direct SQLite access for the bridge's writeback path on
+# add_password_account / remove_account / sync_account, which
+# need to mutate caldav_accounts without going through tasks-core.
+rusqlite = { workspace = true }
+# Preferences persistence — small JSON blob in
+# `<dirs::config_dir()>/tasks-desktop/preferences.json`. Avoids the
+# QSettings FFI surface (not exposed by cxx-qt-lib in our pinned
+# version) and keeps the on-disk format easy to inspect / hand-edit.
+dirs = "5"
+serde = { workspace = true }
+serde_json = "1"
+# System-browser launcher for the OAuth sign-in path. Kept in the
+# UI crate so `tasks-sync` stays headless / runtime-agnostic; the
+# bridge passes `webbrowser::open` to the provider's `authorize()`
+# helper as the open_browser callback.
+webbrowser = "1"
+# Shared HTTP client passed into the OAuth `authorize()` helpers in
+# tasks-sync. Pinned to the same major + features as tasks-sync so
+# Cargo unifies the build into a single rustls-backed reqwest.
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+# Strict URL parsing for the loopback / EteSync host-allowlist
+# checks. Already in the dep tree via reqwest; expose it directly
+# so the bridge doesn't have to thread through reqwest::Url.
+url = "2"
+# OS-native notifications for task alarms. Abstracts
+# org.freedesktop.Notifications on Linux, NSUserNotification on
+# macOS (requires a packaged .app bundle to actually render), and
+# the Windows Toast Notification Manager on Windows 10+. Pinned to
+# the 4.x line; the scheduler task in `notifier.rs` is the only
+# call-site, and notification failures are logged + swallowed so a
+# flaky daemon can't take the app down.
+notify-rust = "4"
+# OS keychain wrapper for the OAuth token store (Tier 1).
+# Backends: secret-service (libsecret) on Linux, NSKeychain on
+# macOS, Credential Manager on Windows. The crate exposes a
+# uniform Entry::set_password / get_password API and surfaces
+# unavailability (no D-Bus session, etc.) as an Err we fall
+# through to the Tier-2 encrypted-file store on.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "sync-secret-service"] }
+# AES-256-GCM for the Tier-2 encrypted-file token store. The key
+# is HKDF-derived from a per-machine identifier + an app salt; we
+# never persist the key, only re-derive it on each launch.
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+# Stable per-machine identifier feeding the HKDF in the Tier-2
+# store. `/etc/machine-id` on Linux, IORegistry UUID on macOS,
+# MachineGuid on Windows; the crate handles the per-OS lookup.
+machine-uid = "0.5"
+# Cryptographically-random nonces for the Tier-2 GCM frames.
+getrandom = "0.2"
+
+# The Win32 dark-title-bar shim is implemented with bare
+# `extern "system"` declarations in `src/win_dark_titlebar.rs` —
+# no `windows-sys` dep needed. The four functions + four
+# constants we use are stable Win32 surface and the signatures
+# don't drift, which avoids the breaking-change churn between
+# windows-sys 0.59 / 0.60 / 0.61 we'd otherwise have to track.
+
+[build-dependencies]
+cxx-qt-build = { workspace = true }
+
+[dev-dependencies]
+# Notifier smoke test materialises a real SQLite file so the
+# scheduler can read its alarms; `tempfile` keeps the fixture
+# scoped to the test run.
+tempfile = "3"
+# `tokio::test` macro for the async smoke test.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
